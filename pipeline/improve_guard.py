@@ -168,8 +168,21 @@ def check():
             pass
         print("✅ 无回归：%s" % json.dumps({k: cur[k] for k in ("py_compile_ok", "cron_lint_ok", "converged", "episodes")},
                                           ensure_ascii=False))
-        os.remove(STATE)
-        print("已清除基线")
+        # 2026-11-17（E162 附带）：**通过后不再删除基线。**
+        # 原来这里 `os.remove(STATE)`，于是「先 --mark 再 --check」的一次运行
+        # 会把基线吃掉；第二天 --check 只打印「没有基线」→ 回归护栏**静默空转**，
+        # 而它空转时没有任何告警（今天的自省就踩到了：mark 后 check 一次即清空）。
+        # 保留基线是安全的：judge() 只判「比基线更差」，陈旧基线（集数更少）
+        # 更不可能误报；下一次 --mark 会原子覆盖它。
+        try:
+            base["verified_ts"] = cur.get("ts")
+            base["verified_head"] = cur.get("head")
+            tmp = STATE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(base, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, STATE)
+        except Exception:                                          # noqa: BLE001
+            pass
         return 0
 
     print("⛔ 检出回归：")

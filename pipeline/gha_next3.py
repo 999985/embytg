@@ -48,6 +48,12 @@ CHANNELS_FILE = os.path.join(HERE, ".gha_channels.json")
 CHANNEL_RR = os.path.join(HERE, ".gha_channel_rr")
 NEW_DONE = os.path.join(HERE, ".gha_new_done.json")
 
+# 2026-11-17（E160）：「源站没有这一集」的按集冷却时长（小时）。
+# 之前这种负证据一条都不落，同一集每轮重搜（今日 335 次源请求里 238 次
+# 落在重复 target 上）。默认 6h：新上架的集最多晚 6h 被补到，
+# 而重复请求从「每小时几十次」降到「每天 4 次」。
+FILL_NO_SOURCE_COOL_HOURS = float(os.environ.get("FILL_NO_SOURCE_COOL_HOURS") or 6)
+
 # 这些 why 意味着「根本没向源站发请求」，不应占用 --max-attempts 名额。
 CHARGE_FREE_WHY = {
     "cooldown", "series_active", "no_missing",           # 本地判据即可跳
@@ -1030,7 +1036,7 @@ def item_cool_key(item):
     return fill_item_key(item)
 
 
-def mark_new_done(video_id, days=7, reason=""):
+def mark_new_done(video_id, days: float = 7, reason=""):
     # 2026-11-15（E128）：**读-改-写必须加 flock。**
     # 五条 lane 并发写同一份 .gha_new_done.json，无锁时「后写覆盖先写」，
     # 刚记的冷却会凭空消失（同 E095 那族静默失效）。锁文件独立，避免动数据文件本身。
@@ -1474,6 +1480,33 @@ def try_fill(item, available_labels, leased, min_bytes, max_bytes, run_id,
             GS.charge_guard(g)
         chosen, why2 = fill_target(item, ep, cands, min_bytes, max_bytes)
         if not chosen:
+            # 2026-11-17（E160）：**「源站没有这一集」也必须落按集冷却。**
+            #
+            # 事故形状：自审 7 天窗口 109 次尝试、其中 72 次失败原因是
+            # 「无源可提供（源有剧但缺这一集）」，而 `.gha_ep_fail` /
+            # `.gha_new_done` 里一条对应的记录都没有 —— why2 算出来了却直接
+            # `continue`。于是队列游标每轮转回来都重搜一遍：今日 335 次源请求
+            # 里 238 次落在重复 target（`乘风破浪的姐姐 第七季` 单日 23 次、
+            # `法警小队` 9 次），既烧源站配额又占 lane。
+            # 与 E128（命中「已在库」不落冷却）是同一类漏写，只是方向相反。
+            #
+            # 判据可信度：E132 之后 `max_hosts` 只限制「拿到几个**有命中**的
+            # 源」，所以 cands 为空 = 所有可用源都搜过、都没有这一集。
+            #
+            # 不冷却 `no_target`：那是本地算不出目标路径，与源站无关。
+            if why2 and str(why2) != "no_target":
+                _k3 = ep_cool_key(item, _season, ep)
+                if _k3:
+                    try:
+                        mark_new_done(
+                            _k3, days=FILL_NO_SOURCE_COOL_HOURS / 24.0,
+                            reason="fill_no_source:%s" % str(why2)[:60])
+                        print("fill: 无源冷却 %s S%dE%d（%s，%.0fh）" % (
+                            item.get("series"), _season, ep,
+                            str(why2)[:40], FILL_NO_SOURCE_COOL_HOURS),
+                            file=sys.stderr, flush=True)
+                    except Exception:                  # noqa: BLE001
+                        pass
             continue
         target, c = chosen
         key, why = check_existing(item, int(item["season"]), ep, target, c["quality"]["label"])

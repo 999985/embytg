@@ -292,7 +292,22 @@ fi
 if [ "$MODE" = "auto" ]; then
   LANES_ORDER="$("$VENV" "$POLICY" next 2>/dev/null || echo new)"
 else
+  # 2026-11-17（E163）：**固定车道的 runner 在 NOJOB 之后必须能换道，不能空转。**
+  #
+  # 事故形状：slot4 用 LANE=fill 固定，而 fill 队列只有 12 条、大部分集已冷却 →
+  # 实测今日 24 次 `NOJOB lane=fill`，每 15.5 分钟一次（03:44→06:04 连续），
+  # 这一条 lane 整天基本在 IDLE_NO_JOB；同时 upgrade 队列压着 2000 条、
+  # new 队列实际待扫 2706 条。五条 lane 里白扔一条 ≈ 20% 产能。
+  #
+  # 原因不是「fill 没事干」这件事本身，而是 `LANES_ORDER="$MODE"` 把这个事实
+  # 变成了「这条 lane 不许干别的」。固定车道的**优先级**要保留（fill 永远先试
+  # fill），但**独占性**没有理由 —— claim 是全局加锁的，多条 lane 抢同一队列
+  # 不会重复领片（同一 state_key 只能被一个 claim 拿走）。
   LANES_ORDER="$MODE"
+  for L in upgrade new fill; do
+    [ "$L" = "$MODE" ] && continue
+    LANES_ORDER="$LANES_ORDER $L"
+  done
 fi
 log "START mode=$MODE candidates=$LANES_ORDER"
 
