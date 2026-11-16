@@ -1,0 +1,101 @@
+name: ingest
+
+# 手动触发一次上片（一个 job = 一集）。
+# 默认不会自己跑：只有你在网页上点 "Run workflow" 才执行。
+#
+# 需要的 Secrets（Settings → Secrets and variables → Actions）：
+#   TG_API_ID, TG_API_HASH
+#   TG_SESSION_STRING, TG_SESSION_STRING_2, TG_SESSION_STRING_3, TG_SESSION_STRING_4
+#   TG_STORE_CH                存储频道 id（多个用逗号分隔）
+#   ORACLE_HOST, ORACLE_PORT, ORACLE_USER
+#   ORACLE_SSH_KEY             能登控制面的私钥（整段，含 BEGIN/END 行）
+#
+# 安全提醒：session 等于账号登录态。放进 GitHub Secrets 后，
+# 能改这个仓库 workflow 的人就能把它打出来——公开仓库尤其要谨慎。
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "用哪个账号槽位（对应 TG_SESSION_STRING_N，1-4）"
+        default: "1"
+        required: true
+      lane:
+        description: "车道名（new2 / fill / upgrade，随便填但要在控制面存在）"
+        default: "gha"
+        required: true
+
+concurrency:
+  group: ingest-${{ inputs.slot }}
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg >/dev/null
+          python -m pip install -q --upgrade pip
+          python -m pip install -q telethon
+
+      - name: 写 runner.env
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          S1: ${{ secrets.TG_SESSION_STRING }}
+          S2: ${{ secrets.TG_SESSION_STRING_2 }}
+          S3: ${{ secrets.TG_SESSION_STRING_3 }}
+          S4: ${{ secrets.TG_SESSION_STRING_4 }}
+          STORE: ${{ secrets.TG_STORE_CH }}
+          OH: ${{ secrets.ORACLE_HOST }}
+          OP: ${{ secrets.ORACLE_PORT }}
+          OU: ${{ secrets.ORACLE_USER }}
+          OK: ${{ secrets.ORACLE_SSH_KEY }}
+        run: |
+          set -e
+          umask 077
+          {
+            echo "TG_API_ID=$TG_API_ID"
+            echo "TG_API_HASH=$TG_API_HASH"
+            echo "TG_SESSION_STRING=$S1"
+            echo "TG_SESSION_STRING_2=$S2"
+            echo "TG_SESSION_STRING_3=$S3"
+            echo "TG_SESSION_STRING_4=$S4"
+            echo "TG_STORE_CH=$STORE"
+            echo "ORACLE_HOST=$OH"
+            echo "ORACLE_PORT=${OP:-22323}"
+            echo "ORACLE_USER=${OU:-root}"
+          } > runner/runner.env
+          printf '%s\n' "$OK" > /tmp/ctl_key
+          chmod 600 /tmp/ctl_key
+          echo "runner.env 行数: $(wc -l < runner/runner.env)"
+
+      - name: 控制面可达性
+        run: |
+          set -e
+          H=$(grep '^ORACLE_HOST=' runner/runner.env | cut -d= -f2)
+          P=$(grep '^ORACLE_PORT=' runner/runner.env | cut -d= -f2)
+          ssh -i /tmp/ctl_key -p "$P" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              -o ConnectTimeout=15 "root@$H" 'echo CONTROL_OK; hostname' || {
+            echo "::error::控制面连不上，检查 ORACLE_* secrets 与私钥"; exit 1; }
+
+      - name: 跑一集
+        env:
+          RUNNER_SLOT: ${{ inputs.slot }}
+          RUNNER_LANE: ${{ inputs.lane }}
+          ORACLE_KEY: /tmp/ctl_key
+        run: |
+          chmod +x runner/run_one.sh
+          bash runner/run_one.sh
+
+      - name: 清理
+        if: always()
+        run: shred -u /tmp/ctl_key runner/runner.env 2>/dev/null || rm -f /tmp/ctl_key runner/runner.env

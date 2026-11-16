@@ -1,0 +1,32 @@
+name: check
+
+# 只在代码变更时做静态检查与回归测试，不碰任何凭据、不跑上片。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 语法检查
+        run: |
+          python -m compileall -q pipeline runner || exit 1
+      - name: shell 语法
+        run: |
+          fail=0
+          while IFS= read -r f; do bash -n "$f" || fail=1; done < <(find pipeline runner -name '*.sh')
+          exit $fail
+      - name: 回归测试（如果存在 tests 目录）
+        run: |
+          if [ -d pipeline/tests ]; then
+            python -m unittest discover -s pipeline/tests -v
+          else
+            echo "no tests dir"
+          fi
