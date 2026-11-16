@@ -1,0 +1,1094 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""gha_state.py — shared lane claims and cross-process source budget.
+
+The three logical lanes (new/fill/upgrade) run in separate jobs.  The upgrade
+queue is split into two mutually exclusive runner shards (``upgrade`` and
+``upgrade2``) so two claims can run without selecting the same episode.
+share one source-server policy and must not race on claims or source limits.
+This module is deliberately small: it only stores JSON state and uses flock;
+media download/registration/scraping stay in the project's existing scripts.
+"""
+import contextlib
+import fcntl
+import json
+import math
+import os
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CLAIM_DIR = os.path.join(HERE, ".gha_claims")
+LEGACY_CLAIM = os.path.join(HERE, ".gha_claim.json")
+LANES = ("new", "new2", "new3", "new4", "new5", "fill", "upgrade", "upgrade2")
+CLAIM_TTL = int(os.getenv("GHA_CLAIM_TTL", str(24 * 3600)))
+
+BUDGET_FILE = os.path.join(HERE, ".gha_src_budget.json")
+BUDGET_LOCK = os.path.join(HERE, ".gha_src_budget.lock")
+BURST_WINDOW = 20 * 60
+DEFAULT_BUDGET = {
+    "daily": int(os.getenv("GHA_SRC_DAILY", "300")),
+    "burst_20m": int(os.getenv("GHA_SRC_BURST_20M", "60")),
+    "fail_cooldown_sec": int(os.getenv("GHA_SRC_FAIL_COOLDOWN", "600")),
+}
+
+
+def _read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:                                      # noqa: BLE001
+        return default
+
+
+def _write_json_atomic(path, obj):
+    tmp = path + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _write_budget_guarded(d):
+    """写预算文件前，禁止用「空计数」覆盖「有计数」的同日数据，并强制日上限。
+
+    2026-11-13 事故 1：观测到 .gha_src_budget.json 所有源的 day 在同一秒被清成 0
+    （此前 bangumi=301 / ct.cdn=297 …），runner_report 因此报出「配额 1000000」。
+    成因是读-改-写在跨进程下不互斥时，某个进程拿到了 _empty_budget()（跨日分支
+    或读到损坏文件），随后把自己的空结构整体写回，覆盖了别的进程刚记的计数。
+    配额是硬顶，被清零等于当天可以无限请求源站 —— 这条必须挡住。
+
+    2026-11-13 事故 2（连续跑三次任务时发现）：emby.bangumi.ca 与
+    goemby.entertang.work 都出现了 day=301，**超出上限 1**。原因是两个进程
+    同时读到 299，各自 +1 后分别写回 300 和 301 —— 典型的读-改-写竞态。
+    模块顶部早就 import 了 fcntl 且定义了 BUDGET_LOCK，但本函数从没用过。
+
+    注意：所有调用方（charge_guard / record_source_* / eligible_sources）
+    已经在 `with _budget_lock():` 内，**不能在这里再开一个 fd 加 LOCK_EX** ——
+    实测同进程内对同一文件用两个 fd 加 LOCK_EX 会阻塞，直接死锁。
+    所以这里用 _BUDGET_LOCK_DEPTH 计数：已在锁内就只做裁剪+落盘，不再加锁；
+    被单独调用（深度 0）时自己加锁，保证互斥。
+
+    规则：
+      1) 同日且新计数总和 < 现有总和 → 拒绝覆盖，合并保留较大值
+      2) 任何源的 day 超过其日上限 → 压回上限（附 budget_clip 标记，便于审计）
+    """
+    limit_default = int(DEFAULT_BUDGET["daily"])
+    if _BUDGET_LOCK_DEPTH > 0:
+        _budget_merge_and_clip(d, limit_default)
+        return
+    with _budget_lock():
+        _budget_merge_and_clip(d, limit_default)
+
+
+def _budget_merge_and_clip(d, limit_default):
+    try:
+        cur = _read_json(BUDGET_FILE, None)
+        if isinstance(cur, dict) and cur.get("date") == d.get("date"):
+            cur_sum = sum(int((v or {}).get("day") or 0) for v in (cur.get("sources") or {}).values())
+            new_sum = sum(int((v or {}).get("day") or 0) for v in (d.get("sources") or {}).values())
+            if new_sum < cur_sum:
+                # 合并：保留两边较大的 day，events 取并集（去重）
+                merged = dict(d)
+                msrc = dict(d.get("sources") or {})
+                for lab, crec in (cur.get("sources") or {}).items():
+                    nrec = dict(msrc.get(lab) or {})
+                    cday = int((crec or {}).get("day") or 0)
+                    nday = int(nrec.get("day") or 0)
+                    if cday > nday:
+                        nrec["day"] = cday
+                        ev = list(set((crec or {}).get("events") or []) |
+                                  set(nrec.get("events") or []))
+                        nrec["events"] = sorted(ev)
+                    for k in ("download_fails", "fails"):
+                        if int((crec or {}).get(k) or 0) > int(nrec.get(k) or 0):
+                            nrec[k] = int(crec.get(k) or 0)
+                    for k in ("cooldown_until", "download_cooldown_until"):
+                        if float((crec or {}).get(k) or 0) > float(nrec.get(k) or 0):
+                            nrec[k] = float(crec.get(k) or 0)
+                    msrc[lab] = nrec
+                merged["sources"] = msrc
+                d = merged
+    except Exception:                                          # noqa: BLE001
+        pass
+
+    # 硬裁剪：任何源不得超过日上限
+    clipped = {}
+    src = dict(d.get("sources") or {})
+    for lab, rec in list(src.items()):
+        if not isinstance(rec, dict):
+            continue
+        cap = int(rec.get("limit") or limit_default)
+        used = int(rec.get("day") or 0)
+        if used > cap:
+            nrec = dict(rec)
+            nrec["budget_clip"] = {"from": used, "to": cap,
+                                   "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            nrec["day"] = cap
+            src[lab] = nrec            # 必须回写，否则裁剪不生效
+            clipped[lab] = used
+    if clipped:
+        d = dict(d)
+        d["sources"] = src
+        d["clipped"] = clipped
+        d["clipped_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    _write_json_atomic(BUDGET_FILE, d)
+
+
+def claim_path(lane):
+    return os.path.join(CLAIM_DIR, lane + ".json")
+
+
+def active_claim(path):
+    d = _read_json(path, None)
+    if not isinstance(d, dict):
+        return None
+    if d.get("status") != "running":
+        return None
+    if time.time() - float(d.get("ts") or 0) >= CLAIM_TTL:
+        return None
+    return d
+
+
+def read_claim(lane):
+    return active_claim(claim_path(lane))
+
+
+def read_claims(include_legacy=True):
+    """Return active lane claims, plus the legacy single-claim file if present."""
+    out = []
+    seen = set()
+    for lane in LANES:
+        d = read_claim(lane)
+        if not d:
+            continue
+        key = (lane, d.get("job_id") or d.get("run_id") or id(d))
+        if key not in seen:
+            out.append(d)
+            seen.add(key)
+    if include_legacy:
+        d = active_claim(LEGACY_CLAIM)
+        if d:
+            key = ("legacy", d.get("job_id") or d.get("run_id") or id(d))
+            if key not in seen:
+                out.append(d)
+    return out
+
+
+def find_claim(run_id, include_failed=False):
+    """Return (path, job) for a claim with this run_id/run_key.
+
+    ``gha_finish`` must be able to resume a claim it marked ``failed`` after a
+    transient registration/scraping error.  Keep the default active-only
+    behaviour for every other caller.
+    """
+    paths = [claim_path(lane) for lane in LANES] + [LEGACY_CLAIM]
+    now = time.time()
+    for path in paths:
+        d = _read_json(path, None)
+        if not isinstance(d, dict) or str(d.get("run_id")) != str(run_id):
+            continue
+        status = d.get("status")
+        if status == "running":
+            if now - float(d.get("ts") or 0) < CLAIM_TTL:
+                return path, d
+            continue
+        if include_failed and status == "failed":
+            if now - float(d.get("ts") or 0) < CLAIM_TTL:
+                return path, d
+    return None, None
+
+
+def write_claim(lane, job):
+    os.makedirs(CLAIM_DIR, mode=0o700, exist_ok=True)
+    _write_json_atomic(claim_path(lane), job)
+
+
+def save_claim(path, job):
+    _write_json_atomic(path, job)
+
+
+def release_claim(path):
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def leased_sources(claims):
+    return {str(d.get("source_label")) for d in claims if d.get("source_label")}
+
+
+def leased_source_load(claims):
+    """每个源当前被多少个 claim 占用（软租约用）。
+
+    2026-11-13：租约原来是「整源独占」—— 只要一个源被某个 claim 用了，
+    eligible_sources() 就把它整个排除。实测后果：8 个源里只有 3 个能产出
+    （其余日配额打满或高失败率），而这 3 个全被 3 个活动 claim 独占，
+    于是第 4/5 台机器永远 NOJOB，五路产能实际只有三路。
+    源站配额是按「请求次数」计费的，不是按并发数，所以同一源并发使用
+    不会多花配额；真正要防的只是把源站打到限流。
+    改成软租约：已占用的源排到最后，只有在没别的选择时才复用。
+    """
+    load = {}
+    for d in claims:
+        lab = str(d.get("source_label") or "")
+        if lab:
+            load[lab] = load.get(lab, 0) + 1
+    return load
+
+
+_BUDGET_LOCK_DEPTH = 0
+
+
+@contextlib.contextmanager
+def _budget_lock():
+    """跨进程互斥锁，并维护进程内重入深度。
+
+    2026-11-13：_write_budget_guarded 需要知道自己是否已在锁内。
+    实测同一进程内对同一文件用两个 fd 加 LOCK_EX 会阻塞（不是可重入锁），
+    所以必须用深度计数，而不是在写函数里无条件再加一次锁。
+    """
+    global _BUDGET_LOCK_DEPTH
+    os.makedirs(os.path.dirname(BUDGET_LOCK), exist_ok=True)
+    fd = os.open(BUDGET_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _BUDGET_LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _BUDGET_LOCK_DEPTH -= 1
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _today():
+    # 日预算按 **北京时间** 换日（2026-11-13）：
+    # 原来用 time.strftime("%F") 取宿主机本地日期，而 runner/queue 脚本跑在 UTC 语境，
+    # 结果每天 08:00 CST 才换日，北京时间 00:00–08:00 一直在用前一天的配额
+    # （表现为「上午就显示 day=300 已打满」，把可用配额人为压缩 1/3）。
+    # 环境变量 GHA_BUDGET_TZ_OFFSET 可覆盖（秒，默认 +8h）。
+    off = int(os.getenv("GHA_BUDGET_TZ_OFFSET", str(8 * 3600)))
+    return time.strftime("%F", time.gmtime(time.time() + off))
+
+
+def _empty_budget():
+    return {"version": 1, "date": _today(), "rr": 0,
+            "limits": dict(DEFAULT_BUDGET), "sources": {}}
+
+
+# ---------- 静态源配置（E144） ----------
+# 病根（2026-11-16 06:xx 自省）：`disabled` / `daily_cap` 这类**配置**和当天计数
+# 存在同一个 `.gha_src_budget.json` 里，而 `_load_budget_unlocked()` 跨日直接
+# `return _empty_budget()` —— 于是每天北京时间 00:00 把配置一起清掉。
+#
+# 当天实测代价：video.emos.best 的 `disabled` 在 00:00 被清空 → 08:00 前
+# 又烧满 300 次配额、ok=0（E110 早已判定它是魔改客户端，/Items 全 404）；
+# emby.bangumi.ca / ct.cdn.bgp.yt 的 `daily_cap=0`（E069 实测无限制）同样丢失，
+# 被降级成礼貌值 300 —— 最好的源反而被自己的兜底限制掐住。
+#
+# 修法分两层：
+#   ① 配置搬到 git 跟踪的 `config/sources_static.json`，任何一次读预算都会合并它，
+#      运行时文件被删/被日切/被写坏都不会丢配置；
+#   ② 日切时保留旧记录里所有**非当天计数**字段（按排除法，加新静态字段不用改代码）。
+STATIC_CONF = os.path.join(os.path.dirname(HERE), "config", "sources_static.json")
+
+# 每个源记录里属于「当天计数/瞬时状态」的键。除此之外的键一律视为静态配置，跨日保留。
+_DAILY_REC_KEYS = frozenset((
+    "day", "events", "fails", "cooldown_until", "download_fails",
+    "download_cooldown_until", "last", "ok", "budget_clip",
+    "last_download_error", "ok_at",
+))
+# 跨日重建时显式写回的零值，保证下游（runner_report / quota_history 等直接读文件的地方）
+# 拿到的形状与 `_source_record()` 一致，不用各自写 `.get() or 0`。
+# 用函数而不是常量字典：dict 里的 `events` 是 list，共享同一个对象会被下游写坏。
+def _daily_reset():
+    return {"day": 0, "events": [], "fails": 0, "cooldown_until": 0,
+            "download_fails": 0, "download_cooldown_until": 0,
+            "last": 0, "ok": 0}
+
+
+def static_source_conf():
+    """读 `config/sources_static.json` 的 sources 段（坏文件/缺文件返回 {}）。"""
+    d = _read_json(STATIC_CONF, None)
+    src = (d or {}).get("sources") if isinstance(d, dict) else None
+    return src if isinstance(src, dict) else {}
+
+
+def _apply_static(d):
+    """把静态配置合并进预算结构：静态优先，且**不许覆盖当天计数**。"""
+    if not isinstance(d.get("sources"), dict):
+        d["sources"] = {}
+    for label, conf in static_source_conf().items():
+        if not isinstance(conf, dict):
+            continue
+        rec = d["sources"].setdefault(str(label), {})
+        for k, v in conf.items():
+            if k in _DAILY_REC_KEYS:
+                continue                   # 配置写错成 day/ok 时忽略，别污染计数
+            rec[k] = v
+    return d
+
+
+def _rollover_budget(old):
+    """跨日：计数归零，但**配置必须原样带过来**（E144）。
+
+    · limits：运维手工调过的全局阈值跨日保留。
+    · sources[*]：只保留非 `_DAILY_REC_KEYS` 的字段（disabled / daily_cap / note …）。
+    """
+    new = _empty_budget()
+    if isinstance(old, dict):
+        lim = old.get("limits")
+        if isinstance(lim, dict):
+            new["limits"].update({k: v for k, v in lim.items() if k in DEFAULT_BUDGET})
+        for label, rec in (old.get("sources") or {}).items():
+            if not isinstance(rec, dict):
+                continue
+            keep = {k: v for k, v in rec.items() if k not in _DAILY_REC_KEYS}
+            new["sources"][str(label)] = dict(_daily_reset(), **keep)
+    return _apply_static(new)
+
+
+def _load_budget_unlocked():
+    d = _read_json(BUDGET_FILE, None)
+    if not isinstance(d, dict) or d.get("date") != _today():
+        return _rollover_budget(d if isinstance(d, dict) else None)
+    d.setdefault("version", 1)
+    d.setdefault("rr", 0)
+    limits = dict(DEFAULT_BUDGET)
+    limits.update(d.get("limits") or {})
+    d["limits"] = limits
+    d.setdefault("sources", {})
+    return _apply_static(d)
+
+
+def _source_record(d, label, now):
+    rec = d["sources"].setdefault(label, {})
+    rec.setdefault("day", 0)
+    rec.setdefault("events", [])
+    rec.setdefault("fails", 0)
+    rec.setdefault("cooldown_until", 0)
+    rec.setdefault("download_fails", 0)
+    rec.setdefault("download_cooldown_until", 0)
+    rec.setdefault("last", 0)
+    # 2026-11-13：产能归因。以前只记"打了多少枪"（day=hits）和"失败几次"，
+    # **从不记"打中多少"**，于是"sources 里谁在白烧配额"永远只能靠感觉判断。
+    # ok = 当天成功出片数（与 day 同生命周期，日切随预算整体重置）。
+    rec.setdefault("ok", 0)
+    rec["events"] = [float(x) for x in rec.get("events") or []
+                     if now - float(x) < BURST_WINDOW]
+    return rec
+
+
+def _source_yield_penalty(rec, now):
+    """返回该源今日应按多大比例打折使用配额（0.0-1.0，1.0=不打折）。
+
+    2026-11-13：4 个源日配额打满，但 emby.chapanda.site 与 ibukifuko.tech
+    各烧掉 300 次却入库 0 集（last_download_error = source_too_slow /
+    source_preflight_not_video）。配额是硬顶，被零产出源吃掉就等于直接减产。
+    这里按「下载失败次数」动态降权：失败越多，允许用的日配额越少。
+      download_fails 0     → 100%
+      download_fails 1-2   → 75%
+      download_fails 3-5   → 50%
+      download_fails 6-9   → 30%
+      download_fails >=10  → 15%（基本只留探测用）
+    次日 download_fails 归零，权重自动恢复 —— 不引入人工干预。
+    """
+    f = int(rec.get("download_fails") or 0)
+    if f <= 0:
+        return 1.0
+    if f <= 2:
+        return 0.75
+    if f <= 5:
+        return 0.5
+    if f <= 9:
+        return 0.4    # 2026-11-14：原为 0.3，但下一档为 0.35 —— 失败更多反而额度更高。
+                     # 由回归测试 test_penalty_is_monotonic 抓到的。
+    # 2026-11-14：最低档从 0.15 提到 **0.35**。
+    # 0.15 意味着 eff_cap=45；而一旦碰到 eff_cap，
+    # 这个源就再也没机会下载、也就永远不会成功、
+    # download_fails 永远不会被 record_source_success 清零 ——
+    # **一个自封的死锁**。实测 emby.chapanda.site day=67/ok=0/dl_fails=10
+    # 被锁死整天，而它占队列 45%（2688 条）。
+    # 保留一份探针额度，让它能靠自己的成功走出来。
+    return 0.35
+
+
+def _eff_cap_of(rec, limits, now):
+    """单个源今天允许的请求上限。**唯一的额度计算入口**（两处调用必须一致）。
+
+    三档语义（`rec["daily_cap"]`，写在 `.gha_src_budget.json` 的 sources[label] 里）：
+
+    | daily_cap | 含义 | 适用 |
+    |---|---|---|
+    | 未声明 | 全局 daily × 惩罚 × 加成，硬顶 400 | 默认（礼貌值，防静默封号） |
+    | N > 0  | 固定 N，**不受惩罚回收** | 源站有限流但阈值已知更高 |
+    | 0      | 不限（仍受 burst_20m 与 1.6s 间隔约束） | 源站本身无请求限制 |
+
+    为什么"不限"也只放日额度、不放频率：`SOURCE_SERVERS.md` 定的
+    「单源并发=1、间隔≥1.6s、burst 窗口」才是防封的核心，那是**频率**规则；
+    日额度只是**总量**礼貌值。源站既然不限总量，就没必要自己卡自己。
+
+    `emby.chapanda.site` 的教训：它被封是因为**旧 UA**（浏览器串），
+    不是频率 —— 所以解封后恢复正常额度即可，不必额外设限。
+
+    2026-11-14（E104）：**固定 `daily_cap` 不得绕过下载失败惩罚。**
+    原来的写法 `if per > 0: return per` 让 daily_cap 成为后门：
+    chapanda 的注记写着「下载永远 source_too_slow，只用于元数据校验」，
+    却带着 `daily_cap: 40` —— 惩罚系数 0.35 被整个跳过，它每天照样拿 40 次
+    去下必然失败的文件，每次领活吃掉一个 claim 和几十分钟。
+    实测当天它 `download_fails=20 / ok=0`，占掉了 lane 大量空转时间。
+
+    正确语义分两件事：
+      - `daily_cap` 是**礼貌值**（怕被封号）→ 可以覆盖默认的日总量。
+      - `_source_yield_penalty` 是**它做不出活的证据**（下不动 / 不是视频）
+        → 必须照样打折。一个明天下不动、今天却给了全额的源，
+        是在拿唯一的硬资源（claim + lane 时间）去换零产出。
+    因此：N>0 → `min(N, N × penalty)`；0（不限）同理受惩罚约束，
+    只有 penalty=1.0（近期零失败）时才真正不限。
+    """
+    per = rec.get("daily_cap")
+    pen = _source_yield_penalty(rec, now)
+    if per is not None:
+        per = int(per)
+        if per == 0:
+            # 「不限」= 不设礼貌上限，但仍受失败率约束
+            return 10 ** 9 if pen >= 1.0 else int(400 * pen)
+        if per > 0:
+            return max(1, int(per * pen)) if pen < 1.0 else per
+    return min(400, int(int(limits["daily"]) * pen
+                        * _source_yield_bonus(rec, now)))
+
+
+def _source_yield_bonus(rec, now):
+    """高产出源的额度加成（1.0-1.5）。
+
+    2026-11-14：配额模型只有惩罚没有奖励 ——
+    39.96.113.82-mirror 今日 ok=32（命中率 10.7%，全部源里最高），
+    却和零产出源一样被卡在 300 次，08:16 就打满。
+    队伍剩下 270 次额度，而能花的源全没了条目。
+
+    **惩罚只能减少浪费，不能发现优秀。** 只有惩罚的系统会把
+    好源和坏源一起压平，最后变成"大家都平均地少干"。
+
+    判据：day>=60（样本足够）且命中率>=5% → 1.5 倍。
+    """
+    day = int(rec.get("day") or 0)
+    ok = int(rec.get("ok") or 0)
+    if day >= 60 and ok and ok * 100.0 / day >= 5.0:
+        return 1.5
+    return 1.0
+
+
+def eligible_sources(labels, leased=None, load=None):
+    """Return a rotated, least-used source order allowed by the shared budget.
+
+    ``leased`` 参数保留兼容：传进来的源视为「已被占用」，不再直接排除，
+    而是排在最后（软租约）。见 leased_source_load() 的说明。
+    ``load`` 是 {source: 当前占用数}，占用越多排越后。
+    """
+    labels = [str(x) for x in labels if x]
+    leased = {str(x) for x in (leased or set()) if x}
+    load = {str(k): int(v or 0) for k, v in (load or {}).items()}
+    now = time.time()
+    with _budget_lock():
+        d = _load_budget_unlocked()
+        limits = d["limits"]
+        rows = []
+        for label in labels:
+            rec = _source_record(d, label, now)
+            # 2026-11-15（E110）：**永久禁用的源。**
+            # video.emos.best 是魔改客户端：只有 /Library/MediaFolders 能用，
+            # 所有 /Items 内容接口全 404 —— 300 次请求 0 成功，
+            # 队列里 1050 条全是废条目。它不会被"冷却"自动淘汰，
+            # 因为失败计数会随时间衰减，于是反复回池、反复白烧。
+            # disabled=true 是显式的永久出局，只能人工摘除。
+            if rec.get("disabled"):
+                continue
+            if rec["cooldown_until"] > now or rec["download_cooldown_until"] > now:
+                continue
+            # 按下载失败率动态收紧该源今日允许的上限（配额硬顶别浪费在零产出源上）
+            # 硬顶：加成后不超过 400/天。
+            # 300 是"礼貌值"（实测全天零 429），但礼貌值上加倍
+            # 必须有上界 —— 被静默封号是永久失去源，比少出几集代价大得多。
+            #
+            # 2026-11-14：**逐源覆盖**。有些源站自己不限流（用户实测
+            # `emby.bangumi.ca` / `ct.cdn.bgp.yt` 无限制），对它们套 300/400
+            # 的礼貌值纯属浪费。声明方式：`.gha_src_budget.json` 的
+            # sources[label].daily_cap。三档语义见 `_eff_cap_of()`。
+            eff_cap = _eff_cap_of(rec, limits, now)
+            if int(rec.get("day") or 0) >= eff_cap:
+                continue
+            if len(rec["events"]) >= int(limits["burst_20m"]):
+                continue
+            # 软租约：被占用的源额外增加排序权重，但不禁用
+            busy = (1 if label in leased else 0) + int(load.get(label) or 0)
+            # 2026-11-14：「试过不少、一集也没出」的源排到最后。
+            # 原来只按"用量最少"排序，于是 ok=0 的坏源（因为用得少）
+            # 反而总被优先选中，整个队伍陪它一起空转。
+            # 实测 emby.chapanda.site day=67/ok=0 却被选中，
+            # 而 39.96.113.82-mirror day=185/ok=10 反而轮不到。
+            # day>=20 才算"试过"，避免把新源（day=0,ok=0）误伤。
+            zero_yield = 1 if (int(rec.get("day") or 0) >= 20
+                               and int(rec.get("ok") or 0) == 0) else 0
+            rows.append((busy, zero_yield, len(rec["events"]),
+                         int(rec.get("day") or 0),
+                         float(rec.get("last") or 0), label))
+        rows.sort()
+        labels_sorted = [x[-1] for x in rows]
+
+        # 2026-11-15（E108）：**节流统计只算真正可用的源。**
+        #
+        # 实测 bug：eligible_sources(6 个源) 返回 []，但其中 4 个单独测都可用。
+        # 根因是被封的源（yuntv download_fails=22、video.emos.best fails=10）
+        # 已经在前面 continue 掉了，可下面的节流计算仍把它们的 events
+        # 算进 recent_rate —— 它们的请求量拉高"近期速率"，触发
+        # `recent_rate > allowed_rate * 2.5` → labels_sorted 清空 → 全部不放行。
+        #
+        # 一句话：**一个源被封，应该只损失它自己，不能拖累其他源。**
+        _usable = [x[-1] for x in rows]        # 通过冷却/额度/突发过滤的源
+        if not _usable:
+            return []
+
+        # ---- 全天节流器（2026-11-14，第二版）----
+        # 第一版用「累计用量 vs 累计应花」，超速就停 —— 设计错了：
+        # 停到半夜等于把剩下的额度白白浪费（实测 4 小时用了 854/2700，
+        # 若一直停到 24 点，68% 的额度永远花不出去）。
+        # 目标不是"花得均匀"，是**把额度全部花在有片的时候**。
+        #
+        # 正确做法是节流器：拿「剩余额度 ÷ 剩余小时」算出允许的速率，
+        # 再和近期实际速率比：
+        #   实际 ≤ 允许×1.2  → 全部源（正常探索）
+        #   实际 ≤ 允许×2.0  → 只放 1 个源（降速）
+        #   实际 >  允许×2.0 → 本轮不放行（严重超速才停，且下一轮就是 5 分钟后）
+        # 这样既不会提前烧光，也不会把额度剩下来。
+        used = sum(int(_source_record(d, l, now).get("day") or 0) for l in labels)
+        caps = []
+        for label in labels:
+            rec = _source_record(d, label, now)
+            caps.append(_eff_cap_of(rec, limits, now))
+        total_cap = sum(caps) or 0
+        if total_cap and labels_sorted:
+            midnight = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+            elapsed_h = max(0.2, (now - midnight) / 3600.0)
+            remain_h = max(0.2, 24.0 - elapsed_h)
+            remain = max(0, total_cap - used)
+            allow_rate = remain / remain_h          # 每小时允许花掉多少
+            # 近期实际速率：用各源 events（BURST_WINDOW 内的请求时间戳）求和
+            win = float(BURST_WINDOW or 1200)
+            recent = []
+            for l in labels:
+                recent.extend(float(x) for x in (_source_record(d, l, now).get("events") or []))
+            rate = len([x for x in recent if now - x <= win]) / (win / 3600.0)
+            # 2026-11-14 第四版（定稿）：兜底 + 温和槽位跳过
+            #
+            # 前三版的教训：
+            #   ① 超速就全停 → 额度锁死，68% 用不掉
+            #   ② 按近期速率节流 → events 窗口滞后，停20分跑5分，振荡
+            #   ③ 纯兜底 → lane 自带 sleep 给出 135 次/小时，但有效容量只有 1950，
+            #      按此中午就烧光、晚上（日更剧上线）没额度
+            #
+            # 定稿：lane 的节奏是底盘，槽位跳过只用来把速率从 135 压到 ~70-80。
+            #   n = clamp(round(used/target / 1.3), 2, 3)
+            #   实测 used/target≈2.5 → n=2 → 每 2 个 5 分钟槽干一次 ≈ 67 次/小时，
+            #   全天 ≈ 1600 次，既不会提前烧光，也不会剩一大截。
+            # 跳过时仍只放 1 个源（单次成本最低）。
+            # 2026-11-14（第七版，按**近期速率**限流）
+            #
+            # 前六版都在拿"累计用量 vs 累计应花"做判据。这个对比有个致命缺陷：
+            # **前半夜的一次性扫描会永远拖着后半天的判断**。
+            # 实测：06:42 已用 1503/1800，剩下的三百次要么十分钟内烧完、
+            # 要么按旧公式一直被判"超速"而不放行 —— 两头都不对。
+            #
+            # 正确的问法是：**现在的速度，能不能把剩下的额度撑到午夜？**
+            #   allowed_rate = 剩余额度 / 剩余小时
+            #   recent_rate  = 最近 BURST_WINDOW 内的请求数 × (小时/窗口)
+            #
+            # 带死区（避免振荡）：
+            #   recent <= allowed×1.2          → 正常，全部源
+            #   allowed×1.2 < recent <= allowed×2.5 → 只给 1 个源
+            #   recent > allowed×2.5          → 这一轮不给（lane 带抖动重试）
+            #
+            # **安全阀**：窗口内一次请求都没有 → 无条件放行。
+            # 否则一旦公式算错，系统会彻底停摆而且不会自愈（今天已经踩过这个坑）。
+            # 2026-11-14（第十二版）：**用各源余量之和，不用总和相减**。
+            #
+            # 实测：五个队列源 used=970、total_cap=970 → 判"used>=cap" → 全停。
+            # 但分解开看：39.96 还剩 100 次（它 ok=32、cap 被奖励到 400），
+            # 而 ct/chapanda/ibukifuko 各超了 20-55 次 —— **超额的源把余量吃掉了**。
+            # "已用总和 >= 额度总和"是个假信号：它把"某个源还能干活"
+            # 和"另一个源已经超了"混成一个数。
+            # 每个源在上面的过滤里已经按自己的 eff_cap 卡过了，
+            # 这里只需算"还有多少可用的余量"。
+            _head = 0
+            for _l in _usable:
+                _r = _source_record(d, _l, now)
+                _cap = _eff_cap_of(_r, limits, now)
+                _head += max(0, _cap - int(_r.get("day") or 0))
+            remain = min(max(0, total_cap - used), _head)
+            if _head <= 0:
+                labels_sorted = []
+            elif labels_sorted:
+                remain_h = max(0.2, 24.0 - elapsed_h)
+                allowed_rate = remain / remain_h
+                win = float(BURST_WINDOW or 1200)
+                recent = 0
+                for l in _usable:
+                    recent += len([x for x in (_source_record(d, l, now).get("events") or [])
+                                   if now - float(x) <= win])
+                if recent <= 0:
+                    pass                                   # 安全阀：没动静就放行
+                else:
+                    recent_rate = recent * (3600.0 / win)
+                    if allowed_rate > 0 and recent_rate > allowed_rate * 2.5:
+                        labels_sorted = []
+                    elif allowed_rate > 0 and recent_rate > allowed_rate * 1.2:
+                        # 2026-11-14（第八版）：**放行时不再只给 1 个源**。
+                        # 实测：放行那一轮只给 1 个源，而那个源的条目恰好全在冷却中
+                        # → `no_job`，白花 7 次请求。节流的目的是**控制量**，
+                        # 不是"只让一个源去碰运气"。每次放行都该能找到活，
+                        # 否则剩下的额度会被一次次空放消耗完。
+                        # 频率仍由窗口决定（一轮决策 = 一次机会），不会因此超速。
+                        labels_sorted = labels_sorted[:3]
+
+        if labels_sorted:
+            rr = int(d.get("rr") or 0)
+            k = rr % min(3, len(labels_sorted))
+            labels_sorted = labels_sorted[k:] + labels_sorted[:k]
+            d["rr"] = rr + 1
+            _write_budget_guarded(d)
+        return labels_sorted
+
+
+def charge_guard(guard):
+    """Persist request counts/failures from one fresh src_guard.Guard session."""
+    now = time.time()
+    with _budget_lock():
+        d = _load_budget_unlocked()
+        limits = d["limits"]
+        for label, st in getattr(guard, "states", {}).items():
+            # 2026-11-14：预算按**源站真正应答过**的次数记，不按尝试次数。
+            # 实测 2300 次尝试里 323 次是连接失败（status=0，DNS/超时/拒绝），
+            # 源站应用层根本没收到请求，却照样扣掉当天配额 —— 白烧 14%。
+            # 多镜像源更糟：一次逻辑 GET 会依次试多个 host，每个都 +1。
+            # answered 只在拿到 HTTP 响应时 +1（404/500 也算应答，服务器确实处理了）。
+            count = int(getattr(st, "answered", None)
+                        if getattr(st, "answered", None) is not None
+                        else getattr(st, "count", 0) or 0)
+            fails_now = int(getattr(st, "fails", 0) or 0)
+            oks_now = int(getattr(st, "ok", 0) or 0)
+            if not count and not fails_now:
+                continue
+            rec = _source_record(d, label, now)
+            if count:
+                rec["day"] = int(rec.get("day") or 0) + count
+                rec["events"].extend([now] * count)
+                rec["last"] = now
+            if fails_now:
+                rec["fails"] = int(rec.get("fails") or 0) + fails_now
+                if rec["fails"] >= 2:
+                    rec["cooldown_until"] = max(
+                        float(rec.get("cooldown_until") or 0),
+                        now + int(limits["fail_cooldown_sec"]))
+            elif oks_now:
+                rec["fails"] = 0
+                rec["cooldown_until"] = 0
+            cool = float(getattr(st, "cool_until", 0) or 0)
+            if cool > now:
+                rec["cooldown_until"] = max(
+                    float(rec.get("cooldown_until") or 0),
+                    cool)
+        _write_budget_guarded(d)
+
+
+def record_source_failure(label, reason=""):
+    if not label:
+        return
+    now = time.time()
+    with _budget_lock():
+        d = _load_budget_unlocked()
+        rec = _source_record(d, str(label), now)
+        # A completed media download is the only proof that a source can
+        # actually deliver video bytes.  Metadata probes must not clear this
+        # counter; otherwise every failed download is forgotten immediately
+        # and the same broken source is selected again on the next run.
+        rec["download_fails"] = int(rec.get("download_fails") or 0) + 1
+        rec["last"] = now
+        rec["last_download_error"] = str(reason or "")[:200]
+        if rec["download_fails"] >= 2:
+            rec["download_cooldown_until"] = max(
+                float(rec.get("download_cooldown_until") or 0),
+                now + int(d["limits"]["fail_cooldown_sec"]))
+        _write_budget_guarded(d)
+
+
+# ---------- 按集失败退避（E074） ----------
+# 2026-11-14：`record_source_failure` 只冷却「源」（10 分钟），不记「集」。
+# 于是出现死循环：《超市特工 S01E08》在源站是移动云盘 504（下不动），
+# 但目标 Emby 缺这一集 → fill 模式每次都搜到它 → 每次失败 → 源冷却 10 分钟
+# → 恢复后又搜到同一集 → 再失败。lane 被一集反复占住，Episode 计数 30 分钟不涨。
+#
+# 修法：按 (video_id) 记失败次数，达到阈值后冷却一整天。
+# 只影响这一集，不影响该源的其他集，也不影响其他源。
+EP_FAIL = os.path.join(HERE, ".gha_ep_fail.json")
+EP_FAIL_TRIP = 3          # 连续失败几次后放长冷却
+EP_FAIL_COOL_DAYS = 1.0   # 放长多久
+
+
+def _ep_fail_load():
+    try:
+        return json.load(open(EP_FAIL, encoding="utf-8"))
+    except Exception:                                      # noqa: BLE001
+        return {}
+
+
+# ---------- TG session 独占租约（E075） ----------
+# 2026-11-14：上传报 `AuthKeyDuplicatedError: The authorization key (session file)
+# was used under two different IP addresses simultaneously`。
+#
+# 病根不是"slot 分配算法不聪明"，而是**约束搞错了**：
+#   claim 里存一个 tg_session_slot 就以为占住了 session，
+#   但 slot 只是标签 —— 两台机器各自领到一个 claim，标签相同，
+#   就真的同时用同一个 TG 账号从两个 IP 上传，TG 直接作废授权。
+#
+# 正确模型：session 是**跨机器的排他资源**，必须用租约显式独占，
+# 用完（或超时）才还。N 个 session 最多支撑 N 台机器同时上传，
+# 这是 TG 侧的硬约束，靠"算最小占用"绕不过去。
+SLOT_DIR = os.path.join(HERE, ".gha_slots")
+SLOT_TTL = 3 * 3600          # 上传最长 2h + 余量；超时视为进程已死，可被回收
+
+
+def _slot_path(n):
+    return os.path.join(SLOT_DIR, "slot%d.lock" % int(n))
+
+
+# 2026-11-15（E106）：本机 runner 的 run_id 归类，**不能写死 slot 号**。
+#
+# 原来是 ("-slot1-", "-slot2-", "-slot4-")：本机加第三个 runner 实例
+# （RUNNER_SLOT=5）后，它发起的 run 不被认作本机 → 永远不会被回收孤儿，
+# 反过来还可能被别的路径误判。加机器等于要改代码，违背可扩展性。
+#
+# 改为：本机发起 = run_id 里的 slot 号在**本机 RUNNER_SLOT 白名单**里。
+# 白名单来自环境变量 RUNNER_LOCAL_SLOTS（run_one.sh 导出），
+# 没设置时退化为「含 -slot 且不含云盒标记」的宽判定。
+def _local_slot_tokens():
+    raw = (os.environ.get("RUNNER_LOCAL_SLOTS") or "").strip()
+    if raw:
+        toks = []
+        for x in raw.replace(":", ",").split(","):
+            x = x.strip()
+            if x.isdigit():
+                toks.append("-slot%s-" % x)
+        if toks:
+            return tuple(toks)
+    # 兜底：配置里的 host=oracle 的 lane 对应的 slot，按本机 runner 实际实例数推
+    toks = []
+    for n in range(1, 13):
+        toks.append("-slot%d-" % n)
+    return tuple(toks)
+
+
+_LOCAL_SLOT_TOKENS = _local_slot_tokens()
+
+
+def _is_local_run(run_id):
+    """这个 run_id 看起来是不是本机发起的（含 -slotN- 标记）。
+
+    注意：这只是**弱信号**。云盒通过 ssh 回控制面执行 gha_next3，
+    拿到的 run_id 同样带 slot 前缀 —— 所以不能单靠它决定回收。
+    """
+    rid = str(run_id or "")
+    if not rid:
+        return True
+    return any(tok in rid for tok in _LOCAL_SLOT_TOKENS)
+
+
+def _orphan_evidence(run_id):
+    """有没有**足够证据**判定这条租约是孤儿（可以安全回收）。
+
+    2026-11-15（E103/E106）两次踩坑后定下的规则：
+      · E101 版：TTL 未到就 pgrep，查不到就回收 → 云盒租约被抢，
+        同一 TG 账号双 IP 并发 → AuthKeyDuplicated（11-14 01:23 事故）。
+      · E103 版：靠 run_id 格式区分本机/云盒 → 测试证明太脆，
+        run_id 不带 slot 前缀时连真孤儿都回收不掉。
+
+    现在要求**两条证据同时成立**才回收：
+      ① ps 里确实找不到这个 run 的进程（跨机器时 ps 看不到云盒进程，
+         但下一条会挡住误判）
+      ② 该 run 名下的 claim 已经不存在 —— claim 才是「它在干活」的
+         权威证据，云盒的 claim 一定在共享目录里，本机看得见。
+    两条都满足 = 进程没了、claim 也释放了 = 真孤儿。
+    """
+    rid = str(run_id or "")
+    if not rid:
+        return True
+    if _run_is_alive(rid):
+        return False                     # 进程还在，活着
+    try:
+        import glob as _glob
+        import json as _json
+        base = os.path.dirname(os.path.abspath(__file__))
+        for fp in _glob.glob(os.path.join(base, ".gha_claims", "*.json")):
+            try:
+                with open(fp, encoding="utf-8") as fh:
+                    if str((_json.load(fh) or {}).get("run_id") or "") == rid:
+                        return False     # claim 还在 → 云盒/别的机器在干活
+            except Exception:            # noqa: BLE001
+                continue
+    except Exception:                    # noqa: BLE001
+        return False                     # 查不动就保守当它活着
+    return True
+
+
+def _run_is_alive(run_id):
+    """run_id 对应的上传进程还在不在本机。
+
+    2026-11-14（E102）：以前用 `pgrep -af <run_id>`，那是**子串匹配** ——
+    会命中命令行里恰好含这个字符串的任何进程：调用者自己的
+    `python3 -m unittest ...`、包着它的 bash `-c '... runA ...'`，甚至
+    本函数继承的 argv。实测 runA 根本不存在，pgrep 每行都命中，
+    于是孤儿租约永远回收不掉、四个 lane 里有两个一直 no_session 空转
+    （E101 那版修复等于没生效）。
+
+    判据改为：拿 `ps -eo pid,comm,args`，只看**内核记账的可执行名**（comm）
+    是 python*/boxwake 的进程，且某个 argv 元素**完整等于** run_id 或
+    `<run_id>.py`。查不到进程 → 认定已死；查不动（异常）→ 保守认为还活着。
+    """
+    rid = str(run_id or "")
+    if not rid:
+        return True
+    try:
+        import subprocess as _sp
+        out = _sp.run(["ps", "-eo", "pid=,comm=,args="],
+                      capture_output=True, text=True, timeout=10).stdout
+    except Exception:                                  # noqa: BLE001
+        return True                                    # 查不了就当它活着
+    for line in (out or "").splitlines():
+        t = line.split()
+        if len(t) < 3:
+            continue
+        comm = t[1]
+        if not (comm.startswith("python") or comm.startswith("boxwake")):
+            continue                                   # bash/ssh/pgrep 等一律不算
+        for arg in t[2:]:
+            base = os.path.basename(arg)
+            if base == rid or base == rid + ".py" or arg == rid:
+                return True
+    return False
+
+
+RESERVE_SUFFIX = ".reserve"
+
+
+def _slot_reserve_path(n):
+    return _slot_path(n) + RESERVE_SUFFIX
+
+
+def slot_reserve(n, holder, ttl=300):
+    """给第 n 个 slot 立「预约旗」：在旗有效期内，别人不再领这一 slot。
+
+    为什么需要（2026-11-15）：tgpipe 的零流量转存要和上传 lane 共用账号池，
+    而 lane 是「收尾立刻领下一集」，释放到再次 claim 之间只有亚秒级间隙。
+    实测 slot3 连续 60 秒同一 run_id、空闲率 0%，靠轮询**永远抢不到**
+    （连续 30 分钟 0 条，扫描一行输出都没有）。
+    改成预约制：tgpipe 先立旗 → lane 交完当前这集就不再领这个号 →
+    tgpipe 自然拿到 → 用完撤旗。旗带 TTL，tgpipe 崩了也不会永久占号。
+    """
+    try:
+        os.makedirs(SLOT_DIR, exist_ok=True)
+        with open(_slot_reserve_path(n), "w", encoding="utf-8") as f:
+            json.dump({"holder": str(holder), "ts": int(time.time()), "ttl": int(ttl)}, f)
+        return True
+    except Exception:                                  # noqa: BLE001
+        return False
+
+
+def slot_unreserve(n, holder=None):
+    """撤旗。传 holder 时只撤自己的旗（防误撤别人的）。"""
+    pth = _slot_reserve_path(n)
+    try:
+        if not os.path.exists(pth):
+            return True
+        if holder is not None:
+            try:
+                with open(pth, encoding="utf-8") as f:
+                    d = json.load(f)
+            except Exception:                          # noqa: BLE001
+                d = {}
+            if str(d.get("holder") or "") != str(holder):
+                return False
+        os.remove(pth)
+        return True
+    except Exception:                                  # noqa: BLE001
+        return False
+
+
+def _reserve_active(n):
+    """旗是否仍在有效期内。没有/损坏 → 不挡（宁可漏挡，不可死锁）。"""
+    try:
+        with open(_slot_reserve_path(n), encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:                                  # noqa: BLE001
+        return False
+    try:
+        return time.time() < float(d.get("ts") or 0) + float(d.get("ttl") or 0)
+    except Exception:                                  # noqa: BLE001
+        return False
+
+
+def slot_lease(n, run_id, ttl=SLOT_TTL):
+    """尝试独占第 n 个 TG session。成功 True，被别人占着 False。
+
+    原子性靠 O_EXCL 建文件（跨机器安全，所有执行方都在同一台控制面上）。
+    回收有两种触发：TTL 到期（持有者崩了）与「TTL 没到但进程没了」（孤儿）。
+    ← 孤儿判定见 `_run_is_alive()`；**TTL 不等于占用**这条是 E101 的核心。
+    """
+    os.makedirs(SLOT_DIR, exist_ok=True)
+    # 预约优先（见 slot_reserve）：旗有效期内，非 tgpipe 的调用方直接让位。
+    # tgpipe 自己的 run_id 形如 `tgpipe-<pid>`，不受此限。
+    if not str(run_id).startswith("tgpipe") and _reserve_active(n):
+        return False
+    pth = _slot_path(n)
+    payload = json.dumps({"run_id": str(run_id), "ts": int(time.time()),
+                          "ttl": int(ttl)}, ensure_ascii=False)
+    for _ in range(3):
+        try:
+            fd = os.open(pth, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            return True
+        except FileExistsError:
+            pass
+        except Exception:                              # noqa: BLE001
+            return False
+
+        # 已存在：判断能不能回收
+        try:
+            with open(pth, encoding="utf-8") as f:
+                cur = json.load(f)
+        except Exception:                              # noqa: BLE001
+            cur = None                                 # 损坏 → 可回收
+        reclaim = False
+        if cur is None:
+            reclaim = True
+        else:
+            holder = str(cur.get("run_id") or "")
+            exp = float(cur.get("ts") or 0) + float(cur.get("ttl") or 0)
+            if time.time() >= exp:
+                reclaim = True                         # TTL 到期
+            elif _orphan_evidence(holder):
+                # 2026-11-15（E103）：**撞车根因修复。**
+                #
+                # E101 的孤儿回收只在「本机能看见进程」时才成立。
+                # 云盒 box2/new4 通过 ssh 回控制面领活，它的进程**本机根本
+                # 看不到**，于是被误判成孤儿 → 本机另一个 lane 抢走同一 slot
+                # → 同一 TG 账号双 IP 并发 → AuthKeyDuplicated（11-14 01:23
+                # 本机 20 份 upload.log 全是这个错，全部发生在 slot1）。
+                #
+                # 判据：run_id 的命名里带本机 slot 前缀（如 `...-slot1-new2-`）
+                # 才说明这是**本机**发起的 run；云盒的 run_id 带 slot3/slot4
+                # 之类云盒自己的编号，或根本查不到进程 —— 一律当它活着，
+                # 只信 TTL。宁可等 TTL 到期（3h），也不能抢同一个 TG 账号。
+                reclaim = True                         # 本机孤儿，可回收
+            else:
+                return False                           # 真的有人在用
+        if reclaim:
+            try:
+                os.remove(pth)
+            except FileNotFoundError:
+                pass                                   # 别人刚回收掉，重试抢锁
+            except Exception:                          # noqa: BLE001
+                return False
+            continue
+    return False
+
+
+def slot_release(n, run_id=None):
+    """归还第 n 个 session。只删属于自己（run_id 匹配）或无主的租约。"""
+    pth = _slot_path(n)
+    try:
+        if run_id is not None:
+            with open(pth, encoding="utf-8") as f:
+                cur = json.load(f)
+            if str(cur.get("run_id")) != str(run_id):
+                return False                          # 不是我的，别动
+        os.remove(pth)
+        return True
+    except FileNotFoundError:
+        return False                                  # 已经没人持有了
+    except Exception:                                 # noqa: BLE001
+        return False
+
+
+def slot_holder(n):
+    """返回第 n 个 session 的租约内容；空闲返回 None。"""
+    try:
+        cur = json.load(open(_slot_path(n), encoding="utf-8"))
+        if time.time() < float(cur.get("ts") or 0) + float(cur.get("ttl") or 0):
+            return cur
+    except Exception:                                 # noqa: BLE001
+        pass
+    return None
+
+
+def record_episode_failure(video_id, reason=""):
+    """记一次「这一集」的失败。返回 (失败次数, 是否进入长冷却)。"""
+    vid = str(video_id or "").strip()
+    if not vid:
+        return 0, False
+    d = _ep_fail_load()
+    now = time.time()
+    rec = d.get(vid) or {}
+    n = int(rec.get("fails") or 0) + 1
+    rec = {"fails": n, "last": now, "reason": str(reason or "")[:120]}
+    tripped = n >= EP_FAIL_TRIP
+    if tripped:
+        rec["next_check"] = now + EP_FAIL_COOL_DAYS * 86400
+    d[vid] = rec
+    tmp = EP_FAIL + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, EP_FAIL)
+    return n, tripped
+
+
+def episode_blocked_set():
+    """返回当前处于长冷却期的 video_id 集合。"""
+    now = time.time()
+    return {str(k) for k, v in _ep_fail_load().items()
+            if isinstance(v, dict) and now < float(v.get("next_check") or 0)}
+
+
+def clear_episode_failure(video_id):
+    """这一集成功了 —— 清掉它的失败记录。"""
+    vid = str(video_id or "").strip()
+    d = _ep_fail_load()
+    if vid in d:
+        d.pop(vid, None)
+        tmp = EP_FAIL + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, EP_FAIL)
+
+
+def record_source_success(label):
+    if not label:
+        return
+    with _budget_lock():
+        d = _load_budget_unlocked()
+        rec = _source_record(d, str(label), time.time())
+        rec["fails"] = 0
+        rec["cooldown_until"] = 0
+        rec["download_fails"] = 0
+        rec["download_cooldown_until"] = 0
+        # 成功出片 +1：这是"这个源到底有没有用"的唯一客观依据。
+        rec["ok"] = int(rec.get("ok") or 0) + 1
+        _write_budget_guarded(d)
+

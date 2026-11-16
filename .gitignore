@@ -1,0 +1,11 @@
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+__pycache__/
+*.pyc
+runner.env
+config.json
+.alert_channel.json
+.tg_string*
