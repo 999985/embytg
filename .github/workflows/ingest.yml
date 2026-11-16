@@ -43,8 +43,11 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg >/dev/null
-          python -m pip install -q --upgrade pip
-          python -m pip install -q telethon
+          # run_one.sh 默认用 $BASE/venv/bin/python，所以在 runner 目录里建 venv
+          python -m venv runner/venv
+          runner/venv/bin/python -m pip install -q --upgrade pip
+          runner/venv/bin/python -m pip install -q telethon
+          runner/venv/bin/python -c "import telethon;print('telethon', telethon.__version__)"
 
       - name: 写 runner.env
         env:
@@ -92,6 +95,9 @@ jobs:
           RUNNER_SLOT: ${{ inputs.slot }}
           RUNNER_LANE: ${{ inputs.lane }}
           ORACLE_KEY: /tmp/ctl_key
+          # run_one.sh 里的 BASE 默认是 /opt/embytg-runner，checkout 环境要指到工作区
+          EMBYTG_RUNNER_BASE: ${{ github.workspace }}/runner
+          TG_MAX_ACTIVE: "1"
         run: |
           chmod +x runner/run_one.sh
           bash runner/run_one.sh
