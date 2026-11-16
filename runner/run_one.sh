@@ -554,11 +554,21 @@ UPLOAD_OK=0
 : >"$WORK/upload.log"
 for attempt in 1 2; do
   printf '\n=== upload attempt %s ===\n' "$attempt" >>"$WORK/upload.log"
-  if timeout "$UPLOAD_OUTER_TIMEOUT" "$VENV" "$BASE/gha_upload.py" --job "$JOB" --media-dir "$MEDIA_DIR" --manifest-out "$WORK/manifest.path" >>"$WORK/upload.log" 2>&1; then
+  timeout "$UPLOAD_OUTER_TIMEOUT" "$VENV" "$BASE/gha_upload.py" --job "$JOB" --media-dir "$MEDIA_DIR" --manifest-out "$WORK/manifest.path" >>"$WORK/upload.log" 2>&1
+  UPLOAD_RC=$?
+  if [ "$UPLOAD_RC" -eq 0 ]; then
     UPLOAD_OK=1
     break
   fi
-  log "UPLOAD attempt $attempt failed; resuming from manifest"
+  log "UPLOAD attempt $attempt failed rc=$UPLOAD_RC; resuming from manifest"
+  # E164：两种情况重试第二次没有意义，直接走失败收尾（claim 释放、文件留 _keep）：
+  #   rc=6 零进展：一个分片都没落地（实测两次 attempt 结果完全相同，白占 30 分钟）
+  #   rc=3 QuotaRest：TG 要求按秒休息，立刻重试只会再撞一次额度
+  # 关掉本策略：TG_UPLOAD_SKIP_RETRY_ZERO_PARTS=0
+  if [ "${TG_UPLOAD_SKIP_RETRY_ZERO_PARTS:-1}" = "1" ] && { [ "$UPLOAD_RC" -eq 6 ] || [ "$UPLOAD_RC" -eq 3 ]; }; then
+    log "UPLOAD_SKIP_RETRY rc=$UPLOAD_RC（零进展/额度休息）；不再重试，文件留给下一次 claim 复用"
+    break
+  fi
   [ "$attempt" -eq 1 ] && sleep 15
 done
 if [ "$UPLOAD_OK" != "1" ]; then
