@@ -32,6 +32,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import gate_history
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG = json.load(open("/opt/embytg/config.json", encoding="utf-8"))
@@ -223,7 +224,23 @@ def new_done_cold_count():
     return cold, len(items or [])
 
 
-def throughput_verdict(done_3h, rate_24h_per_h, bb):
+def gate_blocked_window(window_sec=None):
+    """近 N 小时预算闸门「按设计停」占了多少秒（E160）。
+
+    为什么要这个数：`max_3h_eps` 是**预算口径**的允许量（allow_gb_h×3÷单集），
+    预算一充裕它就涨到物理不可能（2026-11-17 00:46 实测 429.6 集/3h，
+    而历史最好一天 243 集）。用它当产能下限 = 每天凌晨必假红。
+    同理，窗口里若跨了前晚的硬停（22:36 daily_exhausted → 00:00 重置），
+    这 3 小时里有一半时间根本不许领片，拿它跟 24h 均值比也是错判。
+
+    解析器只有一个：`gate_history.blocked_window()`（stall_watch 也用它，E161）。
+    读不到日志 → 返回 None（判据回落到原有逻辑，绝不假装 0）。
+    """
+    window_sec = float(window_sec if window_sec is not None else NO_FINISH_HOURS * 3600)
+    return gate_history.blocked_window(window_sec)
+
+
+def throughput_verdict(done_3h, rate_24h_per_h, bb, blocked=None):
     """产能判据：预算视角优先（见 byte_budget 的说明）。
 
     没有预算视图时才回落到「近 3h vs 过去 24h 均值」的老判据。
@@ -233,14 +250,26 @@ def throughput_verdict(done_3h, rate_24h_per_h, bb):
     口径下等于「剩余总额 ÷ 单集」，闸门拒的恰恰是「这一小时再放就超」，
     两者互相矛盾。2026-11-16 22:30 实测：剩 5.52GB → max_3h_eps 9.2 →
     门槛 5.5 集，而闸门一集都不放 → 每晚预算用完后 daily_ops 必红。
+
+    两个下限取**较小**的那个（E160）：预算允许 429 集/3h 不代表 lane 能跑 429，
+    历史 24h 均值代表可持续产能。要求「同时跑赢预算和历史」会把充裕预算
+    变成不可能任务；正确的门是「不要低于两者中更宽松的那条」。
     """
     if isinstance(bb, dict) and (bb.get("gate_holding") or bb.get("exhausted")):
         return True
+    # 窗口里跨了硬停、且刚放开不到 90 分钟：恢复期不给产能定罪（E160）。
+    # 下一轮窗口不再含硬停时判据自行恢复，最多跳过一次。
+    if isinstance(blocked, dict) and blocked.get("secs") \
+            and blocked["secs"] >= 0.2 * NO_FINISH_HOURS * 3600 \
+            and blocked.get("last_end") is not None and blocked["last_end"] < 5400:
+        return True
+    needs = []
+    if rate_24h_per_h * NO_FINISH_HOURS >= 6:
+        needs.append(THROUGHPUT_RATIO * rate_24h_per_h * NO_FINISH_HOURS)
     if isinstance(bb, dict) and bb.get("max_3h_eps") is not None \
             and rate_24h_per_h * NO_FINISH_HOURS >= 6:
-        return done_3h >= 0.6 * float(bb["max_3h_eps"])
-    if rate_24h_per_h * NO_FINISH_HOURS >= 6 and \
-            done_3h < THROUGHPUT_RATIO * rate_24h_per_h * NO_FINISH_HOURS:
+        needs.append(0.6 * float(bb["max_3h_eps"]))
+    if needs and done_3h < min(needs):
         return False
     return True
 
@@ -425,7 +454,9 @@ def main():
     rep["rate_3h_per_h"] = round(rep["done_3h"] / float(NO_FINISH_HOURS), 2)
     _bb = byte_budget()
     rep["byte_budget"] = _bb
-    rep["throughput_ok"] = throughput_verdict(rep["done_3h"], rep["rate_24h_per_h"], _bb)
+    rep["gate_blocked_3h"] = gate_blocked_window()
+    rep["throughput_ok"] = throughput_verdict(rep["done_3h"], rep["rate_24h_per_h"],
+                                              _bb, rep["gate_blocked_3h"])
 
     # 2) 队列
     q = {}
@@ -536,6 +567,15 @@ def main():
                             "不是预算不足，是闸门口径或闸门本身卡住"
                             % (_bb.get("remaining_gb") or 0, _bb.get("daily_gb") or 0,
                                _bb.get("pace_gb_h") or 0))
+    _gb = rep.get("gate_blocked_3h")
+    _gb = _gb if isinstance(_gb, dict) else {}
+    if _gb.get("secs", 0) >= 0.2 * NO_FINISH_HOURS * 3600 \
+            and _gb.get("last_end") is not None and _gb["last_end"] < 5400:
+        notes.append("近 %dh 里预算闸门按设计停了 %.0f 分钟（%s），刚放开 %.0f 分钟 → "
+                     "产能判据本轮不适用，下一轮自动恢复"
+                     % (NO_FINISH_HOURS, _gb["secs"] / 60.0,
+                        ",".join(_gb.get("reasons") or []) or "-",
+                        _gb["last_end"] / 60.0))
     if not rep["throughput_ok"]:
         problems.append("产能塌陷：近 %d h %d 条，过去 24h 均值 %.1f 条/h（仅 %.0f%%）"
                         % (NO_FINISH_HOURS, rep["done_3h"], rep["rate_24h_per_h"],

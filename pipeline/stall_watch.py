@@ -39,6 +39,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import gate_history  # noqa: E402  （同目录模块，必须放在 HERE 入 sys.path 之后）
+
 DB = os.path.join(HERE, "tg.db")
 BUDGET = os.path.join(HERE, ".gha_src_budget.json")
 LOG = os.path.join(HERE, "logs", "stall_watch.log")
@@ -335,6 +337,21 @@ def _enabled_lanes():
         return None
 
 
+def effective_idle(last, now=None, path=None):
+    """原始空闲 / 闸门硬停 / 有效空闲（分钟）——E161。
+
+    窗口里有 `daily_exhausted`/`month_exhausted` 的时间段物理上不许领片，
+    不能算进「多少分钟零出片」。只扣硬停：pacing 是减速不是停。
+    """
+    now = float(now if now is not None else time.time())
+    if not last:
+        return 1e9, 0.0, 1e9
+    idle_min = (now - float(last)) / 60.0
+    blocked_min = (gate_history.blocked_between(
+        last, now, path=path, reasons=gate_history.HARD_STOP_REASONS) or 0.0) / 60.0
+    return idle_min, blocked_min, max(0.0, idle_min - blocked_min)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alert", action="store_true", help="判定停摆时调用 alert.py")
@@ -343,14 +360,19 @@ def main():
 
     now = time.time()
     last = last_landing()
-    idle_min = (now - last) / 60.0 if last else 1e9
+    # E161：空闲里有多少分钟是「预算闸门按设计停」—— 那段时间物理上不许领片，
+    # 必须从分母里扣掉。2026-11-17 00:24 实况：109 分钟「零出片」里有 84 分钟是
+    # 前一日 22:36 daily_exhausted 的硬停，00:00 额度重置后只过了 24 分钟就被拉 P1。
+    idle_min, blocked_idle_min, eff_idle_min = effective_idle(last, now)
+    blocked_idle_sec = blocked_idle_min * 60.0
     used, cap, lines = budget_state()
     remain = max(0, cap - used)
     pauses = paused()
 
-    _log("最近落地 %s，已 %s；配额 %d/%d（余 %d）%s" % (
+    _log("最近落地 %s，已 %s（其中闸门硬停 %.0f 分钟 → 有效空闲 %.0f 分钟）；配额 %d/%d（余 %d）%s" % (
         time.strftime("%F %T", time.localtime(last)) if last else "无记录",
         ("%.0f 分钟" % idle_min) if idle_min < 1e8 else "从未",
+        blocked_idle_sec / 60.0, eff_idle_min,
         used, cap, remain,
         ("；暂停标记 " + ",".join(pauses)) if pauses else ""))
 
@@ -375,20 +397,22 @@ def main():
              % (gate.get("reason"), gate.get("age_sec", 0)))
 
     usable = _usable_remain(remain)
-    stalled = (idle_min >= a.stall_min and usable > 30 and not pauses and not blocked)
+    stalled = (eff_idle_min >= a.stall_min and usable > 30 and not pauses and not blocked)
     if not stalled:
         _log("  判定：正常（%s）" % (
             "预算闸门按设计停：reason=%s，余 %s/%s GB" % (
                 gate.get("reason"), gate.get("remaining_gb"), gate.get("daily_gb"))
             if blocked else
             "有暂停标记" if pauses else
+            "闸门硬停占掉 %.0f 分钟，有效空闲只有 %.0f 分钟（恢复期）"
+            % (blocked_idle_sec / 60.0, eff_idle_min) if eff_idle_min < a.stall_min and idle_min >= a.stall_min else
             "听任空闲：剩余 %d 次额度里只有 %d 次能花"
             % (remain, usable) if usable <= 30 else
             "近期有产出"))
         return 0
 
-    _log("  ⚠ 判定：疑似停摆 —— 还有 %d 次配额、%d 分钟零出片%s" % (
-        remain, idle_min,
+    _log("  ⚠ 判定：疑似停摆 —— 还有 %d 次配额、有效空闲 %.0f 分钟（原始 %.0f 分钟，闸门硬停 %.0f）%s" % (
+        remain, eff_idle_min, idle_min, blocked_idle_sec / 60.0,
         "；闸门已连按 %.1f 小时（超上限，按卡死处理）" % (gate["hold_sec"] / 3600.0)
         if gate and gate.get("holding") else ""))
     for ln in lines:
@@ -397,10 +421,10 @@ def main():
         _log("  决策 %s reason=%s attempts=%s skip=%s %s"
              % (s["t"], s["reason"], s["attempts"], s["skip"], s["detail"] or ""))
 
-    if a.alert and idle_min >= ALERT_MIN:
-        msg = ("EmbyTG 疑似停摆：%.0f 分钟零出片，配额仍余 %d/%d。\n"
+    if a.alert and eff_idle_min >= ALERT_MIN:
+        msg = ("EmbyTG 疑似停摆：有效空闲 %.0f 分钟（原始 %.0f，闸门硬停 %.0f）零出片，配额仍余 %d/%d。\n"
                "%s各源：\n%s\n最近决策：%s"
-               % (idle_min, remain, cap,
+               % (eff_idle_min, idle_min, blocked_idle_sec / 60.0, remain, cap,
                   ("字节闸门：reason=%s，连按 %.1f 小时，余 %s/%s GB\n"
                    % (gate.get("reason"), gate.get("hold_sec", 0) / 3600.0,
                       gate.get("remaining_gb"), gate.get("daily_gb")))

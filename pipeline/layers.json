@@ -38,6 +38,7 @@
   "claim_reap.py",
   "emby_scan.py",
   "embytg_conf.py",
+  "gate_history.py",
   "gha_cancel.py",
   "gha_dispatch.py",
   "gha_finish.py",
