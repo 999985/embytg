@@ -1479,6 +1479,7 @@ def try_fill(item, available_labels, leased, min_bytes, max_bytes, run_id,
         finally:
             GS.charge_guard(g)
         chosen, why2 = fill_target(item, ep, cands, min_bytes, max_bytes)
+        _is_policy_skip = False
         if not chosen:
             # 2026-11-17（E160）：**「源站没有这一集」也必须落按集冷却。**
             #
@@ -1494,7 +1495,10 @@ def try_fill(item, available_labels, leased, min_bytes, max_bytes, run_id,
             # 源」，所以 cands 为空 = 所有可用源都搜过、都没有这一集。
             #
             # 不冷却 `no_target`：那是本地算不出目标路径，与源站无关。
-            if why2 and str(why2) != "no_target":
+            # too_big 是「本时段策略跳过」，不是「源站没有这一集」：
+            # 落按集冷却会让 4GB+ 的集整天不再尝试，而它夜里本该允许。
+            _is_policy_skip = "too_big" in str(why2 or "")
+            if why2 and str(why2) != "no_target" and not _is_policy_skip:
                 _k3 = ep_cool_key(item, _season, ep)
                 if _k3:
                     try:
@@ -1507,6 +1511,11 @@ def try_fill(item, available_labels, leased, min_bytes, max_bytes, run_id,
                             file=sys.stderr, flush=True)
                     except Exception:                  # noqa: BLE001
                         pass
+            continue
+        if _is_policy_skip:
+            print("fill: 体积超时段上限，本轮跳过 %s S%dE%d（%s）" % (
+                item.get("series"), _season, ep, str(why2)[:40]),
+                file=sys.stderr, flush=True)
             continue
         target, c = chosen
         key, why = check_existing(item, int(item["season"]), ep, target, c["quality"]["label"])
@@ -1755,12 +1764,33 @@ def series_has_active_claim(tmdb, active):
     return False
 
 
+def effective_max_gb(lane, hour=None):
+    """单集体积上限（GB）。
+
+    产能实测（2026-11-17）：今日 107 集里 >4GB 的 16 集吃掉了 39% 的流量与
+    绝大部分 lane 时间（4.6–7.3GB 的单集在慢号上要传 1 小时+），而中位数只有
+    1.49GB。白天让大文件挤占 lane 就是用小文件的机会成本换大文件。
+
+    规则：
+      · upgrade 车道永远 8GB —— 它存在的意义就是追 4K/大文件；
+      · 白天（08:00–02:00）new/new2/fill 上限 4GB，把流水线留给中位数大小的集；
+      · 凌晨（02:00–08:00）全车道放开 8GB —— 那时候本来闲着。
+
+    超限的条目不会被丢弃：当晚就会重新进入候选（too_big 只是本轮跳过）。
+    """
+    if lane == "upgrade":
+        return 8.0
+    h = time.localtime().tm_hour if hour is None else hour
+    return 8.0 if (2 <= h < 8) else 4.0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--lane", choices=LANES, default="fill")
     ap.add_argument("--max-active", type=int, default=2)
-    ap.add_argument("--max-size-gb", type=float, default=8.0)
+    ap.add_argument("--max-size-gb", type=float, default=None,
+                    help="单集体积上限(GB)；不填=按车道与时段自动（见 effective_max_gb）")
     ap.add_argument("--min-size-mb", type=float, default=20.0)
     ap.add_argument("--max-attempts", type=int, default=10)
     ap.add_argument("--max-eps-scan", type=int, default=2)
@@ -2006,6 +2036,8 @@ def main():
             emit({"ok": False, "reason": "source_allow_empty", "lane": a.lane,
                   "detail": ",".join(sorted(allow))})
             return 0
+    if a.max_size_gb is None:
+        a.max_size_gb = effective_max_gb(a.lane)
     max_bytes = int(a.max_size_gb * 1e9)
     min_bytes = int(a.min_size_mb * 1024 * 1024)
     store_ch, store_channels = choose_store_channel()
