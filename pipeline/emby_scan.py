@@ -48,6 +48,7 @@ r = emby_scan.scan_paths(["/mnt/embytg/TV/..."])   # -> {"Created":1,"Refreshed"
 """
 import argparse
 import json
+import hashlib
 import os
 import sqlite3
 import sys
@@ -97,6 +98,48 @@ def have_scanpath():
     return _PROBE["ok"]
 
 
+# ---- 重复建条目防护（E115 根因）------------------------------------------
+# TargetedScan 是异步的：POST 立刻返回，真正的建条目在插件线程里做。
+# 两条 lane 同秒对同一路径各发一次 → 插件起两个建条目任务 → 同 Path 双条目。
+# 这里做「同路径去重窗」：窗口内第二次直接跳过，不再发给插件。
+_SCAN_GUARD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scan_guard")
+_SCAN_DEDUP_SEC = float(os.environ.get("EMBY_SCAN_DEDUP_SEC", "150"))
+
+
+def _scan_guard(paths):
+    """返回 (allowed, skipped)。同路径在去重窗内已扫过就跳过。"""
+    try:
+        os.makedirs(_SCAN_GUARD_DIR, exist_ok=True)
+    except Exception:                                       # noqa: BLE001
+        return list(paths), []
+    now = time.time()
+    allowed, skipped = [], []
+    for p in paths:
+        key = hashlib.sha1(p.encode("utf-8")).hexdigest()[:16]
+        f = os.path.join(_SCAN_GUARD_DIR, key + ".t")
+        try:
+            ts = float(open(f).read().strip() or 0)
+        except Exception:                                   # noqa: BLE001
+            ts = 0.0
+        if now - ts < _SCAN_DEDUP_SEC:
+            skipped.append(p)
+            continue
+        try:
+            open(f, "w").write("%.3f" % now)
+        except Exception:                                   # noqa: BLE001
+            pass
+        allowed.append(p)
+    # 顺手清过期文件，避免目录无限增长
+    try:
+        for fn in os.listdir(_SCAN_GUARD_DIR):
+            fp = os.path.join(_SCAN_GUARD_DIR, fn)
+            if now - os.path.getmtime(fp) > 86400:
+                os.remove(fp)
+    except Exception:                                       # noqa: BLE001
+        pass
+    return allowed, skipped
+
+
 def scan_paths(paths, timeout=180):
     """把路径交给 TargetedScan，返回状态计数。
 
@@ -106,6 +149,11 @@ def scan_paths(paths, timeout=180):
     paths = [p for p in paths if p]
     out = {"Created": 0, "Refreshed": 0, "PathNotFound": 0,
            "ParentNotFound": 0, "Failed": 0, "ids": [], "mode": "scanpath"}
+    if not paths:
+        return out
+    paths, _skipped = _scan_guard(paths)
+    if _skipped:
+        out["skipped"] = len(_skipped)
     if not paths:
         return out
 

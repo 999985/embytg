@@ -182,7 +182,7 @@ def ledger_emby():
     start = 0
     while True:
         d = emby("/Items?Recursive=true&IncludeItemTypes=Episode&StartIndex=%d"
-                 "&Limit=5000&Fields=Path,SeriesId,ParentIndexNumber,IndexNumber"
+                 "&Limit=5000&Fields=Path,SeriesId,ParentIndexNumber,IndexNumber,Size"
                  % start) or {}
         its = d.get("Items") or []
         if not its:
@@ -224,6 +224,33 @@ def reconcile(lib_filter=None):
                      "ep": key[3] if key else None,
                      "quality": key[4] if key else "",
                      "detail": detail, "path": path})
+
+    # 0) 重复体检：同 Path 多条目 / 同集多文件（E115、E128 的护栏）
+    #    只记 gaps，不影响五账计数；出现即说明扫描并发或重传又发生了。
+    _by_path = {}
+    for it in eps.values():
+        _by_path.setdefault(it.get("Path") or "", []).append(it)
+    for _p, _its in _by_path.items():
+        if _p and len(_its) > 1:
+            k0 = next(iter(_its))
+            gaps.append({"kind": "dup_path",
+                         "lib": k0.get("lib", ""), "series": k0.get("series", ""),
+                         "season": k0.get("season"), "ep": k0.get("ep"),
+                         "quality": k0.get("quality", ""),
+                         "detail": "同 Path 有 %d 个条目：%s" %
+                                   (len(_its), ",".join(str(x.get("Id")) for x in _its)),
+                         "path": _p})
+    _by_ep = {}
+    for k, it in eps.items():
+        _by_ep.setdefault(k, []).append(it)
+    for k, _its in _by_ep.items():
+        _sz = {it.get("Size") for it in _its}
+        if (len({it.get("Path") for it in _its}) > 1
+                and _sz and None not in _sz and len(_sz) == 1):
+            gaps.append({"kind": "dup_file", "lib": k[0], "series": k[1],
+                         "season": k[2], "ep": k[3], "quality": k[4],
+                         "detail": "同一集落了 %d 个不同文件，字节相同" % len(_its),
+                         "path": ""})
 
     # 1) teldrive 有、tg.db 无 → 台账缺口
     for k in td:
