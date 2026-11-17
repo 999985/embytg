@@ -64,7 +64,13 @@ import gha_finish as F            # noqa: E402  复用已验证的登记/探测/
 import autoingest as A            # noqa: E402
 import gha_state as GS            # noqa: E402
 
-MANIFEST_DIR = os.path.join(HERE, "_gha_manifests")
+MANIFEST_DIR = (os.getenv("TG_MANIFEST_DIR")
+                or os.path.join(HERE, "_gha_manifests"))
+# 2026-11-18（规模护栏）：清单目录**只增不减**（每单一份 ~3.5KB，实测 7 天 1118 份），
+# 而 candidates() 以前把目录里每个 json 都 open+parse 一遍 —— 1118 份 0.45s，
+# 按 20 万集推算就是每次巡检几分钟的纯 I/O 浪费，且随入库线性变慢（SCALING 九原则第 2 条）。
+# 收尾孤儿只在「刚跑完、客户端没来得及登记」这个窗口里有意义，因此只扫最近 N 小时。
+ORPHAN_WINDOW_H = os.getenv("TG_ORPHAN_WINDOW_H", "168")
 CLAIM_DIR = os.path.join(HERE, ".gha_claims")
 JOURNAL_DIR = os.path.join(HERE, ".gha_orphan_journal")
 LOG_PATH = os.path.join(HERE, "logs", "orphan_finish.log")
@@ -226,13 +232,49 @@ def write_journal(run_id, obj):
         pass
 
 
-def candidates(min_age_min):
+def manifest_paths(window_h=None):
+    """只返回窗口内的清单路径（按 mtime 升序），并给出被窗口排除的份数。
+
+    为什么不是 glob 全目录：目录只增不减，全量 open+parse 会随入库线性变慢；
+    而 7 天前的清单即使 done 也早已被登记（或在 teldrive 有字节），继续扫不出新结论。
+    参数 window_h：小时；None → 读 ORPHAN_WINDOW_H；<=0 → 不限（旧行为，排查用）。
+    """
+    try:
+        win_h = float(ORPHAN_WINDOW_H if window_h is None else window_h)
+    except (TypeError, ValueError):
+        win_h = 168.0
+    cutoff = (time.time() - win_h * 3600.0) if win_h > 0 else 0.0
+    out, excluded = [], 0
+    try:
+        with os.scandir(MANIFEST_DIR) as it:
+            for e in it:
+                if not e.name.endswith(".json"):
+                    continue
+                try:
+                    st = e.stat()
+                except OSError:
+                    continue
+                if st.st_mtime < cutoff:
+                    excluded += 1
+                    continue
+                out.append((st.st_mtime, e.path))
+    except OSError:
+        return [], 0
+    out.sort()
+    return [p for _, p in out], excluded
+
+
+def candidates(min_age_min, window_h=None, quiet=False):
     """返回 (可收尾清单, 跳过清单)，每项含 run_id/path/manifest/reason。"""
     runs, keys, rels = claim_guard()
     ps = process_guard()
     now = time.time()
     ok, skipped = [], []
-    for p in sorted(glob.glob(os.path.join(MANIFEST_DIR, "*.json"))):
+    paths, excluded = manifest_paths(window_h)
+    if excluded and not quiet:
+        log("清单窗口：扫描 %d 份，跳过 %d 份（>%sh，TG_ORPHAN_WINDOW_H 可调）"
+            % (len(paths), excluded, ORPHAN_WINDOW_H if window_h is None else window_h))
+    for p in paths:
         d = read_json(p)
         if not isinstance(d, dict) or not d.get("done"):
             continue
@@ -365,11 +407,17 @@ def main():
     ap.add_argument("--min-age-min", type=int, default=20,
                     help="manifest 至少多旧才动（默认 20 分钟）")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--window-h", type=float, default=None,
+                    help="只扫最近 N 小时的清单（默认读 TG_ORPHAN_WINDOW_H=168；"
+                         "0=不限，仅排查时用）")
     a = ap.parse_args()
 
-    ok, skipped = candidates(a.min_age_min)
+    ok, skipped = candidates(a.min_age_min, a.window_h, quiet=a.json)
     if a.json:
+        _excluded = manifest_paths(a.window_h)[1]
         print(json.dumps({
+            "window_h": (ORPHAN_WINDOW_H if a.window_h is None else a.window_h),
+            "window_excluded": _excluded,
             "orphans": [{k: v for k, v in i.items() if k != "manifest"}
                         for i in ok],
             "skipped": [{k: v for k, v in i.items() if k != "manifest"}
