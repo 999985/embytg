@@ -62,7 +62,7 @@ def human(n):
     return "%.2f GB" % (n / 1e9) if n >= 1e9 else "%.1f MB" % (n / 1e6)
 
 
-def auto_worker_timeout(chunk_bytes, mbps, floor=1200, cap=2700,
+def auto_worker_timeout(chunk_bytes, mbps, floor=1800, cap=2700,
                         safety=1.8, overhead=180, min_rate=0.05):
     """E167：按「区段字节 ÷ 实测单 worker 吞吐」推算墙钟预算，而不是写死 900s。
 
@@ -71,7 +71,8 @@ def auto_worker_timeout(chunk_bytes, mbps, floor=1200, cap=2700,
     manifest `parts=[]`、整轮 30 分钟产出 0（当日 upload_failed 26 次）。
     固定超时把「慢但活着」和「僵死」判成同一件事，这是判据错误。
 
-    - 无实测（mbps<=0）→ 返回 floor（有测量才有资格放宽）
+    - 无实测（mbps<=0）→ 返回 floor=1800（=128MiB @ 0.075MB/s，
+      覆盖「池子值是乐观的旧样本」的情况；有测量才有资格放宽）
     - 有实测 → est×safety+overhead，夹在 [floor, cap]
     - cap 默认 2700 > worker 自己的 TG_CHUNK_DEADLINE(2400)：
       真正的僵死由 worker 的 part 级 90s×6 兜底先退出，父进程只兜「慢」。
