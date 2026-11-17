@@ -131,6 +131,7 @@
   "tgmt_translate.py",
   "tgpipe.py",
   "tgpipe_tick.py",
+  "src_budget_rebalance.py",
   "todb_meta.py",
   "todb_meta_genre.py",
   "todb_pull_episodes.py",
