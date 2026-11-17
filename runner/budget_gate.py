@@ -43,8 +43,10 @@ import argparse
 import datetime
 import json
 import os
+import re
 import random
 import sqlite3
+import subprocess
 import sys
 import time
 
@@ -88,6 +90,33 @@ def _sum_between(con, t_from, t_to=None):
         args.append(int(t_to))
     row = con.execute(q, args).fetchone()
     return float(row[0] or 0) / 1e9, int(row[1] or 0)
+
+
+IFACE = os.environ.get("TG_BUDGET_IFACE", "enp0s6")
+
+
+def _egress_gb_since(day_from):
+    """网卡出站（GB），从 day_from（date）起算。
+
+    为什么按网卡而不按台账：Oracle 计费的是**网卡出站**，台账只记成功落地的
+    字节。零流量转存（tgpipe）落地但不产生出站 —— 实测 2026-11-10 起台账
+    2439GB、网卡出站 1683GB，用台账当额度会把免费额度提前判成用光；
+    反过来若重传很多，台账又会低估真实出站。按计费口径走才不误判。
+    """
+    try:
+        out = subprocess.run(["vnstat", "-i", IFACE, "-d"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except Exception:                                            # noqa: BLE001
+        return None
+    total, seen = 0.0, False
+    pat = re.compile(r"\s+(\d{4}-\d{2}-\d{2})\s+([\d.]+)\s+GiB\s*\|\s*([\d.]+)\s+GiB")
+    for line in out.splitlines():
+        m = pat.match(line)
+        if not m or m.group(1) < day_from.isoformat():
+            continue
+        total += float(m.group(3)) * 1.073741824          # GiB → GB
+        seen = True
+    return total if seen else None
 
 
 def _inflight_gb(now):
@@ -142,10 +171,16 @@ def evaluate(lane, now=None):
     t_next = t_day0 + 86400
     hours_left = max(0.5, (t_next - now) / 3600.0)
 
+    # Oracle 的 10TB 是**自然月**额度（1 号 00:00 重置）。原来读配置里的
+    # month_start=2026-11-10 —— 钉死的锚点，跨月不前进，攒到 9000GB 就永久停摆。
+    # 现在取当月 1 号；TG_BUDGET_MONTH_START 可显式覆盖。
+    _ov = os.environ.get("TG_BUDGET_MONTH_START")
     try:
-        ms = datetime.datetime.strptime(str(c.get("month_start")), "%Y-%m-%d")
-        t_month = int(time.mktime(ms.timetuple()))
+        _ms = (datetime.datetime.strptime(_ov, "%Y-%m-%d") if _ov else day0.replace(day=1))
+        month_start_date = _ms.date()
+        t_month = int(time.mktime(_ms.timetuple()))
     except Exception:                                              # noqa: BLE001
+        month_start_date = day0.date().replace(day=1)
         t_month = t_day0
 
     out = {"ok": False, "lane": lane, "ts": int(now)}
@@ -155,6 +190,10 @@ def evaluate(lane, now=None):
         used_window, _ = _sum_between(con, now - window)
         used_month, _ = _sum_between(con, t_month)
         con.close()
+        if os.environ.get("TG_BUDGET_METRIC", "egress") == "egress":
+            _eg = _egress_gb_since(month_start_date)
+            if _eg is not None:
+                used_month = _eg
     except Exception as e:                                         # noqa: BLE001
         # 读不到账 = 不知道预算 → 不拦（拦了就是全停），但要吼出来
         out.update({"rc": 0, "ok": True, "reason": "budget_unknown:%s" % str(e)[:60]})
