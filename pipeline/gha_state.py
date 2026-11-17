@@ -755,10 +755,24 @@ def ep_cool_days(n):
 
 
 def _ep_fail_load():
+    """读按集失败表，**顺手补齐缺失的 next_check**。
+
+    2026-11-18：`next_check` 是这次加指数退避才有的字段，历史条目没有 →
+    判活处 `now < rec.get("next_check") or 0` 会把它们当成「从没冷却过」，
+    于是 52 条老死集在改动后立刻全部回锅重试一遍。这里按
+    `last + ep_cool_days(fails)` 就地补，只在内存里补，写回由调用方决定。
+    """
     try:
-        return json.load(open(EP_FAIL, encoding="utf-8"))
+        d = json.load(open(EP_FAIL, encoding="utf-8"))
     except Exception:                                      # noqa: BLE001
         return {}
+    for v in d.values():
+        if isinstance(v, dict) and "next_check" not in v:
+            last = float(v.get("last") or 0)
+            if last:
+                v["cool_days"] = ep_cool_days(int(v.get("fails") or 1))
+                v["next_check"] = last + v["cool_days"] * 86400
+    return d
 
 
 # ---------- TG session 独占租约（E075） ----------
