@@ -153,6 +153,36 @@ def queue_progress(con):
     return total, cur_i, unapplied
 
 
+def queue_unapplied(ingest):
+    """**唯一**的「未 apply 条数」判据，所有消费方（verdict/selfcheck/ops1_daily/打印）都走这里。
+
+    2026-11-17 自醒的根因（E142 的回归）：E142 只改了 `collect()` 里的定义，
+    判据仍散在三个消费方，而它们读的是**旧字段** `pending_undone`——
+    那个字段数的是 `payload.done==0` 的行，tgpipe `apply --from-queue` 单批模式
+    只推进 meta.cursor、从不回写 done，所以它恒等于总行数：
+    实测 pending=36 / cursor=36（全部已消费）时仍报「未apply=36」，
+    让 ops1_selfcheck Q4 与 ops1_daily「队列不悬半途」同时假 FAIL/假关闸。
+
+    规则：本函数**永不读 pending_undone**（只可用于展示对照）。缺新字段时用
+    `pending - cursor` 保底（与 rowid>cursor 同义，裁剪只会让 pending 变小 → max(0,...)）。
+    返回 (unapplied, source)；无法判定返回 (None, 原因) —— 调用方必须把 None 当「未知」，
+    不能当「0」。
+    """
+    if not isinstance(ingest, dict):
+        return None, "no_ingest"
+    v = ingest.get("pending_unapplied")
+    if isinstance(v, int):
+        return v, "rowid>cursor"
+    p_raw, c_raw = ingest.get("pending"), ingest.get("cursor")
+    if p_raw is None or c_raw is None:
+        return None, "no_fields"
+    try:
+        p, c = int(p_raw), int(c_raw)
+    except (TypeError, ValueError):
+        return None, "no_fields"
+    return max(0, p - c), "pending-cursor"
+
+
 def item_ledger_gaps():
     """条目级五账差异（reconcile.py 每 15min 写进 tg.db.reconcile_gaps，带 age_min）。
 
@@ -398,8 +428,9 @@ def verdict(d):
     # E142：判据换成「rowid > cursor 的条数」。旧版数 payload.done，而 tgpipe 单批模式
     # 只推 cursor 不回写 done → 把「剩 15 条、下一轮正常消费」报成「35 条未 apply」。
     # 单轮消费上限 20（embytg-tgpipe.service --max-items 20）：≤20 属在途，>20 才是积压。
-    unapplied = ing.get("pending_unapplied")
-    undone = ing.get("pending_undone")
+    # 2026-11-17：改为调用 queue_unapplied() 单一口径，verdict 自己不再碰字段，
+    # 免得 E142 的修复只改一半、消费方继续读旧字段（当轮 selfcheck Q4 假 FAIL 就是这么来的）。
+    unapplied, _usrc = queue_unapplied(ing)
     if isinstance(unapplied, int) and unapplied > 20:
         out.append("入库队列积压 %d 条（cursor=%s/%s，超过单轮消费上限 20，scan 增速 > apply）"
                    % (unapplied, cursor, pending))
@@ -480,22 +511,12 @@ def verdict(d):
     if not out:
         out.append("无阻塞项：Scan 非 Running、入库队列无积压（≤单轮消费上限）、三线 backlog=0、"
                    "loop 在跑、对账齐、日志全闭环")
-    # cursor 在 tg.db.meta 是 TEXT，读出来是 '0' 字符串；pending 是 int → 必须都转 int 比
-    try:
-        cur_i = int(cursor) if cursor is not None else -1
-    except (TypeError, ValueError):
-        cur_i = -1
-    # E021：队列「干净」= 没有未 apply 的条目（undone==0）。旧版 `pending == cursor` 是
-    # 类别错误（行数 vs 单调游标）：11-13 实测 134 行全 done、cursor=144 → 被判【需收口】。
-    # 老库没有 done 字段时再退回「pending ≤ cursor」（比相等安全：裁剪只会让行数变小）。
     # E142：队列「干净」= 没有超过单轮消费上限的在途条目（≤20 条属下一轮的正常在途，
-    # 不是需要人收口的积压）。旧 collect 没有 pending_unapplied 时退回 E021 的 undone 口径。
-    if isinstance(unapplied, int):
-        queue_ok = (unapplied <= 20)
-    elif isinstance(undone, int):
-        queue_ok = (undone == 0)
-    else:
-        queue_ok = (isinstance(pending, int) and cur_i >= 0 and pending <= cur_i)
+    # 不是需要人收口的积压）。
+    # 2026-11-17：判据只走 queue_unapplied()（rowid>cursor）。此处原先还留了一条
+    # 「没有 pending_unapplied 就退回 undone==0」的分支 —— 那条分支正是 E142 的回归口：
+    # 旧字段恒等于总行数，一旦 collect 改了字段名就会静默把队列判死。未知一律按不干净处理。
+    queue_ok = (unapplied is not None and unapplied <= 20)
     stable = (not blocking and queue_ok)
     return ("稳定" if stable else "进行中/需收口"), out
 
@@ -538,7 +559,7 @@ def main():
         print("[刮削] NFO缺口=%s" % ng)
     print("[入库] tg.db pending=%s(未apply=%s) cursor=%s state_key=%s integrity=%s | 近30分钟 视频+%s NFO+%s"
           % (d["ingest"].get("pending"),
-             d["ingest"].get("pending_unapplied", d["ingest"].get("pending_undone")),
+             queue_unapplied(d["ingest"])[0],
              d["ingest"].get("cursor"),
              d["ingest"].get("state_key"), d["ingest"].get("integrity"),
              d["recent_video_30m"], d["recent_nfo_30m"]))

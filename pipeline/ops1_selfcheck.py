@@ -113,19 +113,22 @@ def main():
         "结掉自己的 开始/进行中；别人的按 AGENTS §7.8 只广播点名，不代结")
 
     # Q4 队列不悬半途（E021：用 pending 里「未 apply 条数」，不再拿行数与游标比相等）
-    ing = d.get("ingest") or {}
-    try:
-        cur = int(ing.get("cursor"))
-    except (TypeError, ValueError):
-        cur = -1
-    pend = ing.get("pending")
-    undone = ing.get("pending_undone")
-    if isinstance(undone, int):
-        q4_ok = (undone == 0)
-        q4_note = "未apply=%d / pending=%s 行 / cursor=%s" % (undone, pend, cur)
-    else:                                     # 老库无 done 字段 → 退回 pending ≤ cursor
-        q4_ok = isinstance(pend, int) and cur >= 0 and pend <= cur
-        q4_note = "pending=%s cursor=%s（无 undone 字段，退回旧口径）" % (pend, cur)
+    ing = d.get("ingest")
+    if not isinstance(ing, dict):
+        ing = {}
+    pend, cur = ing.get("pending"), ing.get("cursor")
+    # 2026-11-17：口径统一走 status_now.queue_unapplied()（rowid > cursor）。
+    # 旧版本行读 pending_undone（= payload.done==0 的行数），而 tgpipe 单批 apply
+    # 只推进 meta.cursor、从不回写 done → 该字段恒等于总行数：
+    # 本轮实测 pending=36 / cursor=36（36 条全部已消费）却被判「未apply=36」→ Q4 假 FAIL，
+    # 与 status_now 打印的「未apply=0」直接矛盾。E142 只改了 collect 的定义、没改消费方，
+    # 这就是那次修复漏掉的第三处（另外两处：status_now.verdict、ops1_daily）。
+    undone, usrc = status_now.queue_unapplied(ing)
+    q4_ok = (undone == 0)                     # None（判据缺失）== 0 为 False → 按 FAIL 处理
+    q4_note = "未apply=%s / pending=%s 行 / cursor=%s [%s]" % (
+        "未知" if undone is None else undone, pend, cur, usrc)
+    if undone is None:
+        q4_note += " ← 判据缺失：collect 既无 pending_unapplied 也无 pending+cursor"
     add("Q4 队列不悬半途", q4_ok,
         "%s integrity=%s" % (q4_note, ing.get("integrity")),
         "把 pending 里未 apply 的条目跑完（或确认无 apply 进程后归档），不留半成品")

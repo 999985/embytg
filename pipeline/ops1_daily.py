@@ -60,12 +60,14 @@ def main():
                                  (" UNKNOWN err=%s" % rec.get("err")) if rec_unknown else ""))
     # E021：与 status_now / selfcheck 同口径——「未 apply 条数==0」才算队列干净；
     # 不再拿 pending 行数与 cursor 相等（行数会因裁剪变小，11-13 实测 134 vs 144 全 done）。
-    _undone = ing.get("pending_undone")
-    if isinstance(_undone, int):
-        checks["队列不悬半途"] = (_undone == 0, "未apply=%d pending=%s cursor=%s" % (_undone, pend, cur))
-    else:
-        checks["队列不悬半途"] = (isinstance(pend, int) and cur >= 0 and pend <= cur,
-                                "pending=%s cursor=%s（无 undone 字段，退回旧口径）" % (pend, cur))
+    # 2026-11-17：口径收敛到 status_now.queue_unapplied() 单点。本处原读 pending_undone
+    # （payload.done 计数，单批 apply 不回写 → 恒等于总行数），只要有 pending 就会假关闸，
+    # 与 status_now 打印的「未apply=0」矛盾。
+    _undone, _usrc = status_now.queue_unapplied(ing)
+    checks["队列不悬半途"] = (
+        _undone == 0,                          # None(判据缺失) → False，按未过处理
+        "未apply=%s pending=%s cursor=%s [%s]" % (
+            "未知" if _undone is None else _undone, pend, cur, _usrc))
     checks["状态机在跑"] = (bool(d.get("loop_pids")), "loop=%s" % d.get("loop_pids"))
     # E020：与 status_now / autopilot 同口径——协作日志是交接记录，历史未闭环不是运行阻塞；
     # 只有近 3h 的未闭环才挡开闸（否则 11 条历史条目会让工单天天空闸，与 status_now【稳定】打架）。
