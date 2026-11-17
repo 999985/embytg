@@ -1784,6 +1784,52 @@ def effective_max_gb(lane, hour=None):
     return 8.0 if (2 <= h < 8) else 4.0
 
 
+TG_POOL_JSON = os.getenv("EMBYTG_TG_POOL", "/opt/embytg-runner/config/tg_pool.json")
+
+
+def lane_rate_mbps(slot, path=None, max_age_sec=3 * 3600, now=None):
+    """读账号池里该槽位的实测吞吐（MB/s）。无数据 / 无该槽 / 样本过期 → 0（=未知）。
+
+    「过期当作未知」是给慢号留的回血通道：lane 因为太慢被限了大文件后不再有上传样本，
+    若把旧值当永久事实，它会永远领不到活（自我实现的预言）。超过 max_age_sec 就重新
+    按未测量处理，放它跑一次、用真实结果覆盖旧结论。
+    """
+    p = path or TG_POOL_JSON
+    t = time.time() if now is None else float(now)
+    try:
+        with open(p, encoding="utf-8") as fh:
+            d = json.load(fh)
+        e = (d.get("nodes") or {}).get(str(int(slot))) or {}
+        mb = float(e.get("mbps") or 0)
+        up = float(e.get("updated") or 0)
+    except Exception:                                       # noqa: BLE001
+        return 0.0
+    if mb <= 0:
+        return 0.0
+    if max_age_sec and up and (t - up) > float(max_age_sec):
+        return 0.0                                          # 过期 → 当未测量
+    return mb
+
+
+def rate_limited_max_gb(base_gb, mbps, budget_sec=None, floor_gb=0.5):
+    """E174：单集上限再按「该号实测吞吐 × 上传墙钟预算」压一次。
+
+    事故（2026-11-18，E171/E173 的源头）：本机 four lane 各自绑定一个账号（单会话），
+    实测 0.06 / 2.62 / 0.96 / 0.21 MB/s，而 `effective_max_gb()` 只看车道与时段。
+    于是 0.06 MB/s 的 lane 反复领 3.5–5.4GB 的集：上传数学上跑不完 `timeout 9000`，
+    11-17 17:24 起每小时失败一次（11 次）= 11 小时墙钟 + 11 集源站配额白烧。
+
+    判据：`mbps × budget ÷ 1000`（GB）与车道上限取小；mbps<=0（未测量）不设限。
+    floor_gb 防止慢号彻底断粮（低于它的集照领，用于回血与测速）。
+    """
+    if mbps is None or float(mbps) <= 0:
+        return base_gb
+    b = float(budget_sec if budget_sec is not None
+              else os.getenv("EMBYTG_LANE_UPLOAD_BUDGET_SEC", "6000"))
+    cap = float(mbps) * max(60.0, b) / 1000.0
+    return round(min(float(base_gb), max(float(floor_gb), cap)), 3)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-id", required=True)
@@ -2036,6 +2082,7 @@ def main():
             emit({"ok": False, "reason": "source_allow_empty", "lane": a.lane,
                   "detail": ",".join(sorted(allow))})
             return 0
+    _size_explicit = a.max_size_gb is not None
     if a.max_size_gb is None:
         a.max_size_gb = effective_max_gb(a.lane)
     max_bytes = int(a.max_size_gb * 1e9)
@@ -2050,6 +2097,19 @@ def main():
         emit({"ok": False, "reason": "no_session",
               "detail": "所有 TG session 均被占用（租约未释放或 TTL 未到）"})
         return 0
+    # E174：慢号不许领「它算不完」的大文件。
+    # 单会话模式下每条 lane 绑定一个账号，0.06MB/s 的号领到 3.5–5.4GB 的集
+    # 就必然撞 timeout（E171：11 小时白烧 + 11 集源站配额）。
+    if not _size_explicit:
+        _mb = lane_rate_mbps(slot)
+        _lim = rate_limited_max_gb(a.max_size_gb, _mb)
+        if _lim < a.max_size_gb:
+            print("  单集上限 %.2fGB → %.2fGB（slot%s 实测 %.2fMB/s × %ss 上传预算）"
+                  % (a.max_size_gb, _lim, slot, _mb,
+                     os.getenv("EMBYTG_LANE_UPLOAD_BUDGET_SEC", "6000")),
+                  file=sys.stderr, flush=True)
+            a.max_size_gb = _lim
+            max_bytes = int(_lim * 1e9)
 
     # 2026-11-14（E075 修正）：拿到租约后，**任何非成功领片的出口都必须归还**，
     # 否则一次 NOJOB 就把唯一的 session 锁死 3 小时，整条链路停摆。

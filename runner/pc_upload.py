@@ -87,6 +87,57 @@ def auto_worker_timeout(chunk_bytes, mbps, floor=1800, cap=2700,
     return int(min(cap, max(floor, est * safety + overhead)))
 
 
+def feasible_weights(slots, weights, chunk_bytes, mbps_by_slot,
+                     floor_timeout=1800, safety=0.9, min_rate_floor=0.0):
+    """E173：把「一个区段在 floor 预算内物理上跑不完」的会话权重压到 0。
+
+    事故（2026-11-18，E171 的源头）：池里四个号实测 0.06 / 2.62 / 0.96 / 0.21 MB/s，
+    平滑加权轮询仍按 0.06 的权重把 5GB 级文件的分片派给 0.06 那个号 ——
+    128MiB 区段要 2237s，任何抖动都越过 2700s 上限，**一个慢号就能让整轮失败**
+    （`ZERO_PROGRESS 0 个分片落地`）。E171 只把失败代价砍半，这里才是不让它发生。
+
+    判据：`chunk_bytes / mbps > floor_timeout × safety` → 该号跑不完一个区段，权重 0。
+    全部不可行时**保留最快的那个**（宁可慢，不许停摆）。
+
+    返回 (new_weights, excluded_slot_list)；无实测数据的槽位保持原权重。
+    """
+    try:
+        n = len(weights)
+    except TypeError:
+        return list(weights or []), []
+    slots = list(slots or [])
+    w = [float(x) for x in (weights or [])]
+    if not w:
+        return [], []
+    mbps = {}
+    for s, v in (mbps_by_slot or {}).items():
+        try:
+            mbps[int(s)] = float(v or 0)
+        except (TypeError, ValueError):
+            continue
+    budget = float(floor_timeout) * float(safety)
+    excl = []
+    for i in range(n):
+        sl = slots[i] if i < len(slots) else None
+        try:
+            m = mbps.get(int(sl), 0.0) if sl is not None else 0.0
+        except (TypeError, ValueError):
+            m = 0.0
+        if m <= 0 or m <= float(min_rate_floor or 0):
+            continue                      # 没有实测/低于硬地板：不据此排除
+        if (float(chunk_bytes) / 1e6) / m > budget:
+            excl.append(sl)
+            w[i] = 0.0
+    if excl and not any(x > 0 for x in w):
+        # 全班都跑不完：留下「最快的那个」，让上层按超时/退避去处理，绝不停摆
+        best = max(range(n), key=lambda i: (mbps.get(int(slots[i]), 0.0)
+                                            if i < len(slots) else 0.0, -i))
+        w = [0.0] * n
+        w[best] = max(0.01, float(weights[best]))
+        excl = [s for j, s in enumerate(slots[:n]) if j != best]
+    return w, excl
+
+
 def pick_worker_timeout(explicit, slot, mbps_by_slot, chunk_bytes):
     """决定某个区段实际用的超时：显式正数优先，否则按该账号实测吞吐推算。
 
@@ -196,6 +247,17 @@ def run_region(src, offset, length, name, session=None, channel=0, timeout=900,
                     time.sleep(_fs + 5)
                     continue
                 raise QuotaRest("额度需等待 %ds（> %ds），本轮休息" % (_fs, FLOOD_REST_MAX))
+            # E171（2026-11-18 巡检）：**超时不是瞬时错误，重试同一个区段没有意义。**
+            # 事故：slot3 lane 从 11-17 17:24 起每小时一次 UPLOAD failed，全部是
+            # 「4 个区段 × 2 轮 × 1800s 超时、零字节落地」，每次白烧一小时 + 一整集源站配额。
+            # 1800s 预算已经由 auto_worker_timeout 按实测吞吐算过（见 E167）：
+            # 再给同样的 1800s 只会同样超时，差别只是把这一小时翻倍。
+            # 超时 → 立刻交回上层（gha_upload rc=6 → run_one E164 跳过第二次 attempt），
+            # 让 lane 尽早去领别的活 / 别的账号。要恢复旧行为：TG_RETRY_ON_TIMEOUT=1
+            if "worker 超时" in _msg and os.getenv("TG_RETRY_ON_TIMEOUT", "0") != "1":
+                print("  ! 区段 %s 超时不重试（预算耗尽，重试同样超时）" % name,
+                      file=sys.stderr, flush=True)
+                raise
             if i < attempts:
                 time.sleep(5)
     raise last
@@ -492,6 +554,7 @@ def main():
         _slot_of_idx = list(range(1, len(active_sessions) + 1))
 
     weights = []
+    _slot_ids = []            # E173：weights 每一项对应的真实账号槽位（下标≠槽位）
     _pool_w = {}
     if active_sessions:
         try:
@@ -512,8 +575,23 @@ def main():
                       else sorted(_pool_w.keys()))
             if len(_slots) == len(active_sessions):
                 weights = [max(0.01, float(_pool_w.get(sl, 1.0))) for sl in _slots]
+                _slot_ids = list(_slots)
         if not weights:
             weights = [1.0] * len(active_sessions)
+        # E173：把「一个区段在该号预算内物理上跑不完」的会话权重压到 0。
+        # 平滑加权轮询只看相对权重，0.06 的号照样会分到 1/17 的分片；
+        # 而它传 128MiB 要 2237s → 一个慢号就能让整轮 ZERO_PROGRESS（E171 的源头）。
+        if os.getenv("TG_SESSION_FEASIBILITY", "1") == "1" and _slot_ids:
+            try:
+                _cw = max(1, int(a.chunk_mib)) * 1024 * 1024
+                weights, _excl = feasible_weights(_slot_ids, weights, _cw, _pool_w)
+                if _excl:
+                    print("  排除不可行会话 slot=%s（%dMiB 区段在该号 1800s 预算内跑不完）"
+                          % (",".join(str(x) for x in _excl), int(a.chunk_mib)), flush=True)
+            except Exception as _fe:                       # noqa: BLE001
+                # 不许静默：但也不许因为筛除失败就不上传
+                print("  ! 会话可行性筛除失败（按原权重继续）: %s: %s"
+                      % (type(_fe).__name__, str(_fe)[:80]), flush=True)
         print("  池权重=%s" % ",".join("%.2f" % x for x in weights), flush=True)
 
     # 每个会话保持独立的小 worker 池；总 worker 数仍由 --jobs 控制。
