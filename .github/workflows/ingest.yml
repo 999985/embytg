@@ -23,6 +23,10 @@ on:
         description: "车道名（new2 / fill / upgrade，随便填但要在控制面存在）"
         default: "gha"
         required: true
+      dry_run:
+        description: "演练模式：只验证密钥/SSH/依赖，不领活、不上片"
+        default: "true"
+        required: true
 
 concurrency:
   group: ingest-${{ inputs.slot }}
@@ -91,6 +95,7 @@ jobs:
             echo "::error::控制面连不上，检查 ORACLE_* secrets 与私钥"; exit 1; }
 
       - name: 跑一集
+        if: ${{ inputs.dry_run != 'true' }}
         env:
           RUNNER_SLOT: ${{ inputs.slot }}
           RUNNER_LANE: ${{ inputs.lane }}
@@ -101,6 +106,10 @@ jobs:
         run: |
           chmod +x runner/run_one.sh
           bash runner/run_one.sh
+
+      - name: 演练结束
+        if: ${{ inputs.dry_run == 'true' }}
+        run: echo "dry_run：密钥、SSH、venv 都通了；真跑请把 dry_run 设为 false"
 
       - name: 清理
         if: always()
