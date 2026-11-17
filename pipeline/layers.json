@@ -15,7 +15,7 @@
   "self_audit.py",
   "status_now.py"
  ],
- "generated": "2026-11-16",
+ "generated": "2026-11-17",
  "legacy": [
   "_db_state.py",
   "_inspect_td.py",
@@ -43,6 +43,7 @@
   "gha_dispatch.py",
   "gha_finish.py",
   "gha_next3.py",
+  "gha_orphan_finish.py",
   "gha_state.py",
   "ingest_quota.py",
   "ingest_review.py",
