@@ -311,7 +311,7 @@ def recover(item):
         res["file_id"] = fid
         log("  REGISTERED %s file_id=%s" % (name, fid))
         import tdprobe
-        okp, det = tdprobe.probe_file(fid)
+        okp, det = tdprobe.probe_file(fid, ext=os.path.splitext(name)[1])
         if not okp:
             rollback_file_row(fid)
             try:

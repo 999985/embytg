@@ -65,33 +65,93 @@ def _req(path, rng, timeout):
 
 def _one_range(fid, rng, timeout):
     """返回 (ok, http_code, total_size or None, detail)。"""
+    ok, code, total, detail, _body = _one_range_body(fid, rng, timeout)
+    return ok, code, total, detail
+
+
+def _one_range_body(fid, rng, timeout):
+    """同 _one_range，但把 body 一起返回（结构体检要用前 64KB 的字节）。"""
     try:
         code, hdrs, body = _req("/api/v1/files/%s/content" % fid, rng, timeout)
     except urllib.error.HTTPError as e:
-        return False, e.code, None, "HTTP %s" % e.code
+        return False, e.code, None, "HTTP %s" % e.code, b""
     except Exception as e:                                  # noqa: BLE001
-        return False, "ERR", None, "%s: %s" % (type(e).__name__, str(e)[:60])
+        return False, "ERR", None, "%s: %s" % (type(e).__name__, str(e)[:60]), b""
     cr = hdrs.get("Content-Range") or hdrs.get("content-range") or ""
     total = None
     m = re.search(r"/(\d+)\s*$", cr)
     if m:
         total = int(m.group(1))
     if code not in (200, 206):
-        return False, code, total, "unexpected code %s" % code
+        return False, code, total, "unexpected code %s" % code, b""
     if not body:
-        return False, code, total, "empty body"
-    return True, code, total, "range=%s got=%d" % (cr or "-", len(body))
+        return False, code, total, "empty body", b""
+    return True, code, total, "range=%s got=%d" % (cr or "-", len(body)), body
 
 
-def probe_file(fid, size=None, timeout=PROBE_TIMEOUT, retries=PROBE_RETRIES):
-    """探一个 teldrive 文件能不能读。返回 (ok, detail_dict)。"""
+MP4_EXT = (".mp4", ".m4v", ".mov")
+
+
+def mp4_index_status(head, total):
+    """走查 mp4 顶层 box，判断索引（moov）是否存在。
+
+    为什么需要（E169）：`probe_file` 只证明「头尾能读出字节」，不证明「容器结构完整」。
+    实测 `当星光坠入花海 S01E07`：324 MB 文件、头尾都能读、teldrive 侧 ok=true，
+    但顶层 box 是 `ftyp(28) + free(8) + 垃圾 4 字节 + mdat`——moov 索引根本不存在，
+    ffprobe 报 `moov atom not found`，Emby 永远拿不到 MediaStreams（stage=emby_nofprobe）。
+    这类坏文件重试探测一万次都不会好，只能在通知 Emby 之前就判死并重新下行。
+
+    判据（保守，宁可 unknown 也不误杀）：
+      - 命中顶层 moov            → ok
+      - box 尺寸非法 / 超出文件尾 → dead（截断的上传就是这样）
+      - 走完已知 box 恰好等于文件尾且无 moov → dead（索引缺失）
+      - 其它                     → unknown（moov 可能在文件尾的普通 mp4，不做判定）
+    """
+    off = 0
+    n = len(head)
+    boxes = []
+    while off + 8 <= n:
+        size = int.from_bytes(head[off:off + 4], "big")
+        typ = head[off + 4:off + 8]
+        hdr = 8
+        if size == 1:
+            if off + 16 > n:
+                return "unknown", "truncated_largesize@%d" % off
+            size = int.from_bytes(head[off + 8:off + 16], "big")
+            hdr = 16
+        elif size == 0:
+            size = total - off
+        if typ == b"moov":
+            return "ok", "moov@%d" % off
+        if size < hdr or off + size > total:
+            return "dead", "bad_box@%d type=%r size=%d total=%d boxes=%s" % (
+                off, typ, size, total, boxes[:5])
+        boxes.append((typ.decode("latin1", "replace"), size))
+        off += size
+        if len(boxes) > 64:
+            return "unknown", "too_many_boxes"
+    if off >= total:
+        return "dead", "no_moov_at_eof boxes=%s" % (boxes[:6],)
+    return "unknown", "moov_not_in_head boxes=%s" % (boxes[:6],)
+
+
+def probe_file(fid, size=None, timeout=PROBE_TIMEOUT, retries=PROBE_RETRIES, ext=""):
+    """探一个 teldrive 文件能不能读，并对 mp4 家族做容器结构体检。
+
+    返回 (ok, detail_dict)。ext 为空时跳过结构体检（保持旧行为）。"""
     if not fid:
         return False, {"err": "no_file_id"}
     last = ""
     for attempt in range(retries + 1):
-        ok, code, total, detail = _one_range(
+        ok, code, total, detail, body = _one_range_body(
             fid, "bytes=0-%d" % (PROBE_HEAD - 1), timeout)
         if ok:
+            if ext.lower() in MP4_EXT and body:
+                st, why = mp4_index_status(body, total or size or 0)
+                if st == "dead":
+                    return False, {"err": "mp4_index_missing", "why": why,
+                                   "total": total, "head": detail,
+                                   "attempt": attempt + 1}
             if total and total > PROBE_TAIL:
                 ok2, code2, _t2, d2 = _one_range(
                     fid, "bytes=%d-%d" % (total - PROBE_TAIL, total - 1), timeout)
@@ -183,7 +243,8 @@ def main():
             print(json.dumps({"rel": a.rel, "ok": None, "err": "file_id_not_found"},
                              ensure_ascii=False))
             return 2
-        ok, d = probe_file(fid, timeout=a.timeout or PROBE_TIMEOUT)
+        ok, d = probe_file(fid, timeout=a.timeout or PROBE_TIMEOUT,
+                           ext=os.path.splitext(a.rel)[1])
         print(json.dumps({"rel": a.rel, "id": fid, "ok": ok, **d}, ensure_ascii=False))
         return 0 if ok else 2
 
@@ -217,7 +278,7 @@ def main():
         for line in rows:
             fid, rel = line.split("|", 1)
             fid = fid.strip()
-            ok, d = probe_file(fid)
+            ok, d = probe_file(fid, ext=os.path.splitext(rel)[1])
             tag = "OK " if ok else "BAD"
             print("  %-3s %s" % (tag, rel[:100]), flush=True)
             if ok:

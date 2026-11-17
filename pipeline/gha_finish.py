@@ -577,7 +577,8 @@ def main():
             # 与文件大小无关；读不出来就抛错，这个文件永远进不了 Emby 的视野。
             if not a.no_probe:
                 import tdprobe
-                _ok, _det = tdprobe.probe_file(fid)
+                _ok, _det = tdprobe.probe_file(
+                    fid, ext=os.path.splitext(job.get("name") or "")[1])
                 if not _ok:
                     _led = os.path.join(HERE, "logs", "td_dead_files.jsonl")
                     try:
