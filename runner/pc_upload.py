@@ -62,6 +62,48 @@ def human(n):
     return "%.2f GB" % (n / 1e9) if n >= 1e9 else "%.1f MB" % (n / 1e6)
 
 
+def auto_worker_timeout(chunk_bytes, mbps, floor=1200, cap=2700,
+                        safety=1.8, overhead=180, min_rate=0.05):
+    """E167：按「区段字节 ÷ 实测单 worker 吞吐」推算墙钟预算，而不是写死 900s。
+
+    事故（2026-11-17）：TG 侧把单号压到 0.15–0.18 MB/s 时，一个 128MiB 区段
+    物理上要 745–900s，任何抖动都越线 → 8 个区段同一秒全部 `worker 超时（900s）`、
+    manifest `parts=[]`、整轮 30 分钟产出 0（当日 upload_failed 26 次）。
+    固定超时把「慢但活着」和「僵死」判成同一件事，这是判据错误。
+
+    - 无实测（mbps<=0）→ 返回 floor（有测量才有资格放宽）
+    - 有实测 → est×safety+overhead，夹在 [floor, cap]
+    - cap 默认 2700 > worker 自己的 TG_CHUNK_DEADLINE(2400)：
+      真正的僵死由 worker 的 part 级 90s×6 兜底先退出，父进程只兜「慢」。
+    """
+    try:
+        r = float(mbps or 0)
+    except (TypeError, ValueError):
+        r = 0.0
+    if r <= 0:
+        return int(floor)
+    est = (float(chunk_bytes) / 1e6) / max(float(min_rate), r)
+    return int(min(cap, max(floor, est * safety + overhead)))
+
+
+def pick_worker_timeout(explicit, slot, mbps_by_slot, chunk_bytes):
+    """决定某个区段实际用的超时：显式正数优先，否则按该账号实测吞吐推算。
+
+    单点函数，专为「槽位 → 吞吐 → 预算」这条映射加测试（下标映射错一次就会
+    把快号的预算套到慢号上，症状和没改一样）。
+    """
+    try:
+        if explicit and int(explicit) > 0:
+            return int(explicit)
+    except (TypeError, ValueError):
+        pass
+    try:
+        mb = float((mbps_by_slot or {}).get(int(slot or 0), 0) or 0)
+    except (TypeError, ValueError):
+        mb = 0.0
+    return auto_worker_timeout(chunk_bytes, mb)
+
+
 def md5_file(path):
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -88,8 +130,19 @@ def run_region_once(src, offset, length, name, session=None, channel=0,
                             "--name", name], capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env,
                            timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("worker 超时（%ss）" % timeout)
+    except subprocess.TimeoutExpired as e:
+        # E167：超时也要把 worker 已经说出的话带出来。
+        # 旧写法只报「worker 超时（900s）」，把「part N RPC 超时」这种
+        # 能区分「僵死」与「慢」的证据全丢在变量里，排查时只能猜。
+        _tail = ""
+        try:
+            _raw = e.stderr or b""
+            if isinstance(_raw, bytes):
+                _raw = _raw.decode("utf-8", "replace")
+            _tail = (_raw or "").strip().splitlines()[-1][:200] if _raw else ""
+        except Exception:                                  # noqa: BLE001
+            _tail = ""
+        raise RuntimeError("worker 超时（%ss）%s" % (timeout, (" | " + _tail) if _tail else ""))
     # 2026-11-14（E099）：返回 worker 的**真实耗时**，供账号池算吞吐。
     # 不能用「提交到完成」的时间：8 个 worker 并发时，后提交的区段
     # 一直在排队，134MB / 1300s ≈ 0.1 MB/s，把 7.57 MB/s 的通道
@@ -279,8 +332,8 @@ def main():
                     help="本次分片写入的 TG 存储频道；缺省读 TG_STORE_CH")
     ap.add_argument("--session-slot", type=int, default=0,
                     help="只使用第 N 个 TG 会话（1/2）；0=所有会话按分片轮换")
-    ap.add_argument("--worker-timeout", type=int, default=900,
-                    help="单个分片 worker 的最长等待秒数")
+    ap.add_argument("--worker-timeout", type=int, default=0,
+                    help="单个区段 worker 的最长等待秒数；0=按账号实测吞吐自动推算（E167）")
     ap.add_argument("--no-md5", action="store_true",
                     help="续传时本地文件可能是稀疏文件，不计算全文件 MD5")
     a = ap.parse_args()
@@ -495,8 +548,16 @@ def main():
 
     futs = {}
     fu_t0 = {}
+    _mbps_by_slot = {}
+    try:
+        for _r in TP.snapshot():
+            _mbps_by_slot[int(_r.get("slot") or 0)] = float(_r.get("mbps") or 0)
+    except Exception:                                      # noqa: BLE001
+        _mbps_by_slot = {}
+    _wt_seen = {}
     for pos, (idx, off, length) in enumerate(todo):
         nm = "%s.part%02d" % (base, idx)
+        si = 0
         if active_sessions:
             si = part_sessions[pos]
             session = active_sessions[si]
@@ -506,10 +567,29 @@ def main():
             session = None
             ex = executors[0]
             session_no = a.session_slot or 0
+        # E167：墙钟预算按「该区段字节 ÷ 该账号实测单 worker 吞吐」推算。
+        # 写死 900s 时，TG 慢到 0.15MB/s 就等于「物理上不可能完成」——
+        # 8 个区段整批超时、manifest 一片没落地，整轮产出 0。
+        if a.worker_timeout and a.worker_timeout > 0:
+            _wt = a.worker_timeout
+        else:
+            _sl = (_slot_of_idx[si] if _slot_of_idx and si < len(_slot_of_idx)
+                   else session_no)
+            _mb = _mbps_by_slot.get(int(_sl or 0), 0.0)
+            _wt = pick_worker_timeout(0, _sl, _mbps_by_slot, length)
+            _wt_seen[(_sl, _mb)] = _wt
         _fu = ex.submit(run_region, src, off, length, nm, session, store_ch,
-                        a.worker_timeout)
+                        _wt)
         fu_t0[_fu] = time.time()
         futs[_fu] = (idx, length, session_no)
+    if _wt_seen:
+        print("  区段超时=auto（实测吞吐→预算）：%s" % "，".join(
+            "slot%s %.2fMB/s→%ds" % (k[0], k[1], v)
+            for k, v in sorted(_wt_seen.items(), key=lambda x: str(x[0][0]))),
+            flush=True)
+    elif a.worker_timeout and a.worker_timeout > 0:
+        print("  区段超时=固定 %ds（TG_WORKER_TIMEOUT 显式覆盖）"
+              % a.worker_timeout, flush=True)
     try:
         for fu in as_completed(futs):
             idx, length, session_no = futs[fu]

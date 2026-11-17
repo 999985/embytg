@@ -46,7 +46,7 @@ def main():
            "--name", job["name"],
            "--chunk-mib", os.getenv("TG_CHUNK_MIB", "512"),
            "--jobs", os.getenv("TG_UPLOAD_JOBS", "6"),
-           "--worker-timeout", os.getenv("TG_WORKER_TIMEOUT", "1800")]
+           "--worker-timeout", os.getenv("TG_WORKER_TIMEOUT", "0")]
     store_ch = int(job.get("store_channel_id") or 0)
     if store_ch:
         cmd.extend(["--store-ch", str(store_ch)])
