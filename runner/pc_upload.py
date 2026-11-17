@@ -202,7 +202,31 @@ def run_region_once(src, offset, length, name, session=None, channel=0,
     for line in (r.stdout or "").splitlines():
         if line.startswith("MSG="):
             return int(line[4:].strip()), time.time() - _t0
-    raise RuntimeError("worker 未返回 MSG (rc=%s): %s" % (r.returncode, (r.stderr or "")[-300:]))
+    raise RuntimeError("worker 未返回 MSG (rc=%s): %s" % (r.returncode, _err_brief(r.stderr)))
+
+
+_ERR_RE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Wait|Cancel\w*)\b.*$", re.M)
+
+
+def _err_brief(stderr, limit=300):
+    """把 worker stderr 压成「异常行 | 末行」，而不是只保留最后 300 个字符。
+
+    2026-11-18 修：旧写法取 `stderr[-300:]`，落点在 traceback 中途
+    （实测得到 `return future.result()` + `File "/opt/emby-run`），
+    **看不到异常类型**，part08/part09 反复失败时无从判断是 RPC 还是本地错误。
+    现在优先取最后一条形如 `XxxError: ...` 的行，再附末行。
+    """
+    s = (stderr or "").strip()
+    if not s:
+        return ""
+    m = _ERR_RE.findall(s)
+    last = s.splitlines()[-1].strip()
+    if m:
+        head = m[-1].strip()
+        out = head if head == last else "%s | last: %s" % (head, last)
+    else:
+        out = last
+    return out[-limit:]
 
 
 FLOOD_REST_MAX = int(os.environ.get("PC_FLOOD_REST_MAX", "1200"))  # 20 分钟以内就地休息

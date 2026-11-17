@@ -27,5 +27,5 @@ for k in $(sed -n 's/^\(TG_SESSION_STRING[_0-9]*\)=.*/\1/p' "$ENV" 2>/dev/null);
 done
 echo "$(date '+%F %T') templated instances=$N" >> "$LOG"
 
-# E157：上传失败留下的 _keep 源文件缓存必须有界（TTL 24h / 上限 12GiB）
+# E157：上传失败留下的 _keep 源文件缓存必须有界（TTL 24h / 上限 16GiB 且不超过「余量−20GB」）
 /usr/bin/python3 /opt/embytg-runner/keep_cleanup.py >> "$LOG" 2>&1 || true

@@ -3,7 +3,8 @@
 
 背景：上传失败（pc_worker 900s 超时）会把已下好的整集留在 _keep 等下一单复用，
       省掉整集重下的源站配额。但缓存必须有界，否则 8GB/集的残件几天就吃满磁盘。
-规则：① TTL（默认 24h）过期即删；② 总容量超过上限（默认 12GiB）时从最旧删起。
+规则：① TTL（默认 24h）过期即删；② 总容量超过上限（默认 16GiB，且不超过
+      「当前余量 − 保留线 20GB」）时从最旧删起。
 两个阈值都可用环境变量覆盖：TG_KEEP_TTL_H / TG_KEEP_CAP_GB。
 用法：python3 keep_cleanup.py [--dry]
 """
@@ -74,6 +75,13 @@ def main(argv):
             except OSError as exc:
                 print("keep_cleanup: 删除失败 %s: %s" % (it["name"], exc))
                 total += it["size"]
+    if dry:
+        # 干跑时说「将删除」而不是「删除 0 个」——后者会让人以为没有候选（2026-11-18 修）。
+        print("keep_cleanup[dry]: 将删除 %d 个 / 可释放 %.2f GB / 保留 %d 个 %.2f GB（上限 %.1f GB, TTL %.0fh）"
+              % (len(dropped), sum(it["size"] for _, it in dropped) / 1e9,
+                 len(kept) - len([1 for w, _ in dropped if w == "cap"]), total / 1e9,
+                 cap_b / 1e9, ttl_h))
+        return 0
     print("keep_cleanup: 删除 %d 个 / 释放 %.2f GB / 保留 %d 个 %.2f GB（上限 %.1f GB, TTL %.0fh）"
           % (len(gone), freed / 1e9, len(kept) - len(gone), total / 1e9, cap_b / 1e9, ttl_h))
     return 0
