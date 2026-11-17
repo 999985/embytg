@@ -175,7 +175,9 @@ for _n in ["nfo_episodes.py", "nfo_episodes_fix.py", "nfo_episodes_tmdb.py",
 for _n in ["OPS_HANDBOOK.md", "SELF_IMPROVE.md", "SOURCE_SERVERS.md", "CRON_SCHEDULE.md", "PROJECT_LAYOUT.md", "OPS_COVERAGE.md"]:
     BACKUP_FILES.append((os.path.join(PIPE, "docs", _n), "docs/" + _n))
 for _n in [".ingest_budget.json", ".ingest_manual.jsonl", ".autoingest_queue.json",
-           ".autoingest_failed.json", ".self_backlog.json"]:
+           ".autoingest_failed.json", ".self_backlog.json",
+           ".gha_ep_fail.json",      # 2026-11-18：按集退避表（live），换机后不该重新撞死集
+           ".gha_new_done.json"]:    # 2026-11-18：剧集级冷却表（live），同上
     BACKUP_FILES.append((os.path.join(PIPE, _n), "state/" + _n))
 for _f in ["每日巡检与自省.json", "远程上片核查.json", "四小时看护.json",
            "日终收尾.json", "周度体检.json"]:

@@ -79,24 +79,29 @@ def classify(tail):
 
 
 def review(days=7):
-    """7 天回归复查：指标趋势 + 这段时间改过哪些脚本（验证"进化"是否真的有效）"""
+    """7 天回归复查：指标趋势 + 这段时间改过哪些脚本（验证"进化"是否真的有效）
+
+    2026-11-18：指标从「成功率」换成「次/集」（quota_history 口径）。
+    旧格式的快照（`成功率 **X%**`）已经不写了，这里不再解析 —— 混着两种口径
+    画趋势会得出「成功率涨了」的假结论，而真实成本在别处。
+    """
     import glob
     tr = []
     for f in sorted(glob.glob(os.path.join(LOGS, "self_review_*.md")))[-days:]:
         try:
             txt = open(f, encoding="utf-8").read()
-            m = re.search(r"成功率 \*\*([\d.]+)%", txt)
+            m = re.search(r"(\d+) 天共落地 \*\*(\d+) 集\*\*，烧 \d+ 次源请求，\*\*([\d.]+) 次/集\*\*", txt)
             d = os.path.basename(f).replace("self_review_", "").replace(".md", "")
             if m:
-                tr.append((d, float(m.group(1))))
+                tr.append((d, int(m.group(2)), float(m.group(3))))
         except Exception:                                          # noqa: BLE001
             pass
     print("== 改进有效性复查（近 %d 天）==" % days)
     if len(tr) >= 2:
         first, last = tr[0], tr[-1]
-        print("  成功率：%s %.1f%% → %s %.1f%%（%+.1f）"
-              % (first[0], first[1], last[0], last[1], last[1] - first[1]))
-        print("  逐日：" + "  ".join("%s=%.0f%%" % (d[4:], v) for d, v in tr))
+        print("  次/集：%s %.2f → %s %.2f（%+.2f，越低越好）"
+              % (first[0], first[2], last[0], last[2], last[2] - first[2]))
+        print("  逐日：" + "  ".join("%s=%.1f(%d集)" % (d[4:], v, n) for d, n, v in tr))
     else:
         print("  快照不足（至少两天的 self_review 才能比）")
     try:
@@ -123,27 +128,56 @@ def main():
     cutoff = time.time() - a.window_days * 86400
     rep = {"ts": time.strftime("%F %T"), "window_days": a.window_days}
 
-    # ---- 1) 入库成功率 ----
-    # E035（2026-11-12 运维守护自省）：autoingest.log 里除了「尝试」还混着
-    # duplicate / skip_series / register 等事件，它们没有 ok 字段。此前一律
-    # 计入 tries → 63 条 duplicate + 2 条 skip_series 被记成「失败/未知」，
-    # 成功率被压到 13.8%（真实 24/106=22.6%），改进清单也跟着指向错方向。
-    # 现在：只有带 ok 字段的记录算尝试；其余按 event 单列，不进分母。
+    # ---- 1) 入库产能（真源：logs/quota_history.jsonl） ----
+    # 2026-11-18（自省）：原来这里读 autoingest.log 里「带 ok 字段的尝试」算成功率。
+    # 但 autoingest.py --loop 已随 GHA 链路退役（ps 无进程、cron 无条目），
+    # 实测 7 天窗口 tries=0 / success_rate=None —— 这一节每天都是空的，
+    # 等于**监控指着退役链路**（AGENTS.md §7.8.6 的同一类错误：文档改了、判据没改）。
+    #
+    # 现在改读 quota_history.jsonl（daily_ops 每轮刷新，一天一行，tg.db 记账派生）：
+    #   episodes = 当日落地集数，requests = 当日源请求数，
+    #   per_ep   = 每集消耗请求数 —— 这才是 AGENTS.md §0.2 定的产能第一指标。
+    prod_rows = []
+    qh = os.path.join(LOGS, "quota_history.jsonl")
+    if os.path.exists(qh):
+        for line in open(qh, encoding="utf-8", errors="ignore"):
+            try:
+                r = json.loads(line)
+            except Exception:                                      # noqa: BLE001
+                continue
+            if r.get("day") and ts2epoch(str(r["day"]) + " 00:00:00") >= cutoff - 86400:
+                prod_rows.append(r)
+    prod_rows.sort(key=lambda r: str(r.get("day")))
+    full = [r for r in prod_rows if not r.get("partial")]
+    ep_sum = sum(int(r.get("episodes") or 0) for r in prod_rows)
+    req_sum = sum(int(r.get("requests") or 0) for r in prod_rows)
+    rep["prod"] = {
+        "days": len(prod_rows),
+        "episodes": ep_sum,
+        "requests": req_sum,
+        "per_ep": round(req_sum / ep_sum, 2) if ep_sum else None,
+        # 只拿「完整日」算基线：当天 partial 会把 per_ep 拉偏（请求已发、集还没落完）
+        "full_days": len(full),
+        "full_per_ep": (round(sum(int(r["requests"]) for r in full)
+                              / max(1, sum(int(r["episodes"]) for r in full)), 2)
+                        if full and sum(int(r["episodes"]) for r in full) else None),
+        "today": (prod_rows[-1] if prod_rows else {}),
+    }
+    # autoingest.log 仍在写（duplicate / skip 事件由 gha_next3 打），只取事件计数
     ing_all = [r for r in tail_jsonl("autoingest.log") if ts2epoch(r.get("ts", "")) >= cutoff]
-    ing = [r for r in ing_all if "ok" in r]
     skipped = [r for r in ing_all if "ok" not in r]
-    ok = [r for r in ing if r.get("ok")]
-    fail = [r for r in ing if not r.get("ok")]
-    gb = sum(r.get("gb") or 0 for r in ok)
-    rep["ingest"] = {"tries": len(ing), "ok": len(ok), "fail": len(fail),
-                     "gb": round(gb, 1),
-                     "success_rate": round(len(ok) * 100.0 / len(ing), 1) if ing else None,
-                     "non_attempt": len(skipped)}
+    dup_n = len([r for r in skipped if r.get("event") == "duplicate"])
+    rep["ingest"] = {
+        "episodes": ep_sum, "requests": req_sum, "per_ep": rep["prod"]["per_ep"],
+        "duplicate": dup_n,
+        # 每落地 1 集付出的 duplicate 扫描条数（§0.2 的 KPI，越低越好）
+        "dup_per_ep": round(dup_n / ep_sum, 3) if ep_sum else None,
+        "non_attempt": len(skipped),
+    }
     rep["non_attempt_events"] = collections.Counter(
         (r.get("event") or "?") + ("/" + str(r.get("reason")) if r.get("reason") else "")
         for r in skipped).most_common(6)
-    causes = collections.Counter(classify(r.get("tail")) for r in fail)
-    rep["fail_causes"] = causes.most_common(8)
+    rep["fail_causes"] = []       # 失败原因已由 quota_history.queue.reasons 体现（见 §4）
 
     # ---- 2) 源服健康 ----
     reqs = [r for r in tail_jsonl("source_requests.log", 20000) if ts2epoch(r.get("ts", "")) >= cutoff]
@@ -177,27 +211,78 @@ def main():
                   "findings_total": sum(r.get("findings") for r in cycles
                                         if isinstance(r.get("findings"), int))}
 
-    # ---- 4) 失败记忆 ----
-    fm = {}
-    if os.path.exists(os.path.join(HERE, ".autoingest_failed.json")):
-        try:
-            fm = json.load(open(os.path.join(HERE, ".autoingest_failed.json"), encoding="utf-8"))
-        except Exception:                                          # noqa: BLE001
-            pass
-    rep["dead_items"] = len(fm)
+    # ---- 4) 失败记忆（真源：.gha_ep_fail.json） ----
+    # 2026-11-18（自省）：原来读 `.autoingest_failed.json` —— 那是 autoingest.py 的表，
+    # 随 GHA 链路退役后**冻结在 2026-11-15**，永远 43 条。于是 P1「43 个死集反复失败」
+    # 连续几天挂在改进清单上，指向一个没人再跑的文件，真问题反而看不见（§7.8.6 同一类）。
+    #
+    # 现在读 live 的按集退避表（gha_state.record_episode_failure 写、gha_next3 落 claim 前读）：
+    #   total     = 表内条数
+    #   cooling   = next_check 未到期（正在退避，本来就不该被领 —— 不领才是对的）
+    #   today     = 今天又失败过（退避到期后又撞了一次 → 该换源/换画质，不是再等一天）
+    #   by_reason = 原因分布：upload_failed 找 runner，source_* 找源站
+    ep_fail = {}
+    try:
+        ep_fail = json.load(open(os.path.join(HERE, ".gha_ep_fail.json"), encoding="utf-8"))
+    except Exception:                                              # noqa: BLE001
+        ep_fail = {}
+    _now = time.time()
+    _today = time.strftime("%Y-%m-%d")
+    _cooling = [k for k, v in ep_fail.items()
+                if isinstance(v, dict) and _now < float(v.get("next_check") or 0)]
+    _today_fail = [k for k, v in ep_fail.items()
+                   if isinstance(v, dict)
+                   and time.strftime("%Y-%m-%d", time.localtime(float(v.get("last") or 0))) == _today]
+    legacy_n = 0
+    try:
+        legacy_n = len(json.load(open(os.path.join(HERE, ".autoingest_failed.json"),
+                                      encoding="utf-8")))
+    except Exception:                                              # noqa: BLE001
+        pass
+    rep["ep_fail"] = {
+        "total": len(ep_fail), "cooling": len(_cooling), "today": len(_today_fail),
+        "by_reason": collections.Counter(
+            str(v.get("reason") or "?")[:40] for v in ep_fail.values()
+            if isinstance(v, dict)).most_common(5),
+        # 今日新增失败的原因要单独统计：全表分布会被历史条目带偏（改进清单要能指向当天的病）
+        "by_reason_today": collections.Counter(
+            str((ep_fail.get(k) or {}).get("reason") or "?")[:40] for k in _today_fail).most_common(5),
+        "legacy_retired": legacy_n,     # 退役链路的旧表，只做留痕，不再派活
+    }
+    # 队列停泊原因（quota_history 当日行）：no_source / series_complete / fill_ep_present
+    _q = (rep["prod"]["today"] or {}).get("queue") or {}
+    rep["parked"] = {
+        "total": _q.get("total"), "parked": _q.get("parked"),
+        "top": sorted((_q.get("reasons") or {}).items(), key=lambda x: -x[1])[:5],
+    }
 
     # ---- 5) 改进清单（影响 × 频次 ÷ 成本） ----
     bl = []
-    if rep["ingest"]["success_rate"] is not None and rep["ingest"]["success_rate"] < 80:
-        top = causes.most_common(1)
-        bl.append({"p": 1, "item": "入库成功率 %.0f%%（低）" % rep["ingest"]["success_rate"],
-                   "why": "首要失败原因：%s ×%d" % (top[0][0], top[0][1]) if top else "原因未知",
-                   "fix": "按失败原因改 source_pull：404→多源回退+失败记忆；401→换 token；无此剧→换源站",
+    _per_ep = rep["prod"]["per_ep"]
+    if _per_ep is not None and _per_ep > 15:
+        bl.append({"p": 1, "item": "每集消耗 %.1f 次源请求（>15，配额被烧穿）" % _per_ep,
+                   "why": "%d 集烧了 %d 次请求；配额是硬顶，次/集 高就是白烧"
+                          % (rep["prod"]["episodes"], rep["prod"]["requests"]),
+                   "fix": "查 quota_history 的 search/episodes_req 占比：search 高→加列集缓存；"
+                          "episodes_req 高→多源复用同一列集结果",
+                   "cost": "中"})
+    elif _per_ep is not None and _per_ep > 8:
+        bl.append({"p": 2, "item": "每集消耗 %.1f 次源请求（目标 ≤5）" % _per_ep,
+                   "why": "配额约 1950 次/天 → 次/集 决定日产能上限；当前 %d 集/7 天"
+                          % rep["prod"]["episodes"],
+                   "fix": "先量化 search/episodes_req 各自占比（quota_history 有字段），"
+                          "再决定加列集缓存还是多源复用",
+                   "cost": "中"})
+    if rep["ep_fail"]["cooling"] >= 20:
+        bl.append({"p": 1, "item": "%d 集在 24h 退避里（源站长期缺片）" % rep["ep_fail"]["cooling"],
+                   "why": "反复失败已自动冷却；冷却期满还会再撞，除非换源或标 DEAD",
+                   "fix": "缺口报告里标 DEAD（60 天不再尝试）+ 对这批剧换源站；原因分布见 §4",
                    "cost": "小"})
-    if rep["dead_items"] >= 5:
-        bl.append({"p": 1, "item": "%d 个「死集」反复失败" % rep["dead_items"],
-                   "why": "源上元数据在、文件不在，重试只会浪费请求",
-                   "fix": "延长失败记忆窗口到 30 天，并在缺口报告里标 DEAD，等换源",
+    if rep["ep_fail"]["today"] >= 3:
+        bl.append({"p": 2, "item": "今日 %d 集新进失败记忆" % rep["ep_fail"]["today"],
+                   "why": "原因：" + "；".join("%s ×%d" % (r, n)
+                                              for r, n in rep["ep_fail"]["by_reason_today"][:3]),
+                   "fix": "upload_failed→看 runner 日志/orphan_finish；source_*→换源",
                    "cost": "小"})
     slow = [h for h, v in rep["sources"].items() if v["avg_ms"] > 3000]
     if slow:
@@ -224,14 +309,23 @@ def main():
     # ---- 输出 ----
     lines = ["# 自审报告 %s（近 %d 天）" % (rep["ts"], a.window_days), ""]
     i = rep["ingest"]
-    lines.append("## 入库")
-    lines.append("- 尝试 %s 次，成功 %s，失败 %s，落地 %.1f GB，成功率 **%s%%**"
-                 % (i["tries"], i["ok"], i["fail"], i["gb"], i["success_rate"]))
+    p = rep["prod"]
+    lines.append("## 入库（真源 quota_history）")
+    lines.append("- %d 天共落地 **%d 集**，烧 %d 次源请求，**%.2f 次/集**（目标 ≤5）"
+                 % (p["days"], p["episodes"], p["requests"], p["per_ep"] or 0))
+    if p.get("full_per_ep") is not None:
+        lines.append("- 完整日基线 **%.2f 次/集**（%d 天；当天 partial 不计）"
+                     % (p["full_per_ep"], p["full_days"]))
+    t = p.get("today") or {}
+    if t:
+        lines.append("- 今天：%s 集 / %s 次请求 / %s 次每集%s"
+                     % (t.get("episodes"), t.get("requests"), t.get("per_ep"),
+                        "（未结束）" if t.get("partial") else ""))
+    lines.append("- duplicate %d 条 → **%.2f 条/集**（§0.2 产能比，越低越好）"
+                 % (i["duplicate"], i["dup_per_ep"] or 0))
     if i.get("non_attempt"):
-        lines.append("- 另 %d 条非尝试事件（不计入成功率）：%s"
+        lines.append("- 非尝试事件 %d 条：%s"
                      % (i["non_attempt"], "；".join("%s ×%d" % (k, v) for k, v in rep["non_attempt_events"])))
-    if rep["fail_causes"]:
-        lines.append("- 失败原因：" + "；".join("%s ×%d" % (k, v) for k, v in rep["fail_causes"]))
     lines.append("")
     lines.append("## 源服")
     for h, v in sorted(rep["sources"].items(), key=lambda x: -x[1]["n"])[:8]:
@@ -243,6 +337,19 @@ def main():
     lines.append("- %d 轮，%d 个动作，平均 %.1fs/轮" % (o["cycles"], o["actions"], o["avg_sec"]))
     if o["findings"]:
         lines.append("- 命中问题：" + "；".join("%s ×%d" % (k, v) for k, v in o["findings"]))
+    lines.append("")
+    lines.append("## 失败记忆 / 队列停泊")
+    e = rep["ep_fail"]
+    lines.append("- 按集退避表 %d 条：冷却中 %d / 今日新增失败 %d"
+                 "（旧表 `.autoingest_failed` %d 条属退役链路，只留痕不派活）"
+                 % (e["total"], e["cooling"], e["today"], e["legacy_retired"]))
+    if e["by_reason"]:
+        lines.append("- 失败原因：" + "；".join("%s ×%d" % (r, n) for r, n in e["by_reason"]))
+    pk = rep.get("parked") or {}
+    if pk.get("parked") is not None:
+        lines.append("- 队列 %s 条，停泊 %s 条；主因：%s"
+                     % (pk.get("total"), pk.get("parked"),
+                        "；".join("%s ×%d" % (k, v) for k, v in (pk.get("top") or []))))
     lines.append("")
     lines.append("## 今日改进清单（自己给自己派活）")
     for idx, b in enumerate(bl, 1):

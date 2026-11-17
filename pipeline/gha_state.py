@@ -736,8 +736,22 @@ def record_source_failure(label, reason=""):
 # 修法：按 (video_id) 记失败次数，达到阈值后冷却一整天。
 # 只影响这一集，不影响该源的其他集，也不影响其他源。
 EP_FAIL = os.path.join(HERE, ".gha_ep_fail.json")
-EP_FAIL_TRIP = 3          # 连续失败几次后放长冷却
-EP_FAIL_COOL_DAYS = 1.0   # 放长多久
+EP_FAIL_TRIP = int(os.environ.get("EP_FAIL_TRIP") or 3)      # 连续失败几次后放长冷却
+EP_FAIL_COOL_DAYS = float(os.environ.get("EP_FAIL_COOL_DAYS") or 1.0)   # 触发后的基准冷却
+EP_FAIL_COOL_MAX_DAYS = float(os.environ.get("EP_FAIL_COOL_MAX_DAYS") or 30.0)
+EP_FAIL_PRUNE_DAYS = float(os.environ.get("EP_FAIL_PRUNE_DAYS") or 90.0)
+
+
+def ep_cool_days(n):
+    """第 n 次失败冷却多少天：3→1d，4→2d，5→4d，6→8d，7→16d，≥8→30d（封顶）。
+
+    2026-11-18（自省）：原来是**恒定 1 天**。死集（源站元数据在、文件不在）于是
+    每天被领一次、失败一次、再冷却一天，永远循环 —— 实测 21 集长期挂在这条链上，
+    每集每天白烧一次请求，且永远等不到「源站补片」那天。
+    指数退避把它压到 30 天一次；真有片了也能在下一个窗口领到（不是永久拉黑）。
+    """
+    k = max(0, int(n) - EP_FAIL_TRIP)
+    return min(EP_FAIL_COOL_DAYS * (2 ** k), EP_FAIL_COOL_MAX_DAYS)
 
 
 def _ep_fail_load():
@@ -1048,7 +1062,16 @@ def record_episode_failure(video_id, reason=""):
     rec = {"fails": n, "last": now, "reason": str(reason or "")[:120]}
     tripped = n >= EP_FAIL_TRIP
     if tripped:
-        rec["next_check"] = now + EP_FAIL_COOL_DAYS * 86400
+        rec["cool_days"] = ep_cool_days(n)
+        rec["next_check"] = now + rec["cool_days"] * 86400
+    # 防无界增长：冷却早已到期且 90 天没再失败的条目直接丢（下次失败会重新记）
+    # 20 万集规模下，5% 失败率 = 1 万条；不裁剪的话这份 JSON 每次 next3 都要整份解析。
+    _stale = [k for k, v in d.items()
+              if isinstance(v, dict)
+              and now - float(v.get("last") or 0) > EP_FAIL_PRUNE_DAYS * 86400
+              and now > float(v.get("next_check") or 0)]
+    for k in _stale:
+        d.pop(k, None)
     d[vid] = rec
     tmp = EP_FAIL + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
