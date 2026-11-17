@@ -173,6 +173,23 @@ def main():
     try:
         import check_layout as CL
         stray = CL.find_stray()
+        # 自愈：*.bak* 是编辑器备份，移到 .attic（可逆、不删），只对真正的临时脚本报错
+        attic = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".attic")
+        moved = 0
+        keep = []
+        for f in stray:
+            if ".bak" in os.path.basename(f):
+                try:
+                    os.makedirs(attic, exist_ok=True)
+                    shutil.move(f, os.path.join(attic, os.path.basename(f)))
+                    moved += 1
+                    continue
+                except Exception:                            # noqa: BLE001
+                    pass
+            keep.append(f)
+        if moved:
+            print("   ↳ 已把 %d 个 *.bak 移进 .attic" % moved)
+        stray = keep
         line(not stray, "一次性脚本", ("%d 个残留: %s" % (len(stray), ", ".join(os.path.basename(x) for x in stray[:4])))
              if stray else "无（规则：放 /tmp）")
     except Exception as e:                                          # noqa: BLE001
@@ -182,6 +199,19 @@ def main():
     # 真源只有 pipeline/tg.db。根目录那份被查询会读到 0 条 → 误判「台账全丢」。
     try:
         ghost = find_phantom_db()
+        # 自愈：0 字节空壳是 sqlite 在错误目录下被查询时自动建的，删掉不留痕；
+        # 非空的不动（可能是别人真正要的数据），继续报错让人看。
+        healed = 0
+        for gp, gsz in ghost:
+            if gsz == 0:
+                try:
+                    os.remove(gp)
+                    healed += 1
+                except Exception:                            # noqa: BLE001
+                    pass
+        if healed:
+            ghost = [(gp, gsz) for gp, gsz in ghost if gsz != 0]
+            print("   ↳ 已自动删除 %d 份 0 字节空壳" % healed)
         line(not ghost, "幻影 tg.db",
              ("根目录有 %d 份空壳: %s —— 真源只有 pipeline/tg.db"
               % (len(ghost), ", ".join("%s(%dB)" % (os.path.basename(p), s) for p, s in ghost[:3])))
