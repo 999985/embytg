@@ -195,6 +195,31 @@ def main():
     except Exception as e:                                          # noqa: BLE001
         line(False, "布局检查", str(e)[:50])
 
+    # 4.505) 转存画质虚标（2026-11-18 用户反馈 @luolimeimei 质量忽高忽低）
+    # tgpipe 落地命名前会用真实分辨率复算画质，并把「标签 vs 实际」写进
+    # logs/tgpipe_quality.jsonl。这里只统计 24h 内的订正条数：
+    # 少量订正 = 频道偶发虚标（正常）；持续 >10 条 = 那条频道系统性虚标，该降权。
+    try:
+        qlog = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "logs", "tgpipe_quality.jsonl")
+        n24 = 0
+        per = {}
+        if os.path.exists(qlog):
+            cut = time.time() - 86400
+            for ln in open(qlog, encoding="utf-8"):
+                try:
+                    j = json.loads(ln)
+                except Exception:                            # noqa: BLE001
+                    continue
+                if float(j.get("ts") or 0) < cut:
+                    continue
+                n24 += 1
+                per[j.get("ch") or "?"] = per.get(j.get("ch") or "?", 0) + 1
+        detail = ("24h 订正 %d 条%s" % (n24, ("：" + ", ".join("%s=%d" % kv for kv in per.items())) if per else ""))
+        line(n24 <= 10, "转存画质虚标", detail if n24 else "无（标签与实际一致）")
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "转存画质虚标", str(e)[:50])
+
     # 4.51) 幻影台账：根目录 tg.db 空壳（2026-11-16 新增）
     # 真源只有 pipeline/tg.db。根目录那份被查询会读到 0 条 → 误判「台账全丢」。
     try:

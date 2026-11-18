@@ -321,17 +321,31 @@ def looks_ad(cap, dur, size):
 
 
 def parse_quality(w, h, cap):
+    """按真实分辨率判画质，**宽度优先**。
+
+    2026-11-18：原来高度优先（`h>=1000 → 1080p`），于是 1920x800 这种
+    2.40:1 的宽银幕 1080p 片被标成 720p（实测 @yingshi9999 有 7 条）。
+    分档按宽度更稳：3840→2160p、1920→1080p、1280→720p，宽度缺失才用高度。
+    """
     txt = (cap or "").lower()
-    if (h and h >= 1800) or (w and w >= 3000):
-        return "2160p"
-    if (h and h >= 1000):
-        return "1080p"
+    if w:
+        if w >= 3000:
+            return "2160p"
+        if w >= 1700:
+            return "1080p"
+        if w >= 1200:
+            return "720p"
+    if h:
+        if h >= 1800:
+            return "2160p"
+        if h >= 1000:
+            return "1080p"
+        if h >= 700:
+            return "720p"
     if "#4k" in txt or "2160" in txt or "4k" in txt:
         return "2160p"
     if "#1080" in txt or "1080p" in txt:
         return "1080p"
-    if h and h >= 700:
-        return "720p"
     return "SD"
 
 
@@ -1083,8 +1097,45 @@ def dedupe(items, state, idx=None):
     return kept
 
 
+def _real_qual(it):
+    """按真实分辨率复算画质，别信频道自称。
+
+    2026-11-18（用户反馈 @luolimeimei 质量忽高忽低）实测：
+    队列里 18 条标 `2160p`，其中 8 条 DocumentAttributeVideo 的 w/h 是
+    1920x1080 / 1920x800 —— 频道把 1080p 片子写成 2160p 发出来。
+    `parse_quality(w,h,cap)` 本来优先信 w/h，但扫描时若消息没带 video 属性
+    就退回 caption（含 "4K" 字样），qual 就此被写歪并落进队列，之后再没人复算。
+
+    这里在**落地命名前**用队列里的 w/h 再算一次：名字写真实画质，
+    upgrade 车道才不会被"假 4K"骗住而不再升级。
+    """
+    w, h = it.get("w") or 0, it.get("h") or 0
+    if w >= 1200 and h >= 600:
+        real = parse_quality(w, h, "")
+        if real and real != it.get("qual"):
+            print("# 画质订正 %s m%s: 标签 %s → 实际 %s (%dx%d)"
+                  % (it.get("ch"), it.get("msg"), it.get("qual"), real, w, h),
+                  file=sys.stderr, flush=True)
+            try:
+                # 留痕给巡检看：频道自称 vs 实际分辨率，谁在虚标一目了然
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "logs", "tgpipe_quality.jsonl"), "a",
+                          encoding="utf-8") as _f:
+                    _f.write(json.dumps({"ts": int(time.time()), "ch": it.get("ch"),
+                                         "msg": it.get("msg"), "label": it.get("qual"),
+                                         "real": real, "w": w, "h": h},
+                                        ensure_ascii=False) + "\n")
+            except Exception:                                # noqa: BLE001
+                pass
+            it["qual"] = real
+            it["qual_corrected"] = "标签%s→实际%s(%dx%d)" % (
+                it.get("qual_tag") or it.get("qual"), real, w, h)
+    return it["qual"]
+
+
 def file_name(it):
     """中文规范名 + TMDB ID 锚点；剧集 ID 写在文件夹名（Emby 精确识别 Series），文件名按 SxxExx。"""
+    _real_qual(it)
     name = it.get("meta_name") or it["title"]
     year = it.get("year") or "0000"
     anchor = f' {{tmdb={it["mid"]}}}' if (it.get("src") == "tmdb" and it.get("mid")) else ""
