@@ -98,7 +98,7 @@ def load_upgrade(limit):
     con = sqlite3.connect("file:%s?mode=ro" % DB, uri=True, timeout=30)
     con.row_factory = sqlite3.Row
     rows = con.execute(
-        "select tmdb, lib, title, rel, width, height from resource_state "
+        "select tmdb, lib, title, rel, width, height, size from resource_state "
         "where kind='episode' and tmdb is not null and rel is not null"
     ).fetchall()
     con.close()
@@ -120,6 +120,7 @@ def load_upgrade(limit):
         })
         s["eps"][(season, ep)] = {
             "quality": q, "rank": rank, "rel": r["rel"],
+            "size": int(r["size"] or 0),
         }
     candidates = []
     for sid, s in series.items():
@@ -134,13 +135,31 @@ def load_upgrade(limit):
                 "ep": ep,
                 "current_quality": v["quality"],
                 "current_rel": v["rel"],
+                "current_size": v.get("size") or 0,
                 "target_quality": "2160p",
                 "priority": (2 if qmax < 4 else 1, v["rank"], -season, -ep),
             })
     candidates.sort(key=lambda x: (x["priority"], x["tmdb"], x["season"], x["ep"]))
+    # 2026-11-19：原来直接 candidates[:limit]，把「整部剧都没有 2160p」的剧（priority=2）
+    # 整部挤掉 —— 航海王 1180 集一条都进不了 upgrade 队列。
+    # 现在每部剧先取 PER_SERIES 条，再回填剩下的名额，长剧至少能进得来。
+    PER_SERIES = int(os.environ.get("UPGRADE_PER_SERIES", "3"))
+    picked, seen, rest = [], {}, []
     for x in candidates:
+        k = (x["tmdb"], x["season"])
+        n = seen.get(k, 0)
+        if n < PER_SERIES and len(picked) < limit:
+            picked.append(x)
+            seen[k] = n + 1
+        else:
+            rest.append(x)
+    for x in rest:
+        if len(picked) >= limit:
+            break
+        picked.append(x)
+    for x in picked:
         x.pop("priority", None)
-    return candidates[:limit]
+    return picked
 
 
 def load_new(limit, current_year):

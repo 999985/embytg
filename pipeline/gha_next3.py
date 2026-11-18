@@ -937,9 +937,36 @@ def fill_target(item, ep, cands, min_bytes, max_bytes):
     return (target, c), ""
 
 
+def same_label_better(c, cur_size, ratio=None):
+    """同画质但明显更大的文件 = 更高码率 = 更好画质。
+
+    2026-11-19（用户口径「upgrade 能上最高画质就应该上最高画质」）：
+    原判据只比分辨率等级，`1080p 0.63GB` 与 `1080p 3GB` 在它眼里完全等价 →
+    再好的版本也永远不会替换。这里补一条：同标签且体积 ≥ 当前 × ratio 时也算可升级。
+    ratio 默认 1.5（`UPGRADE_SAME_LABEL_RATIO` 可覆盖），避免轻微差异来回洗版。
+    """
+    try:
+        r = float(ratio if ratio is not None else
+                  os.environ.get("UPGRADE_SAME_LABEL_RATIO", "1.5"))
+    except Exception:                                       # noqa: BLE001
+        r = 1.5
+    sz = int(c.get("size") or 0)
+    cur = int(cur_size or 0)
+    return bool(cur) and sz >= cur * r
+
+
 def upgrade_target(item, cands, min_bytes, max_bytes):
     current_rank = rank_of(item.get("current_quality"))
     good = [c for c in cands if rank_of(c["quality"]["label"]) > current_rank]
+    # 注意：同画质替换的目标文件名与现有文件**完全相同**（都是 `S01E01 - 1080p.mkv`），
+    # 直接被 check_existing 的 path_exists 挡住；强行覆盖又要先删旧文件（不可逆）。
+    # 所以这条默认关闭，只有显式 UPGRADE_SAME_LABEL=1 且下游支持「原地替换」时才开。
+    if item.get("current_size") and os.environ.get("UPGRADE_SAME_LABEL") == "1":
+        # 同画质更优版本（高码率）也纳入，按体积比判
+        good += [c for c in cands
+                 if rank_of(c["quality"]["label"]) == current_rank
+                 and same_label_better(c, item.get("current_size"))]
+        good.sort(key=lambda c: -(c.get("size") or 0))
     good, reasons = valid_candidates(good, min_bytes, max_bytes)
     if not good:
         return None, "no_higher_quality" + ((":" + ",".join(reasons[:4])) if reasons else "")
