@@ -352,10 +352,28 @@ def main():
              % (len(srcs), tot_day, tot_ok,
                 (tot_ok * 100.0 / tot_day) if tot_day else 0))
         if zero and tot_ok:
+            # 判据跟着动作走：额度已经压到地板（20）的源，不该每天再报一次
+            # 「建议降 limit」——2026-11-18 日终发现 rebalance 根本没被调度，
+            # 结果这条建议在「从不执行的建议」与「已经执行完的旧话」之间反复刷屏。
+            try:
+                with open(os.path.join(HERE, ".gha_src_budget.json"),
+                          encoding="utf-8") as f:
+                    caps = {k: v.get("daily_cap")
+                            for k, v in (json.load(f).get("sources") or {}).items()
+                            if isinstance(v, dict)}
+            except Exception:                                      # noqa: BLE001
+                caps = {}
+
+            def _pending(x):
+                c = caps.get(x["label"])
+                return c is None or c == 0 or int(c) > 20
+
+            todo = [x for x in zero if _pending(x)]
+            names = ",".join(x["label"][:16] for x in zero[:4])
+            days = ",".join(str(x["day"]) for x in zero[:4])
             line(None, "零产出源",
-                 "%s（各烧 %s 次，建议降 limit）"
-                 % (",".join(x["label"][:16] for x in zero[:4]),
-                    ",".join(str(x["day"]) for x in zero[:4])))
+                 "%s（各烧 %s 次，建议降 limit）" % (names, days) if todo
+                 else "%s（各烧 %s 次；额度已压到 20，次日生效）" % (names, days))
     except Exception as e:                                          # noqa: BLE001
         line(None, "源命中率", str(e)[:60])
 

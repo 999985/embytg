@@ -143,16 +143,59 @@ def target_abs(rel):
     return os.path.join(A.MNT_ROOT, rel.replace("/", os.sep))
 
 
+RC_ADDR = os.environ.get("EMBYTG_RCLONE_RC", "127.0.0.1:5572")
+
+
+def _rc_forget(dir_rel, timeout=15):
+    """让 rclone mount 丢掉某个目录的 VFS 缓存条目（失败只留痕）。
+
+    与 ``reconcile._vfs_forget`` 同一根因（E178）：``vfs/refresh`` 对**已缓存**的
+    目录返回 OK 但不会失效，只有 ``vfs/forget`` + 重新 readdir 才会重新拉列表。
+    """
+    if not dir_rel:
+        return False
+    try:
+        r = subprocess.run(["rclone", "rc", "vfs/forget", "dir=" + dir_rel,
+                            "--rc-addr", RC_ADDR],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
 def wait_mount_file(path, timeout=180):
+    """等文件出现在挂载上（E180）。
+
+    根因：mount 用 ``--dir-cache-time 10m``，被动 ``os.listdir`` 每 3s 读到的都是
+    同一份缓存目录，180s 窗口内永远看不到新上传的文件 —— 2026-11-18 一天 128 单
+    这样白等到超时（占当日中止 74%），文件其实早已在 teldrive 里。
+    现在每 10s 主动 ``vfs/forget`` 文件所在目录（顺带其上一级，覆盖「季目录整个
+    新建」的情况）再重新 readdir，等待窗口与目录缓存 TTL 彻底解耦。
+    """
+    parent = os.path.dirname(path)
+    rel = os.path.relpath(parent, A.MNT_ROOT).replace(os.sep, "/")
+    if rel == ".":
+        rel = ""
+    up = "/".join(rel.split("/")[:-1]) if rel and "/" in rel else ""
     deadline = time.time() + max(0, timeout)
-    while not os.path.exists(path) and time.time() < deadline:
+    last = 0.0
+    while True:
+        if os.path.exists(path):
+            return
+        now = time.time()
+        if now >= deadline:
+            break
+        if now - last >= 10:
+            _rc_forget(rel)
+            if up:
+                _rc_forget(up)
+            last = now
         try:
-            os.listdir(os.path.dirname(path))
+            os.listdir(parent)          # 清过缓存后这一下会真的重列远端
         except OSError:
             pass
         time.sleep(3)
-    if not os.path.exists(path):
-        raise RuntimeError("rclone 挂载尚未出现文件（%ds）：%s" % (timeout, path))
+    raise RuntimeError("rclone 挂载尚未出现文件（%ds）：%s" % (timeout, path))
 
 
 def journal_path(run_id):
