@@ -321,16 +321,27 @@ def static_source_conf():
 
 
 def _apply_static(d):
-    """把静态配置合并进预算结构：静态优先，且**不许覆盖当天计数**。"""
+    """把静态配置合并进预算结构：静态优先，且**不许覆盖当天计数**。
+
+    例外（E181）：`cap_mode: "auto"` 的源，静态**不得覆盖 `daily_cap`**。
+    根因：`src_budget_rebalance.py` 按实测命中率写进运行时文件的额度，
+    每次读预算都会被静态里的 `daily_cap: 0`（= 不限）盖回去 —— 于是
+    「零产出的源被压到 20」这件事从来没真正生效过，2026-11-18 两个源
+    在「不限」状态下各烧 166/156 次、产出 0。自动额度 = 静态只声明模式，
+    具体数值归运行时（learned）。
+    """
     if not isinstance(d.get("sources"), dict):
         d["sources"] = {}
     for label, conf in static_source_conf().items():
         if not isinstance(conf, dict):
             continue
         rec = d["sources"].setdefault(str(label), {})
+        auto_cap = str(conf.get("cap_mode") or "").strip().lower() == "auto"
         for k, v in conf.items():
             if k in _DAILY_REC_KEYS:
                 continue                   # 配置写错成 day/ok 时忽略，别污染计数
+            if k == "daily_cap" and auto_cap:
+                continue                   # 自动额度：数值由 rebalance 学习，静态不覆盖
             rec[k] = v
     return d
 
