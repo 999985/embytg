@@ -45,6 +45,26 @@ MNT = "/opt/embytg/mnt/embytg"
 rows = []
 
 
+def gap_objects(gaps):
+    """把对账差异行折叠成「对象」数（E182 附带修的判据单位问题）。
+
+    一集刚落地的中间态会同时产出 3 行：unregistered / episode_missing_emby /
+    series_missing_emby。按行数比 claim 数就是拿行比集，1 个 claim 必然误报。
+    同一集的三行算 1 个对象，series 级缺剧单独算 1。
+    """
+    objs = set()
+    for g in gaps or []:
+        k = str(g.get("kind") or "")
+        if k == "series_missing_emby":
+            objs.add(("series", g.get("lib"), g.get("series")))
+        elif k in ("unregistered", "episode_missing_emby"):
+            objs.add(("episode", g.get("lib"), g.get("series"),
+                      g.get("season"), g.get("ep")))
+        else:
+            objs.add((k, g.get("lib"), g.get("series"), g.get("detail")))
+    return len(objs)
+
+
 def line(ok, name, detail=""):
     rows.append((ok, name, detail))
     print("  %s %-26s %s" % ("✔" if ok is True else ("✘" if ok is False else "•"), name, detail))
@@ -279,13 +299,21 @@ def main():
         total = sum(cnt.values())
         # 在途容忍：刚落地、Emby 还没索引的那几集是正常中间态（差异数 ≤ 活跃 claim 数）。
         # 与 status_now / improve_guard 的 gap_le_claims 同一口径，避免每次落地都报 FAIL。
+        #
+        # 2026-11-19：**单位要对齐。** 一集刚落地的状态会同时产出 3 行
+        # （unregistered + episode_missing_emby + series_missing_emby），
+        # 而容忍度是按「claim 数」算的 → 只有 1 个 claim 时 3 > max(2,1)，
+        # 每次单集落地都会假 FAIL 两三分钟（实测 06:12 律政英雄 S01E01）。
+        # 判据改成按「对象」计数：同一集的 unregistered/episode_missing 合并为 1，
+        # series 级缺剧单独算 1。
         import glob as _g
         _ncl = len(_g.glob(os.path.join(HERE, ".gha_claims", "*.json")))
-        _in_flight = total > 0 and total <= max(2, _ncl)
+        _objs = gap_objects(rc.get("gaps") or [])
+        _in_flight = _objs > 0 and _objs <= max(2, _ncl)
         line(total == 0 or _in_flight,
              "对账差异",
-             "teldrive=%s tgdb=%s emby=%s | 差异 %s%s"
-             % (st.get("teldrive"), st.get("tgdb"), st.get("emby_eps"), total,
+             "teldrive=%s tgdb=%s emby=%s | 差异 %s 条 / %d 个对象%s"
+             % (st.get("teldrive"), st.get("tgdb"), st.get("emby_eps"), total, _objs,
                 "（≤活动 claim %d，属在途）" % _ncl if _in_flight and total else ""))
         if not _in_flight:
             for k, n in sorted(cnt.items(), key=lambda x: -x[1])[:4]:

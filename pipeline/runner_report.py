@@ -224,6 +224,35 @@ def new_done_cold_count():
     return cold, len(items or [])
 
 
+def upload_outage(window_sec=None):
+    """近 N 小时「上传断流」的事实（E182）。
+
+    2026-11-19 03:42–05:41 实测：6 条 claim 全部下完却传不上去，产能 0，而
+    `throughput_verdict` 只会判「产能塌陷」——那会把一场**已经恢复的传输故障**
+    记成能力问题，下一轮窗口滑过去才自己变绿。这里只提供事实，
+    是否豁免产能判据由 `_upload_outage_explains()` 决定（要求 ≥3 次零进展失败，
+    且最后一次失败之后已经有落地 —— 没恢复就照报）。
+    """
+    try:
+        import upload_health as U
+        return U.outage(window_sec=int(window_sec or NO_FINISH_HOURS * 3600))
+    except Exception:                                          # noqa: BLE001
+        return {}
+
+
+def _upload_outage_explains(o, last_finish):
+    """上传断流能否解释本轮产能塌陷：次数够 + 之后确实恢复了。"""
+    if not o or int(o.get("n") or 0) < 3 or not o.get("last_ts"):
+        return False
+    if not last_finish:
+        return False
+    try:
+        lf = time.mktime(time.strptime(last_finish, "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, TypeError):
+        return False
+    return lf > float(o["last_ts"]) + 60
+
+
 def gate_blocked_window(window_sec=None):
     """近 N 小时预算闸门「按设计停」占了多少秒（E160）。
 
@@ -577,9 +606,19 @@ def main():
                         ",".join(_gb.get("reasons") or []) or "-",
                         _gb["last_end"] / 60.0))
     if not rep["throughput_ok"]:
-        problems.append("产能塌陷：近 %d h %d 条，过去 24h 均值 %.1f 条/h（仅 %.0f%%）"
-                        % (NO_FINISH_HOURS, rep["done_3h"], rep["rate_24h_per_h"],
-                           100.0 * rep["done_3h"] / max(1e-9, rep["rate_24h_per_h"] * NO_FINISH_HOURS)))
+        _uho = upload_outage()
+        rep["upload_outage"] = _uho
+        if _upload_outage_explains(_uho, rep.get("last_finish")):
+            notes.append("上传断流：近 %dh 有 %d 次零进展失败（%s–%s，lane=%s），"
+                         "最后一次之后已恢复（最新落地 %s）→ 产能判据本轮不适用，下一轮自动恢复"
+                         % (NO_FINISH_HOURS, _uho["n"],
+                            time.strftime("%H:%M", time.localtime(_uho["first_ts"])),
+                            time.strftime("%H:%M", time.localtime(_uho["last_ts"])),
+                            ",".join(_uho.get("lanes") or []) or "-", rep["last_finish"]))
+        else:
+            problems.append("产能塌陷：近 %d h %d 条，过去 24h 均值 %.1f 条/h（仅 %.0f%%）"
+                            % (NO_FINISH_HOURS, rep["done_3h"], rep["rate_24h_per_h"],
+                               100.0 * rep["done_3h"] / max(1e-9, rep["rate_24h_per_h"] * NO_FINISH_HOURS)))
     # 判据改成「近 3h 的 duplicate」，并同时参考完成数。
     # 全天累计会把修复前的历史一直带进来（今日一度 1107 条，修好后仍是 1107），
     # 让「已经好了」持续报警；真正该问的是「现在还在空转吗」。

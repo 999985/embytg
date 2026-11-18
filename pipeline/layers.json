@@ -60,7 +60,8 @@
   "source_pull.py",
   "src_guard.py",
   "stall_watch.py",
-  "tdprobe.py"
+  "tdprobe.py",
+  "upload_health.py"
  ],
  "rule": "prod=systemd/timer/run_one 可达；cron=Hermes cron 点名；tool=有 CLI 入口；legacy=无入口也无人调用",
  "tool": [

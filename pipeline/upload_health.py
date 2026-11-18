@@ -292,6 +292,25 @@ def gate(slot=0, now=None):
     return bool(info.get("allow")), info
 
 
+def outage(now=None, window_sec=3 * 3600):
+    """窗口内的「上传断流」事实（给 runner_report / 巡检看）。
+
+    返回 {n, first_ts, last_ts, lanes, last_ok_ts}。
+    只数**零进展**失败（rc=3/6）——实测 rc=1 的两单其实已经传了 40/59、1/8 个分片，
+    把它们算成「断流」会把慢当成死（E171 的同一类错误）。
+    """
+    now = _now(now)
+    recs = _read_records(cutoff=now - window_sec)
+    zero = [r for r in recs
+            if r.get("result") == "fail" and int(r.get("rc") or 0) in ZERO_RCS]
+    oks = [r["ts"] for r in recs if r.get("result") == "ok"]
+    return {"n": len(zero),
+            "first_ts": zero[0]["ts"] if zero else 0.0,
+            "last_ts": zero[-1]["ts"] if zero else 0.0,
+            "lanes": sorted({str(r.get("lane") or "?") for r in zero}),
+            "last_ok_ts": max(oks) if oks else 0.0}
+
+
 def summary(now=None):
     """给 stall_watch / 巡检用的摘要。"""
     now = _now(now)

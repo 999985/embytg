@@ -344,13 +344,23 @@ def upload_evidence(now=None):
         return {"consecutive": 0, "lanes": [], "holding": False, "last": None}
 
 
-def alert_code(uh):
-    """上传断了要报 upload_degraded（可执行），否则才是 stall。"""
+def alert_code(uh, now=None):
+    """上传断了要报 upload_degraded（可执行），否则才是 stall。
+
+    只在**最近 45 分钟**还发生过零进展失败时才算「断流」——台账保留 6 小时，
+    拿三小时前的旧失败来给此刻的停摆定性，等于把两个不同故障混成一个。
+    """
     if not uh:
         return "stall"
-    if uh.get("holding") or int(uh.get("consecutive") or 0) >= 2:
+    if uh.get("holding"):
         return "upload_degraded"
-    return "stall"
+    last_ts = float((uh.get("last") or {}).get("ts") or 0)
+    recent = last_ts and (_now(now) - last_ts) <= 45 * 60
+    return "upload_degraded" if (recent and int(uh.get("consecutive") or 0) >= 2) else "stall"
+
+
+def _now(now=None):
+    return float(now if now is not None else time.time())
 
 
 def _upload_line(uh):
