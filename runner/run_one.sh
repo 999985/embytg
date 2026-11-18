@@ -1,6 +1,8 @@
 #!/bin/bash
 set -u
 BASE="${EMBYTG_RUNNER_BASE:-/opt/embytg-runner}"
+PIPELINE_DIR="${EMBYTG_PIPELINE_DIR:-/opt/embytg/pipeline}"
+SYSPY="${EMBYTG_SYSPY:-/usr/bin/python3}"
 ENV="$BASE/runner.env"
 LOG="$BASE/logs/runner.log"
 VENV="$BASE/venv/bin/python"
@@ -311,6 +313,26 @@ else
 fi
 log "START mode=$MODE candidates=$LANES_ORDER"
 
+# 2026-11-19（E182）：**上传断流闸门**，必须在领 claim 之前问。
+# 03:42–05:41 那两小时：每条 claim 都先把整集从源站下完（配额硬顶），
+# 上传 100% 零进展失败 → 释放 → 下一条 lane 再领一集。产出 0，白烧 ~12GB 配额。
+# 判据只看「零进展失败的连续次数 + 涉及几条 lane」，不预测速度（速度是噪声：
+# 同一账号 03:44 是 0.12MB/s、05:41 是 6MB/s）。
+# 关掉：TG_UPLOAD_BREAKER=0（记账照旧）。
+if [ "${TG_UPLOAD_BREAKER:-1}" != "0" ] && [ -f "$PIPELINE_DIR/upload_health.py" ]; then
+  UB_JSON="$("$SYSPY" "$PIPELINE_DIR/upload_health.py" --gate --slot "$SLOT" 2>>"$BASE/logs/upload_health.err")"
+  UB_RC=$?
+  if [ "$UB_RC" = "75" ]; then
+    UB_WAIT=$(printf '%s' "$UB_JSON" | sed -n 's/.*"wait_sec": *\([0-9]*\).*/\1/p' | head -1)
+    case "$UB_WAIT" in ''|*[!0-9]*) UB_WAIT=600 ;; esac
+    [ "$UB_WAIT" -lt 30 ] && UB_WAIT=30
+    [ "$UB_WAIT" -gt 600 ] && UB_WAIT=600
+    log "UPLOAD_HOLD slot=$SLOT wait=${UB_WAIT}s $UB_JSON"
+    sleep "$UB_WAIT"
+    exit 0
+  fi
+fi
+
 SELECTED=0
 BUDGET_PAUSE=0
 BUDGET_WAIT=600
@@ -552,6 +574,10 @@ fi
 
 UPLOAD_OK=0
 : >"$WORK/upload.log"
+UP_BYTES=0
+if [ -n "${MEDIA_NAME:-}" ] && [ -f "$MEDIA_DIR/$MEDIA_NAME" ]; then
+  UP_BYTES=$(stat -c %s "$MEDIA_DIR/$MEDIA_NAME" 2>/dev/null || echo 0)
+fi
 for attempt in 1 2; do
   printf '\n=== upload attempt %s ===\n' "$attempt" >>"$WORK/upload.log"
   timeout "$UPLOAD_OUTER_TIMEOUT" "$VENV" "$BASE/gha_upload.py" --job "$JOB" --media-dir "$MEDIA_DIR" --manifest-out "$WORK/manifest.path" >>"$WORK/upload.log" 2>&1
@@ -571,8 +597,20 @@ for attempt in 1 2; do
   fi
   [ "$attempt" -eq 1 ] && sleep 15
 done
+# E182：把上传结果记进台账（断流闸门的唯一输入）。成功/失败都要记，
+# 否则闸门只看得到失败、看不到恢复，会一直按着不放。
+if [ "$UPLOAD_OK" = "1" ]; then
+  "$SYSPY" "$PIPELINE_DIR/upload_health.py" --record ok --rc 0 --bytes "$UP_BYTES" \
+    --claim "$RUN_KEY" --lane "${ACTIVE_LANE:-$MODE}" --err="" \
+    >>"$BASE/logs/upload_health.err" 2>&1 || true
+fi
 if [ "$UPLOAD_OK" != "1" ]; then
   log "UPLOAD failed after retry; see $WORK/upload.log"
+  UP_ERR=$(grep -a -E "ZERO_PROGRESS|worker 超时|FloodWait|RPC 超时|QuotaRest|no manifest" "$WORK/upload.log" \
+            | tail -1 | tr -d '\r' | cut -c1-180)
+  "$SYSPY" "$PIPELINE_DIR/upload_health.py" --record fail --rc "$UPLOAD_RC" --bytes "$UP_BYTES" \
+    --claim "$RUN_KEY" --lane "${ACTIVE_LANE:-$MODE}" --err="$UP_ERR" \
+    >>"$BASE/logs/upload_health.err" 2>&1 || true
   # E157：源文件不要跟着 media.slotN 一起被 rm 掉。留到 _keep，下一单硬链接复用；
   # 同一份字节第二次仍失败 → 判为坏件，删掉不再复用（否则会无限重传同一坏文件）。
   if [ -n "$MEDIA_NAME" ] && [ -f "$MEDIA_DIR/$MEDIA_NAME" ]; then

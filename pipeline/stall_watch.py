@@ -40,6 +40,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import gate_history  # noqa: E402  （同目录模块，必须放在 HERE 入 sys.path 之后）
+try:
+    import upload_health  # noqa: E402  （E182：零出片时先区分「领不到活」与「传不上去」）
+except Exception:                                              # noqa: BLE001
+    upload_health = None
 
 DB = os.path.join(HERE, "tg.db")
 BUDGET = os.path.join(HERE, ".gha_src_budget.json")
@@ -325,6 +329,41 @@ def lane_auth_dead():
     return out
 
 
+def upload_evidence(now=None):
+    """零出片时，上传通道是什么状态（E182）。
+
+    2026-11-19 05:16/05:36 两条 P1 只写了「配额仍余、各源可用」——
+    真相是 03:42–05:41 六条 claim 全部 `ZERO_PROGRESS`，一集都没传上去。
+    没有这一段，「疑似停摆」会把人引向调度侧，实际要动的是上传通道。
+    """
+    if upload_health is None:
+        return {"consecutive": 0, "lanes": [], "holding": False, "last": None}
+    try:
+        return upload_health.summary(now=now)
+    except Exception:                                          # noqa: BLE001
+        return {"consecutive": 0, "lanes": [], "holding": False, "last": None}
+
+
+def alert_code(uh):
+    """上传断了要报 upload_degraded（可执行），否则才是 stall。"""
+    if not uh:
+        return "stall"
+    if uh.get("holding") or int(uh.get("consecutive") or 0) >= 2:
+        return "upload_degraded"
+    return "stall"
+
+
+def _upload_line(uh):
+    if not uh or not (uh.get("consecutive") or uh.get("holding")):
+        return ""
+    last = uh.get("last") or {}
+    return ("上传台账：连续 %d 次零进展失败（lane=%s，最后 rc=%s %s）；断流闸门%s。\n"
+            % (int(uh.get("consecutive") or 0),
+               ",".join(uh.get("lanes") or []) or "-",
+               last.get("rc"), (last.get("err") or "")[:90],
+               "按住中" if uh.get("holding") else "未按住"))
+
+
 def _enabled_lanes():
     """config/scale.json 里 enabled=true 的 lane 集合；读不到就返回 None（保守：全都算启用）。"""
     try:
@@ -397,6 +436,9 @@ def main():
              % (gate.get("reason"), gate.get("age_sec", 0)))
 
     usable = _usable_remain(remain)
+    uh = upload_evidence(now)
+    if uh.get("consecutive") or uh.get("holding"):
+        _log("  " + _upload_line(uh).rstrip())
     stalled = (eff_idle_min >= a.stall_min and usable > 30 and not pauses and not blocked)
     if not stalled:
         _log("  判定：正常（%s）" % (
@@ -431,10 +473,16 @@ def main():
                   if gate and gate.get("holding") else "",
                   "\n".join(lines),
                   json.dumps(recent_skips(3), ensure_ascii=False)))
+        # E182：出口按「上传是否断了」分流 —— upload_degraded 与 stall 各自 6h 去重，
+        # 不会因为同一场故障换了个 code 就重复轰炸。
+        code = alert_code(uh)
+        if code == "upload_degraded":
+            msg = _upload_line(uh) + msg.replace("EmbyTG 疑似停摆",
+                                                 "EmbyTG 上传通道故障（领到了活、传不上去）", 1)
         try:
             import subprocess
             subprocess.run([sys.executable, os.path.join(HERE, "alert.py"),
-                            "--level", "P1", "--code", "stall",
+                            "--level", "P1", "--code", code,
                             "--msg", msg], check=False, timeout=120)
             _log("  已发出告警")
         except Exception as e:                                 # noqa: BLE001
