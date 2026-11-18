@@ -230,6 +230,13 @@ def main():
     _today = time.strftime("%Y-%m-%d")
     _cooling = [k for k, v in ep_fail.items()
                 if isinstance(v, dict) and _now < float(v.get("next_check") or 0)]
+    # 2026-11-19：冷却条目必须按类别拆开报。原来一律写成「源站长期缺片」，
+    # 而实测 48/81 条是 upload_failed —— 报表把人指向「换源/标 DEAD」，
+    # 真问题（TG 上传通道）反而看不见。类别判定与 gha_state.ep_fail_class 同一实现。
+    import gha_state as _GS
+    _cool_src = [k for k in _cooling
+                 if (_GS.ep_fail_class((ep_fail.get(k) or {}).get("reason")) == "src")]
+    _cool_ours = [k for k in _cooling if k not in set(_cool_src)]
     _today_fail = [k for k, v in ep_fail.items()
                    if isinstance(v, dict)
                    and time.strftime("%Y-%m-%d", time.localtime(float(v.get("last") or 0))) == _today]
@@ -241,6 +248,7 @@ def main():
         pass
     rep["ep_fail"] = {
         "total": len(ep_fail), "cooling": len(_cooling), "today": len(_today_fail),
+        "cooling_src": len(_cool_src), "cooling_ours": len(_cool_ours),
         "by_reason": collections.Counter(
             str(v.get("reason") or "?")[:40] for v in ep_fail.values()
             if isinstance(v, dict)).most_common(5),
@@ -273,10 +281,16 @@ def main():
                    "fix": "先量化 search/episodes_req 各自占比（quota_history 有字段），"
                           "再决定加列集缓存还是多源复用",
                    "cost": "中"})
-    if rep["ep_fail"]["cooling"] >= 20:
-        bl.append({"p": 1, "item": "%d 集在 24h 退避里（源站长期缺片）" % rep["ep_fail"]["cooling"],
-                   "why": "反复失败已自动冷却；冷却期满还会再撞，除非换源或标 DEAD",
+    if rep["ep_fail"].get("cooling_src", 0) >= 20:
+        bl.append({"p": 1, "item": "%d 集在**源站缺片**退避里" % rep["ep_fail"]["cooling_src"],
+                   "why": "源站侧反复失败，已按指数退避冷却；冷却期满还会再撞，除非换源或标 DEAD",
                    "fix": "缺口报告里标 DEAD（60 天不再尝试）+ 对这批剧换源站；原因分布见 §4",
+                   "cost": "小"})
+    if rep["ep_fail"].get("cooling_ours", 0) >= 10:
+        bl.append({"p": 1, "item": "%d 集在**我方失败**退避里（上传/会话，不是源站缺片）"
+                               % rep["ep_fail"]["cooling_ours"],
+                   "why": "这些集源站有片，是上传/收尾环节失败被冷却；长期封禁等于白丢产能",
+                   "fix": "看 runner 的 upload 日志与 TG 通道健康；这类退避已限 ≤6h",
                    "cost": "小"})
     if rep["ep_fail"]["today"] >= 3:
         bl.append({"p": 2, "item": "今日 %d 集新进失败记忆" % rep["ep_fail"]["today"],

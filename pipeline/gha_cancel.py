@@ -140,7 +140,8 @@ def main():
                 _n, _tripped = GS.record_episode_failure(_vid, a.reason)
                 if _tripped:
                     print(json.dumps({"ep_backoff": str(_vid), "fails": _n,
-                                      "days": GS.EP_FAIL_COOL_DAYS},
+                                      "cls": GS.ep_fail_class(a.reason),
+                                      "hours": round(GS.ep_cool_seconds(_n, a.reason) / 3600.0, 2)},
                                      ensure_ascii=False))
         # 2026-11-14（E075）：归还 TG session 租约，否则要等 3h TTL 才释放。
         try:

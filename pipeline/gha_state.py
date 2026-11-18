@@ -751,6 +751,45 @@ EP_FAIL_TRIP = int(os.environ.get("EP_FAIL_TRIP") or 3)      # 连续失败几�
 EP_FAIL_COOL_DAYS = float(os.environ.get("EP_FAIL_COOL_DAYS") or 1.0)   # 触发后的基准冷却
 EP_FAIL_COOL_MAX_DAYS = float(os.environ.get("EP_FAIL_COOL_MAX_DAYS") or 30.0)
 EP_FAIL_PRUNE_DAYS = float(os.environ.get("EP_FAIL_PRUNE_DAYS") or 90.0)
+# 2026-11-19（自省）：冷却必须按**原因类别**分开。实测 `.gha_ep_fail.json` 81 条里
+# 48 条原因是 `upload_failed` —— 那是**我们自己**的 TG 上传失败（重试就能好），
+# 却被套上了「源站缺片」那套 1→2→4→8→30 天的指数退避：一次上传抖动就把这一集
+# 判停 8~30 天，报表上还显示成「源站长期缺片」，于是改进清单一直指向「换源/标 DEAD」
+# ——方向完全是错的。我方失败要短退避（防热循环即可），源站侧才用长退避。
+EP_FAIL_OURS_BASE_MIN = float(os.environ.get("EP_FAIL_OURS_BASE_MIN") or 15.0)
+EP_FAIL_OURS_MAX_H = float(os.environ.get("EP_FAIL_OURS_MAX_H") or 6.0)
+# 我方失败重试到第 8 次仍不好 → 已经不是「抖动」而是坏件/永久拒绝，交回长退避。
+# 没有这一档就变成另一种浪费：一集永远传不上去，却每 6 小时重下一次（≈4GB/天/集）。
+EP_FAIL_OURS_HARD = int(os.environ.get("EP_FAIL_OURS_HARD") or 8)
+_EP_SRC_KEYS = ("source", "quality", "bad_source", "no_valid_source")
+_EP_OURS_KEYS = ("upload", "manifest", "resume_scan", "claim", "slot", "session", "tg_", "emby")
+
+
+def ep_fail_class(reason):
+    """把失败原因分成 `src`（源站侧，长退避）与 `ours`（我方临时故障，短退避）。
+
+    未知原因一律按 `src` 处理：宁可多等，也不要在原因不明时进入分钟级热循环。
+    """
+    r = str(reason or "").strip().lower()
+    if r.startswith(_EP_SRC_KEYS) or any(k in r for k in _EP_SRC_KEYS):
+        return "src"
+    if any(k in r for k in _EP_OURS_KEYS):
+        return "ours"
+    return "src"
+
+
+def ep_cool_seconds(n, reason=""):
+    """第 n 次失败该冷却多少**秒**（按原因类别分档）。
+
+    src  ：沿用 ep_cool_days 的指数阶梯（1/2/4/8/16/30 天）——源站真缺片，少撞省配额。
+    ours ：15min 起、每次翻倍、封顶 6h —— 我方失败重试就能好，长期封禁是纯损失；
+           但连续 EP_FAIL_OURS_HARD 次仍失败说明是坏件/永久拒绝，转回长阶梯。
+    """
+    n = int(n or 1)
+    if ep_fail_class(reason) == "src" or n >= EP_FAIL_OURS_HARD:
+        return ep_cool_days(n) * 86400
+    k = max(0, n - EP_FAIL_TRIP)
+    return min(EP_FAIL_OURS_BASE_MIN * 60 * (2 ** k), EP_FAIL_OURS_MAX_H * 3600)
 
 
 def ep_cool_days(n):
@@ -781,8 +820,11 @@ def _ep_fail_load():
         if isinstance(v, dict) and "next_check" not in v:
             last = float(v.get("last") or 0)
             if last:
-                v["cool_days"] = ep_cool_days(int(v.get("fails") or 1))
-                v["next_check"] = last + v["cool_days"] * 86400
+                n = int(v.get("fails_cls") or v.get("fails") or 1)
+                sec = ep_cool_seconds(n, v.get("reason") or "")
+                v["cool_sec"] = sec
+                v["cool_days"] = round(sec / 86400.0, 4)
+                v["next_check"] = last + sec
     return d
 
 
@@ -1076,19 +1118,31 @@ def slot_holder(n):
 
 
 def record_episode_failure(video_id, reason=""):
-    """记一次「这一集」的失败。返回 (失败次数, 是否进入长冷却)。"""
+    """记一次「这一集」的失败。返回 (本类别连续失败次数, 是否进入长冷却)。
+
+    2026-11-19：**按原因类别分别计数**。同一个 video_id 先在源站侧失败 5 次
+    （8 天冷却），后来源站补片了、下载成功但上传抖动一次 —— 如果沿用累计次数，
+    这一次抖动会直接续上 30 天封禁。类别变了就重新计数，这是唯一不会把
+    「我方故障」算进「源站缺片」账上的做法。
+    """
     vid = str(video_id or "").strip()
     if not vid:
         return 0, False
     d = _ep_fail_load()
     now = time.time()
     rec = d.get(vid) or {}
-    n = int(rec.get("fails") or 0) + 1
-    rec = {"fails": n, "last": now, "reason": str(reason or "")[:120]}
-    tripped = n >= EP_FAIL_TRIP
+    cls = ep_fail_class(reason)
+    prev_cls = rec.get("cls") or (ep_fail_class(rec.get("reason")) if rec.get("reason") else cls)
+    prev_n = int(rec.get("fails_cls") or rec.get("fails") or 0)
+    n_cls = prev_n + 1 if prev_cls == cls else 1
+    rec = {"fails": int(rec.get("fails") or 0) + 1, "fails_cls": n_cls, "cls": cls,
+           "last": now, "reason": str(reason or "")[:120]}
+    tripped = n_cls >= EP_FAIL_TRIP
     if tripped:
-        rec["cool_days"] = ep_cool_days(n)
-        rec["next_check"] = now + rec["cool_days"] * 86400
+        sec = ep_cool_seconds(n_cls, reason)
+        rec["cool_sec"] = sec
+        rec["cool_days"] = round(sec / 86400.0, 4)
+        rec["next_check"] = now + sec
     # 防无界增长：冷却早已到期且 90 天没再失败的条目直接丢（下次失败会重新记）
     # 20 万集规模下，5% 失败率 = 1 万条；不裁剪的话这份 JSON 每次 next3 都要整份解析。
     _stale = [k for k, v in d.items()
@@ -1103,7 +1157,7 @@ def record_episode_failure(video_id, reason=""):
         json.dump(d, f, ensure_ascii=False, indent=1)
     os.chmod(tmp, 0o600)
     os.replace(tmp, EP_FAIL)
-    return n, tripped
+    return n_cls, tripped
 
 
 def episode_blocked_set():
