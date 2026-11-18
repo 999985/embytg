@@ -442,6 +442,123 @@ def _parse_ts(v):
         return None
 
 
+_CRON_DOW_NAMES = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+
+
+def _cron_field(spec, lo, hi):
+    """单个 cron 字段 → 允许值集合（`*` / 列表 / 区间 / 步长 / 星期名）；解析不了返回 None。"""
+    vals = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            return None
+        step = 1
+        if "/" in part:
+            part, _, st = part.partition("/")
+            try:
+                step = int(st)
+            except ValueError:
+                return None
+            if step <= 0:
+                return None
+        if part in ("*", "?"):
+            a, b = lo, hi
+        elif "-" in part:
+            a, _, b = part.partition("-")
+            try:
+                a, b = int(a), int(b)
+            except ValueError:
+                return None
+        else:
+            low = part.lower()
+            try:
+                a = _CRON_DOW_NAMES[low] if low in _CRON_DOW_NAMES else int(part)
+            except ValueError:
+                return None
+            b = hi if step > 1 else a
+        if a < lo or b > hi or a > b:
+            return None
+        vals.update(range(a, b + 1, step))
+    return vals or None
+
+
+def cron_period_min(expr):
+    """cron 表达式的排程周期（分钟，相邻两次 fire 间隔的中位数）；解析失败返回 None。
+
+    2026-11-18（E169）：09:30 的排程复审把「五路生产巡检」从 `45 */6`（360min）
+    改成 `45 0,8,16`（480min），而 CRON_STALE_MIN 里写死的 420 没人跟着改 →
+    13:45 起每轮都判「已 449 分钟没有执行」的假 P1。死线必须由排程自己算，
+    不能再靠人肉同步常数（用户要求「加/改一个就自动生效」）。
+    做法：按标准 cron 语义枚举未来几次 fire 时刻，取间隔中位数。
+    """
+    from datetime import datetime, timedelta
+    parts = str(expr or "").split()
+    if len(parts) != 5:
+        return None
+    minutes = _cron_field(parts[0], 0, 59)
+    hours = _cron_field(parts[1], 0, 23)
+    doms = _cron_field(parts[2], 1, 31)
+    mons = _cron_field(parts[3], 1, 12)
+    dows = _cron_field(parts[4], 0, 7)
+    if not (minutes and hours and doms and mons and dows):
+        return None
+    dows = {d % 7 for d in dows}                     # 7 = 周日，与 0 同义
+    dom_star = parts[2].strip() in ("*", "?")
+    dow_star = parts[4].strip() in ("*", "?")
+    base = datetime.now().replace(second=0, microsecond=0)
+    day = base.date()
+    fires = []
+    for _ in range(400):                             # 上限：覆盖年度排程
+        day_ok = None
+        if day.month in mons:
+            if dom_star and dow_star:
+                day_ok = True
+            elif dom_star:
+                day_ok = (day.weekday() + 1) % 7 in dows
+            elif dow_star:
+                day_ok = day.day in doms
+            else:                                     # dom 与 dow 都限定时按标准 cron 取并集
+                day_ok = day.day in doms or (day.weekday() + 1) % 7 in dows
+        if day_ok:
+            for h in sorted(hours):
+                for mi in sorted(minutes):
+                    t = datetime(day.year, day.month, day.day, h, mi)
+                    if t >= base:
+                        fires.append(t)
+            if len(fires) >= 4:
+                break
+        day += timedelta(days=1)
+    if len(fires) < 3:
+        return None
+    gaps = sorted((fires[i + 1] - fires[i]).total_seconds() / 60.0
+                  for i in range(len(fires) - 1))
+    return round(gaps[len(gaps) // 2], 1)
+
+
+def schedule_period_min(sched):
+    """jobs.json 的 schedule 结构 → 周期分钟（cron 或 interval 都支持）。"""
+    if not isinstance(sched, dict):
+        return None
+    if str(sched.get("kind") or "").lower() == "interval":
+        try:
+            m = float(sched.get("minutes") or 0)
+        except (TypeError, ValueError):
+            return None
+        return m or None
+    return cron_period_min(sched.get("expr"))
+
+
+def cron_stale_limit(period_min):
+    """看护 job 多久没跑才算「调度层死了」：排程周期 + 90 分钟缓冲（下限 240）。
+
+    缓冲 ≥ 单轮执行时长（实测 7~28 分钟）+ 一次探测间隔，理由是 last_run_at 记的是
+    **完成**时刻，而下一个 fire 在周期末尾 —— 用「周期+90」才不会在两次 fire 之间误报。
+    """
+    if not period_min or period_min <= 0:
+        return CRON_STALE_MIN
+    return int(max(240, period_min + 90))
+
+
 def sense_cron():
     """反查 Hermes 调度层状态；失败只留痕不抛（autoops 本身不能因此挂掉）。
     Hermes jobs.json 字段：enabled / last_status / last_error / last_run_at / next_run_at。
@@ -451,7 +568,7 @@ def sense_cron():
     if st is None:
         return {"probe_err": "hermes_job_missing", "enabled": None, "status": None,
                 "err": None, "in_flight": False, "run_age_min": None,
-                "last_run_age_min": None, "next_age_min": None}
+                "last_run_age_min": None, "next_age_min": None, "period_min": None}
     now = time.time()
     last = _parse_ts(st.get("last_run_at"))
     nxt = _parse_ts(st.get("next_run_at"))
@@ -488,7 +605,9 @@ def sense_cron():
             "in_flight": bool(running),
             "run_age_min": None,
             "last_run_age_min": round((now - last) / 60.0, 1) if last else None,
-            "next_age_min": round((now - nxt) / 60.0, 1) if nxt else None}
+            "next_age_min": round((now - nxt) / 60.0, 1) if nxt else None,
+            # 死线随排程走：排程改了周期，判据自动跟着变（见 cron_stale_limit）。
+            "period_min": schedule_period_min(st.get("schedule"))}
 
 
 def sense():
@@ -750,6 +869,7 @@ def analyze(f, st=None):
     c = f.get("cron") or {}
     if c and not c.get("probe_err"):
         na, lra = c.get("next_age_min"), c.get("last_run_age_min")
+        _lim = cron_stale_limit(c.get("period_min"))
         if c.get("enabled") is False:
             out.append(("P1", "cron_stale", "看护 job 被禁用（Hermes cron enabled=false）", "alert"))
         elif c.get("running"):
@@ -758,9 +878,10 @@ def analyze(f, st=None):
             out.append(("P1", "cron_stale", "看护 job last_status=error err=%s" % c.get("err"), "alert"))
         elif na is not None and na > CRON_LATE_MIN:
             out.append(("P1", "cron_stale", "看护 job 迟到 %.0f 分钟未触发" % na, "alert"))
-        elif lra is not None and lra > CRON_STALE_MIN:
+        elif lra is not None and lra > _lim:
             out.append(("P1", "cron_stale",
-                        "看护 job 已 %.0f 分钟没有执行（>%d）" % (lra, CRON_STALE_MIN), "alert"))
+                        "看护 job 已 %.0f 分钟没有执行（>%d = 周期 %s 分钟 + 90 缓冲）"
+                        % (lra, _lim, c.get("period_min") or "未知"), "alert"))
     for bad in (f.get("cron_all") or [])[:3]:
         out.append(("P1", "cron_job_stale",
                     "调度任务「%s」异常：%s" % (bad.get("name") or bad.get("id"), bad.get("why")), "alert"))
