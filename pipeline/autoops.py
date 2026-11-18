@@ -67,9 +67,8 @@ CRON_JOB = "abd003ea5889"     # 运维守护-四小时看护（Hermes cron job i
 CRON_LATE_MIN = 30       # next_run_at 已过 30min 仍未触发 = 调度停摆
 # 2026-11-14：警戒线必须与排程周期匹配。CRON_JOB 是 `45 */6 * * *`（周期 360min），
 # 原来写死 5*60=300 → 每轮都判「已 326 分钟没有执行」误报 P1 并发邮件。
-# 取周期 + 60min 缓冲 = 420min。
-# （原 `CRON_STALE_MIN = 40 # 派发后超过 40min 仍未收尾 = 悬挂` 已删除：
-#   该变量无其它引用，且与下方 420 同名覆盖，属于死定义 + 重名）
+# 2026-11-18（E177）：改 8h 排程后 420 又不够用 → 死线改成由 jobs.json 的 schedule 现算
+# （cron_stale_limit = 周期 + 120 缓冲）。这个常数只是「周期解析失败」时的兜底。
 CRON_STALE_MIN = 420
 # 2026-11-14：任务**正在跑**不算悬挂。`45 */6` 的巡检每轮会跑十几分钟到半小时，
 # autoops 每 30min 探一次，若不做「在跑」豁免就会把正常执行判成
@@ -485,7 +484,7 @@ def _cron_field(spec, lo, hi):
 def cron_period_min(expr):
     """cron 表达式的排程周期（分钟，相邻两次 fire 间隔的中位数）；解析失败返回 None。
 
-    2026-11-18（E169）：09:30 的排程复审把「五路生产巡检」从 `45 */6`（360min）
+    2026-11-18（E177）：09:30 的排程复审把「五路生产巡检」从 `45 */6`（360min）
     改成 `45 0,8,16`（480min），而 CRON_STALE_MIN 里写死的 420 没人跟着改 →
     13:45 起每轮都判「已 449 分钟没有执行」的假 P1。死线必须由排程自己算，
     不能再靠人肉同步常数（用户要求「加/改一个就自动生效」）。
@@ -549,14 +548,16 @@ def schedule_period_min(sched):
 
 
 def cron_stale_limit(period_min):
-    """看护 job 多久没跑才算「调度层死了」：排程周期 + 90 分钟缓冲（下限 240）。
+    """看护 job 多久没跑才算「调度层死了」：排程周期 + 120 分钟缓冲（下限 240）。
 
-    缓冲 ≥ 单轮执行时长（实测 7~28 分钟）+ 一次探测间隔，理由是 last_run_at 记的是
-    **完成**时刻，而下一个 fire 在周期末尾 —— 用「周期+90」才不会在两次 fire 之间误报。
+    last_run_at 记的是**完成**时刻，而下一轮 fire 在周期末尾，所以空窗 =
+    周期 + 上一轮执行时长（实测 7~28 分钟）；再留一次派发延迟的余量。
+    缓冲 90 分钟时 8h 排程只剩 17 分钟余量（06:58 完成 → 16:45 fire = 587 > 570），
+    派发晚几分钟就会在 fire 前误报；取 120 才有可用的余量。
     """
     if not period_min or period_min <= 0:
         return CRON_STALE_MIN
-    return int(max(240, period_min + 90))
+    return int(max(240, period_min + 120))
 
 
 def sense_cron():
@@ -880,7 +881,7 @@ def analyze(f, st=None):
             out.append(("P1", "cron_stale", "看护 job 迟到 %.0f 分钟未触发" % na, "alert"))
         elif lra is not None and lra > _lim:
             out.append(("P1", "cron_stale",
-                        "看护 job 已 %.0f 分钟没有执行（>%d = 周期 %s 分钟 + 90 缓冲）"
+                        "看护 job 已 %.0f 分钟没有执行（>%d = 周期 %s 分钟 + 120 缓冲）"
                         % (lra, _lim, c.get("period_min") or "未知"), "alert"))
     for bad in (f.get("cron_all") or [])[:3]:
         out.append(("P1", "cron_job_stale",

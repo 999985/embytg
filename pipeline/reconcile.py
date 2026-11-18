@@ -78,6 +78,8 @@ E = C.cfg("emby_url", "http://127.0.0.1:8096").rstrip("/")
 T = C.cfg("emby_api_key") or C.cfg("emby_token") or ""
 HDR = {"X-Emby-Token": T, "Content-Type": "application/json"}
 PREFIX = "/mnt/embytg"          # Emby 容器内看到的挂载根
+HOST_MNT = "/opt/embytg/mnt/embytg"   # 同一挂载在宿主机的路径
+RC_ADDR = "127.0.0.1:5572"      # rclone mount 的 rc 端点（--rc --rc-addr）
 SE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})")
 VIDEO = (".mp4", ".mkv", ".m4v", ".avi", ".ts", ".mov")
 DB = "teldrive-postgres"
@@ -359,6 +361,54 @@ def annotate_ages(gaps):
     return gaps
 
 
+def _vfs_forget(dir_rel, timeout=15):
+    """让 rclone mount 丢掉某个目录的缓存条目。失败只留痕，不影响对账。
+
+    2026-11-18（E178）：S01E02 的字节和 teldrive 记录都在（files.active、16:06 建），
+    挂载却一直不列它 → ScanPath 报 PathNotFound、Emby 永远建不出条目，
+    reconcile 只能报「文件在但 Emby 无 Episode」。实测 `vfs/refresh` 返回 OK 仍不列，
+    `vfs/forget` + 重新 readdir 才立刻出现（rclone 的 DirCache 对已缓存的目录
+    不会因 refresh 失效）。所以「看不见 ≠ 没有」，先清缓存再判。
+    """
+    try:
+        r = subprocess.run(["rclone", "rc", "vfs/forget", "dir=" + dir_rel,
+                            "--rc-addr", RC_ADDR],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+def heal_mount_cache(paths, limit=20, _exists=None, _forget=None, _sleep=None):
+    """挂载看不见的文件 → 清父目录 VFS 缓存再确认。返回 (可见路径, 缓存自愈条数)。
+
+    paths 是 Emby 容器内路径（/mnt/embytg/...）。注入 _exists/_forget/_sleep 便于测试。
+    """
+    exists = _exists or os.path.exists
+    forget = _forget or _vfs_forget
+    sleep = _sleep or time.sleep
+    visible, healed, checked = [], 0, 0
+
+    def host(p):
+        return HOST_MNT + p[len(PREFIX):] if p.startswith(PREFIX) else p
+
+    for p in paths:
+        if checked >= limit:
+            break
+        if exists(host(p)):
+            visible.append(p)                    # 本来就可见，交给 ScanPath 即可
+            continue
+        checked += 1
+        d = os.path.dirname(p)
+        if not forget(d[len(PREFIX):].lstrip("/") if d.startswith(PREFIX) else d):
+            continue
+        sleep(1.0)
+        if exists(host(p)):
+            visible.append(p)
+            healed += 1
+    return visible, healed
+
+
 def repair(gaps, only=None, cooldown_h=12):
     """只做有界、可逆的修补。每库/每剧每 cooldown_h 小时最多一次。"""
     st = load_state()
@@ -421,6 +471,13 @@ def repair(gaps, only=None, cooldown_h=12):
         todo = [g for g in gaps if g["kind"] == "episode_missing_emby" and g.get("path")
                 and allow("scanpath:" + g["path"])]
         if todo:
+            # 先确认「挂载真的看不见」——rclone DirCache 会把刚上传的文件藏起来（E178），
+            # 不先清缓存就 ScanPath，插件只会回 PathNotFound，条目永远建不出来。
+            _vis, _healed = heal_mount_cache([g["path"] for g in todo])
+            if _healed:
+                print("  ✓ 挂载目录缓存自愈 %d 条（vfs/forget 后可见）" % _healed)
+                done["mount_cache_heal"] += _healed
+                todo = [g for g in todo if g["path"] in _vis]
             r = emby_scan.scan_paths([g["path"] for g in todo][:200])
             print("  ✓ ScanPath 补集 %d 条：Created=%d Refreshed=%d Failed=%d"
                   % (len(todo), r.get("Created", 0), r.get("Refreshed", 0),
