@@ -97,6 +97,19 @@ def main():
               if a not in l3_runs
               and ("预演" in str(a.get("result", "")) or "DRY" in str(a.get("result", "")))]
     l3_skip = [a for a in l3_exec if a not in l3_runs and a not in l3_dry]
+    # E177：只统计 L3 会让「L1/L2 也被冻住」完全看不见 —— 2026-11-11~18 的六天里，
+    # 简报每天只说「L3 真入库 0 次」，而 L2 的 96 轮 [DRY] 与 L1 的假「disk_guard 完成」
+    # 一次都没出现在简报上，我因此审了五天都没发现自愈停摆。三层各自的真/DRY 必须同屏。
+    def _real_dry(action, alert_prefix=None):
+        rows = [a for a in execs if str(a.get("action", "")) == action]
+        if alert_prefix:
+            rows = [a for a in rows if not str(a.get("result", "")).startswith(alert_prefix)]
+        dry = [a for a in rows if str(a.get("result", "")).lstrip().startswith("[DRY]")
+               or "DRY（未执行" in str(a.get("result", ""))]
+        return len(rows) - len(dry), len(dry)
+
+    l1_real, l1_dry = _real_dry("L1", alert_prefix="只告警")
+    l2_real, l2_dry = _real_dry("L2")
     skipped_gates = []
     for a in decisions:
         m = re.search(r"'未过=\[(.*?)\]'|\"未过=\[(.*?)\]\"", str(a.get("decision", "")))
@@ -183,6 +196,10 @@ def main():
                 len(l3_dry), len(l3_skip)))
     for r in l3_runs[-3:]:
         L.append("  - `[%s] %s`" % (r.get("ts", "")[:16], str(r.get("result", ""))[:120]))
+    L.append("- **L1/L2 执行面**（E177：dry 不许冒充产出）: L1 真动作 **%d** / DRY %d；"
+             "L2 真跑 **%d** / DRY %d%s"
+             % (l1_real, l1_dry, l2_real, l2_dry,
+                "  ⚠ **L2 整段 DRY = 刮削停摆**" if l2_dry and not l2_real else ""))
     if fails:
         for f in fails[:5]:
             L.append("  - ⚠ `[%s] %s → %s`" % (f.get("ts", "")[:16],
