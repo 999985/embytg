@@ -33,6 +33,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import todb_titles as TT
 
 VID_CACHE = "/opt/embytg/pipeline/.todb_vid_cache.json"
+MISS_CACHE = "/opt/embytg/pipeline/.todb_vid_miss.json"
+MISS_TTL = 7 * 86400          # TODB 没收录/候选不唯一 → 7 天内不重复查
 OUT = "/opt/embytg/pipeline/nfo_episodes_last.json"
 
 
@@ -41,6 +43,19 @@ def load_vid_cache():
         return json.load(open(VID_CACHE))
     except Exception:
         return {}
+
+
+def load_miss_cache():
+    try:
+        return json.load(open(MISS_CACHE))
+    except Exception:
+        return {}
+
+
+def save_miss_cache(d):
+    tmp = MISS_CACHE + ".tmp.%d" % os.getpid()
+    json.dump(d, open(tmp, "w"), ensure_ascii=False)
+    os.replace(tmp, MISS_CACHE)
 
 
 def xml_esc(s):
@@ -126,21 +141,44 @@ def plan(lib=None, tid=None, limit=0):
         vid = vcache.get("%s|%s" % (title, year)) or vcache.get("%s|%s" % (qtitle, year))
         if not vid:
             # 缓存没有就现查一次 TODB；只有候选唯一才落缓存，避免把同名多条目选错固化（E021）。
-            cands = []
+            neg = {}
             try:
-                cands = TT.resolve_all(qtitle, year)
+                neg = load_miss_cache()
             except Exception:
+                neg = {}
+            nkey = "%s|%s" % (qtitle, year)
+            if time.time() - (neg.get(nkey) or 0) < MISS_TTL:
+                notes["neg_cached"] = notes.get("neg_cached", 0) + 1
+            else:
                 cands = []
-            if len(cands) == 1:
-                vid = cands[0]["vid"]
-                vcache["%s|%s" % (qtitle, year)] = vid
-                notes["resolved"] += 1
                 try:
-                    tmp = VID_CACHE + ".tmp.%d" % os.getpid()
-                    json.dump(vcache, open(tmp, "w"), ensure_ascii=False)
-                    os.replace(tmp, VID_CACHE)
+                    cands = TT.resolve_all(qtitle, year)
                 except Exception:
-                    pass
+                    cands = []
+                if len(cands) == 1:
+                    vid = cands[0]["vid"]
+                    vcache[nkey] = vid
+                    notes["resolved"] += 1
+                    try:
+                        tmp = VID_CACHE + ".tmp.%d" % os.getpid()
+                        json.dump(vcache, open(tmp, "w"), ensure_ascii=False)
+                        os.replace(tmp, VID_CACHE)
+                    except Exception:
+                        pass
+                    if nkey in neg:
+                        neg.pop(nkey, None)
+                        try:
+                            save_miss_cache(neg)
+                        except Exception:
+                            pass
+                else:
+                    # 负缓存：TODB 确实没有 / 候选不唯一 → 7 天内不再重复查。
+                    # 不加这个，232 部无 vid 剧每跑一次 plan 就要 232 次 TODB 搜索（实测 6 分钟）。
+                    try:
+                        neg[nkey] = int(time.time())
+                        save_miss_cache(neg)
+                    except Exception:
+                        pass
         if not vid:
             notes["no_vid"] += 1
             continue
