@@ -118,6 +118,36 @@ def quality_of(ms):
     return "SD", 0, 0
 
 
+def write_nfo(dir_path, name, item):
+    """写 NFO：标题用源站中文集名（别让 Emby 显示文件名里的英文画质标签）。"""
+    import xml.sax.saxutils as su
+    title = (item.get("Name") or "").strip()
+    if not title:
+        return
+    nfo = os.path.join(dir_path, os.path.splitext(name)[0] + ".nfo")
+    try:
+        os.makedirs(dir_path, exist_ok=True)
+        with open(nfo, "w", encoding="utf-8") as f:
+            f.write('<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
+                    '<episodedetails>\n  <title>%s</title>\n  <season>%s</season>\n'
+                    '  <episode>%s</episode>\n  <plot>%s</plot>\n</episodedetails>\n'
+                    % (su.escape(title), item.get("ParentIndexNumber") or 1,
+                       item.get("IndexNumber") or 0, su.escape(title)))
+    except Exception as ex:
+        print("  NFO 写入失败（不影响入库）: %s" % str(ex)[:60], flush=True)
+
+
+def scan_one(file_path):
+    """Emby 定向扫描：必须送**文件路径**；送目录只会 Refreshed，不会建新条目。"""
+    try:
+        import emby_scan
+        r = emby_scan.scan_paths([file_path])
+        print("  送扫: Created=%s Refreshed=%s skip=%s" % (
+            r.get("Created"), r.get("Refreshed"), r.get("skipped", 0)), flush=True)
+    except Exception as ex:
+        print("  送扫失败: %s" % str(ex)[:60], flush=True)
+
+
 def parse_eps(spec):
     out = []
     for part in spec.split(","):
@@ -200,8 +230,24 @@ def main():
             el = max(time.time() - t0, 0.001)
             print("  下载完成 %.2fGB %.1f MB/s" % (os.path.getsize(dest)/1e9,
                                                 os.path.getsize(dest)/el/1e6), flush=True)
-            parts = TC.upload(env, slot, dest)
-            TC.register(a.target_dir or ("TV/国漫/%s" % a.series), name, parts)
+            parts = None
+            for try_slot in [slot] + [x for x in (1, 2, 3, 4) if x != slot]:
+                if try_slot != slot and not GS.slot_lease(try_slot, "emos-%d" % os.getpid(), ttl=7200):
+                    continue
+                try:
+                    parts = TC.upload(env, try_slot, dest)
+                    break
+                except Exception as ex:
+                    print("  slot%d 上传失败: %s" % (try_slot, str(ex)[:80]), flush=True)
+                    if try_slot != slot:
+                        GS.slot_release(try_slot, "emos-%d" % os.getpid())
+            if not parts:
+                print("  全部 slot 上传失败，保留文件: %s" % dest, flush=True)
+                continue
+            tdir = a.target_dir or ("TV/国漫/%s" % a.series)
+            TC.register(tdir, name, parts)
+            write_nfo(os.path.join("/opt/embytg/mnt/embytg", tdir), name, it)
+            scan_one(os.path.join("/mnt/embytg", tdir, name))
             os.remove(dest)
         return 0
     finally:
