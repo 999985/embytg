@@ -116,10 +116,31 @@ def do_one(job):
 
 def plan(lib=None, tid=None, limit=0):
     vcache = load_vid_cache()
-    jobs, notes = [], {"no_vid": 0, "no_title": 0, "no_se": 0, "series": 0, "no_eps": 0}
+    jobs, notes = [], {"no_vid": 0, "no_title": 0, "no_se": 0, "series": 0, "no_eps": 0,
+                       "resolved": 0}
     for l, sp, sid in TT.iter_series(lib, tid):
         title, year = TT.series_title(sp)
-        vid = vcache.get("%s|%s" % (title, year))
+        # 目录名里的「(未知)」是年份没查到时的占位符，不是剧名的一部分；先剥掉再查缓存，
+        # 否则 key「虎与龙 (未知)|None」永远命中不了 → 这部剧一辈子没有 NFO（2026-11-18 实测 32 部）。
+        qtitle = TT.query_title(title)
+        vid = vcache.get("%s|%s" % (title, year)) or vcache.get("%s|%s" % (qtitle, year))
+        if not vid:
+            # 缓存没有就现查一次 TODB；只有候选唯一才落缓存，避免把同名多条目选错固化（E021）。
+            cands = []
+            try:
+                cands = TT.resolve_all(qtitle, year)
+            except Exception:
+                cands = []
+            if len(cands) == 1:
+                vid = cands[0]["vid"]
+                vcache["%s|%s" % (qtitle, year)] = vid
+                notes["resolved"] += 1
+                try:
+                    tmp = VID_CACHE + ".tmp.%d" % os.getpid()
+                    json.dump(vcache, open(tmp, "w"), ensure_ascii=False)
+                    os.replace(tmp, VID_CACHE)
+                except Exception:
+                    pass
         if not vid:
             notes["no_vid"] += 1
             continue

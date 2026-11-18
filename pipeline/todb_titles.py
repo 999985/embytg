@@ -37,6 +37,15 @@ SE_RE = re.compile(r"S(\d{1,2})E(\d{1,4})", re.I)
 QUAL_RE = re.compile(r"-\s*(\d{3,4}p|SD|4K)\s*$", re.I)
 TMDB_RE = re.compile(r"\{tmdb=(\d+)\}")
 YEAR_RE = re.compile(r"\((\d{4})\)")
+# 「(未知)」不是年份，是入库时没查到年份留下的占位符。以前它会被当成剧名的一部分
+# 原样发给 TODB（`title=虎与龙 (未知)`），搜索自然 0 命中 → 这类剧永远拿不到 NFO。
+# 查询侧必须剥掉它；文件名/目录名侧不动（改名是另一条链路，见 fix_naming.py）。
+YEAR_UNKNOWN_RE = re.compile(r"\s*[\(（]\s*(?:未知|未知年份|unknown|n/?a)\s*[\)）]\s*", re.I)
+
+
+def query_title(t):
+    """把剧名收拾成「可以拿去搜 TODB」的样子：去掉年份占位符。"""
+    return YEAR_UNKNOWN_RE.sub("", t or "").strip()
 SEASON_WORD = re.compile(r"\s*第[一二三四五六七八九十0-9]+季\s*$")
 
 _cache = {}
@@ -83,6 +92,7 @@ def resolve_all(title, year):
     需要按季集结构挑的时候用 `todb_resolve.py`；至少要知道"这里有几个候选"。
     """
     out, seen = [], set()
+    title = query_title(title)
     base = SEASON_WORD.sub("", title).strip()
     for cand in [title, base, title.replace(" ", ""), base.replace(" ", "")]:
         if not cand:
@@ -128,7 +138,8 @@ def resolve(title, year):
         cands.sort(key=lambda c: (abs(int(c["year"]) - int(year)) if (c["year"] and year) else 99, c["vid"]))
         return int(cands[0]["vid"]), title
     # 兜底：旧逻辑（含「第N季」后缀剥离）
-    for cand in [title, SEASON_WORD.sub("", title).strip(), title.replace(" ", "")]:
+    for cand in [query_title(title), SEASON_WORD.sub("", query_title(title)).strip(),
+                 query_title(title).replace(" ", "")]:
         if not cand:
             continue
         items = search_title(cand)
