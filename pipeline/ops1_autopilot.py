@@ -33,8 +33,14 @@
      G5 运维守护未在拉片（无 .part / pull 日志近期活跃）→ 否则跳过/缩小批次
      G6 先 `tgpipe.py scan --dry` 预演（不写队列、不消耗冷却），再走 START_HERE §2 增量六步；
         失败即熔断（写 state，不再重试）
-     ⚠ 默认 DRY_ONLY=True（安全起步）；要真自动把 config 里 ops1_autopilot.l3_enabled 打开，
+     ⚠ L3 默认 DRY（安全起步）；要真自动把 config 里 ops1_autopilot.l3_enabled 打开，
        且必须是我审核过一轮 dry 日志后亲手开。用户授权「无人值守」不等于无闸门。
+     ⚠ E177（2026-11-18）：**L1/L2 的 dry 与 L3 的 dry 是三件事，不许共用一个开关**。
+       以前 `dry = a.dry or DRY_ONLY`（DRY_ONLY 来自 l3_enabled=false，11-11 用户暂停上片后恒 True），
+       结果「不上片」把**运维自己的**磁盘自愈(L1)和刮削补缺(L2)一起冻住：
+       24h 审计 96/96 轮 `[DRY] 会跑 nfo_gen`、`disk_guard` 只打印不执行，
+       NFO 补缺最后一次真跑停在 2026-11-11 18:00。现在 l1_enabled/l2_enabled 独立，
+       默认 True；`--dry` 仍是全局只读。
 
 【留痕与审计】每轮每步写 logs/ops1_audit.jsonl（时间/阶段/观测/决策/动作/结果/耗时），
 另写 logs/ops1_autopilot.log 人读；重大动作同步 AgentCommunication.log（只在有动作时，
@@ -68,16 +74,32 @@ COOLDOWN_H = 20
 # 一个字节都没入库，不能消耗 20h 的真灌冷却，否则「只读巡检」会把当天 L3 关掉。
 # 预演只用自己的节流窗口，且只在 DRY_ONLY 的重复预演间生效（省 FUSE 扫描）。
 PREVIEW_MIN_INTERVAL_H = 1
-# DRY_ONLY 从 config.json 的 ops1_autopilot.l3_enabled 读（默认 false=只预演）。
-# 真自动入库由运维任务审核过一轮 dry 日志后，改 config.json 打开并留痕。
-def l3_enabled():
+# E177：三级各自的开关。以前只有 l3_enabled，且被当成「全机 dry」的总闸：
+#   11-11 用户暂停上片（l3_enabled=false）后，L1 磁盘自愈与 L2 刮削补缺也一起被冻住 ——
+#   24h 审计 96/96 轮 `[DRY] 会跑 nfo_gen`，`last_l2_ts` 停在 2026-11-11 18:00。
+# L1/L2 是运维自己的动作（不上片、不写 TG 云端），与上片暂停令无关，默认放行。
+# 只有 `--dry`（人工只读巡检）能让三层全停。
+def _cfg_flag(key, default):
     try:
         c = json.load(open(CFG, encoding="utf-8"))
-        return bool((c.get("ops1_autopilot") or {}).get("l3_enabled", False))
+        v = (c.get("ops1_autopilot") or {}).get(key)
+        return bool(default if v is None else v)
     except Exception:
-        return False
+        return bool(default)
 
-DRY_ONLY = not l3_enabled()
+
+def l3_enabled():
+    # 默认 false：真入库是不可逆 TG 云端写，读不到配置就当「不许灌」
+    return _cfg_flag("l3_enabled", False)
+
+
+L1_ENABLED = _cfg_flag("l1_enabled", True)
+L2_ENABLED = _cfg_flag("l2_enabled", True)
+DRY_L3 = not l3_enabled()
+DRY_L1 = not L1_ENABLED
+DRY_L2 = not L2_ENABLED
+# 兼容旧名（日志/外部脚本可能引用）：DRY_ONLY == 「L3 只预演」
+DRY_ONLY = DRY_L3
 CACHE = os.path.join(ROOT, "cache")
 DISK_WARN_PCT = 80       # 13:12 实测 82%/余18G；85% 太宽，等不到自愈就满了
 DISK_CRIT_PCT = 88
@@ -258,6 +280,16 @@ def active_pulls():
     return act
 
 
+def nfo_gen_running():
+    """§7.4：标题类任务同一时间只许一个（nfo_gen 会写同一批 NFO+poster）。
+    E177 起 L2 会真跑，必须自己判重，不能指望人工盯着。"""
+    try:
+        _, out, _ = sh("ps -eo args | grep '[n]fo_gen.py' | grep -v 'ops1_autopilot' | head -3", 10)
+        return bool(out.strip())
+    except Exception:
+        return True          # 判不了 → 当作在跑（不抢）
+
+
 def disk_guard(dinfo, dry):
     """磁盘分级自愈：只清**确定可再生的运行时缓存**，绝不碰媒体/备份/在写的 .part。
 
@@ -271,16 +303,21 @@ def disk_guard(dinfo, dry):
     """
     acts = []
     if dinfo["pct"] < DISK_WARN_PCT and dinfo["avail_mb"] > MIN_FREE_MB:
-        return acts, "磁盘正常，无需自愈"
+        return acts, ("磁盘正常，无需自愈" if not dry else "磁盘正常，无需自愈(DRY)")
     level = "CRIT" if (dinfo["pct"] >= DISK_CRIT_PCT or dinfo["avail_mb"] < MIN_FREE_MB) else "WARN"
     acts.append("level=%s pct=%d%% avail=%dMB" % (level, dinfo["pct"], dinfo["avail_mb"]))
     # 1) rclone 日志截断
+    # E177：旧写法 `tail -c 20M > tmp && mv tmp rl` 换掉了 inode，rclone 仍写旧 inode
+    # → 空间一个字节都没释放，而审计写着「rclone.log 截断到20M」= 假自愈。
+    # 现在原地回写同一 inode（cat > 文件 = O_TRUNC 后写入），空间真的释放。
     rl = os.path.join(CACHE, "rclone-mount.log")
     try:
         if os.path.getsize(rl) > 200 * 1048576:
             if not dry:
-                rc, tail, _ = sh("tail -c 20M %s > %s.tmp && mv %s.tmp %s" % (rl, rl, rl, rl), 60)
-                acts.append("rclone.log 截断到20M rc=%d" % rc)
+                rc, _, _ = sh("tail -c 20M %s > %s.tmp && cat %s.tmp > %s && rm -f %s.tmp"
+                              % (rl, rl, rl, rl, rl), 120)
+                acts.append("rclone.log 原地截断到20M rc=%d (now=%dMB)"
+                            % (rc, os.path.getsize(rl) // 1048576))
             else:
                 acts.append("[DRY] 会截断 rclone.log 到20M")
     except OSError:
@@ -336,7 +373,7 @@ def disk_guard(dinfo, dry):
                     % ("[DRY] 会清 " if dry else "清 ", len(old), freed))
     else:
         acts.append("cache/varc=%dMB（运维守护资产，WARN只告警；CRIT才清>6h孤块）" % varc)
-    return acts, "disk_guard 完成"
+    return acts, ("disk_guard 完成" if not dry else "disk_guard DRY（未执行，仅报告）")
 
 
 def main():
@@ -348,7 +385,11 @@ def main():
     # 不认识这个参数 → 一加 --json 就 "unrecognized arguments" 退出（自证手段用不了）。
     ap.add_argument("--json", action="store_true", help="输出本轮机器可读摘要（给自醒/巡检看）")
     a = ap.parse_args()
-    dry = a.dry or DRY_ONLY
+    # E177：三层各用各的 dry。--dry 仍是全局只读（人工巡检/自醒验证用）。
+    dry_all = a.dry
+    dry_l1 = dry_all or DRY_L1
+    dry_l2 = dry_all or DRY_L2
+    dry_l3 = dry_all or DRY_L3
     t0 = time.time()
     st = load_state()
     st["cycles"] = st.get("cycles", 0) + 1
@@ -465,7 +506,7 @@ def main():
                           % (nfo_gap["missing"], recent_video, (time.time() - last_l2) / 3600)))
         # E017：只有真的跑了 nfo_gen 才写节流时间（dry 时这一步并不执行，写进去等于
         # 用一次只读巡检白占 1h 的增量窗口；13:14:12 的全局 --dry 就这么干过）。
-        if not dry:
+        if not dry_l2:
             st["last_l2_ts"] = time.time()
     # L3 自动入库：六道闸门
     # 【E017】冷却只由「真灌」消耗，缺失状态从审计回填而不是 fail-open：
@@ -477,7 +518,7 @@ def main():
     l3_src = "state"
     if not last_l3:
         last_l3, l3_src = last_l3_from_audit()
-        if last_l3 and not dry:
+        if last_l3 and not dry_l3:
             st["last_l3_ts"] = last_l3   # 回填落盘，下次不用再扫审计
     if last_l3:
         hours_since = (time.time() - last_l3) / 3600.0
@@ -524,14 +565,15 @@ def main():
     }
     gate_all = all(v[0] for v in gate.values())
     if gate_all:
-        decisions.append(("L3", "自动入库判定通过 → 执行六步SOP%s" % ("(DRY)" if dry else ""),
+        decisions.append(("L3", "自动入库判定通过 → 执行六步SOP%s" % ("(DRY)" if dry_l3 else ""),
                           "gates=%s" % {k: v[0] for k, v in gate.items()}))
     else:
         decisions.append(("L3", "跳过自动入库", "未过=%s" % [k for k, v in gate.items() if not v[0]]))
     audit("分析", {"gate": {k: v[0] for k, v in gate.items()},
                   "gate_detail": {k: v[1] for k, v in gate.items()},
                   "cooldown_h": (round(hours_since, 1) if hours_since is not None else None),
-                  "dry": dry, "pulls": pulls[:2]},
+                  "dry": {"all": dry_all, "l1": dry_l1, "l2": dry_l2, "l3": dry_l3},
+                  "pulls": pulls[:2]},
           decisions, t0=t0)
 
     # ---------------- 执行 ----------------
@@ -539,28 +581,32 @@ def main():
     for lvl, what, why in decisions:
         t1 = time.time()
         if lvl == "L1" and "恢复 auto_finalize" in what:
-            if dry:
+            if dry_l1:
                 res = "[DRY] 会 nohup /usr/bin/python3 -u auto_finalize.py --loop"
             else:
                 _, out, err = sh("cd %s && nohup /usr/bin/python3 -u auto_finalize.py --loop >> %s/auto_finalize.stdout.log 2>&1 < /dev/null & echo $!" % (PIPE, BK), 20)
                 time.sleep(3)
                 res = "loop 恢复 pid=%s now=%s" % (out.strip(), loop_pids())
         elif lvl == "L1" and "selfheal" in what:
-            rc, out, err = sh("bash %s/p0_3_selfheal.sh" % PIPE, 120) if not dry else (0, "[DRY]", "")
+            rc, out, err = sh("bash %s/p0_3_selfheal.sh" % PIPE, 120) if not dry_l1 else (0, "[DRY]", "")
             res = "rc=%d %s %s" % (rc, out[:80], err[:80])
         elif lvl == "L1" and "重打包" in what:
             res = "仅标记：需人工/下轮在 flock 空闲时 force-pack（避免与常驻 loop 抢锁）"
         elif lvl == "L1" and "disk_guard" in what:
-            acts, res = disk_guard(dinfo, dry)
+            acts, res = disk_guard(dinfo, dry_l1)
             res = "%s | %s" % (res, "; ".join(acts[:6]))
         elif lvl == "L1" and "告警" in what:
             res = ("只告警不代结（§7.3）；AI 自醒 stale 需查 Hermes cron 状态 / 模型 provider"
                    if "selfwake" in what else "只告警不代结（§7.3）")
         elif lvl == "L2" and "nfo_gen" in what:
-            if dry:
+            if dry_l2:
                 res = "[DRY] 会跑 nfo_gen.py --kind all --workers 24（幂等）"
+            elif nfo_gen_running():
+                # §7.4：同一时间只允许一个标题类任务（会写同一批 NFO/poster）
+                res = "跳过：已有 nfo_gen 在跑（串行保护），本轮不写 last_l2_ts"
+                st.pop("last_l2_ts", None)
             else:
-                rc, out, err = sh("cd %s && /usr/bin/python3 nfo_gen.py --kind all --workers 24 2>&1 | tail -5" % PIPE, 900)
+                rc, out, err = sh("cd %s && timeout 840 /usr/bin/python3 nfo_gen.py --kind all --workers 24 2>&1 | tail -5" % PIPE, 900)
                 res = "rc=%d %s" % (rc, (out or err)[:160])
         elif lvl == "L3" and gate_all:
             # 【增量六步】不用 ingest_sop.sh（它硬编码 --full 拉全 7 频道历史，
@@ -571,7 +617,7 @@ def main():
             prev_age_h = (time.time() - last_prev) / 3600.0 if last_prev else None
             # E017：DRY_ONLY / --dry 下不重复预演（省 FUSE 扫描），但节流只作用于「预演本身」，
             # 绝不因此写 last_l3_ts —— 真灌路径（dry=False）永远先预演再执行，不受节流影响。
-            if dry and prev_age_h is not None and prev_age_h < PREVIEW_MIN_INTERVAL_H:
+            if dry_l3 and prev_age_h is not None and prev_age_h < PREVIEW_MIN_INTERVAL_H:
                 res = ("预演节流：距上次预演 %.1fh < %.0fh（DRY_ONLY 不重复烧 FUSE）；"
                        "真灌未执行、真灌冷却未消耗" % (prev_age_h, PREVIEW_MIN_INTERVAL_H))
             else:
@@ -585,8 +631,8 @@ def main():
                     st["l3_fails"] = st.get("l3_fails", 0) + 1
                     if st["l3_fails"] >= 2:
                         st["l3_fused"] = True
-                elif dry:
-                    res = "L3 增量 dry 预演 OK（DRY_ONLY，真灌未执行，冷却未消耗）：%s" % out_dry[:140].replace("\n", " ")
+                elif dry_l3:
+                    res = "L3 增量 dry 预演 OK（DRY_L3，真灌未执行，冷却未消耗）：%s" % out_dry[:140].replace("\n", " ")
                 else:
                     # 真执行：六步逐步跑，任一步失败即熔断（不继续灌）
                     # 2026-11-13 按运维守护实测建议 + 用户 11-09 原话「永远不要等着 emby 来自动扫
@@ -643,11 +689,15 @@ def main():
 
     # ---------------- 留痕 / 收口 ----------------
     save_state(st)
-    summary = {"cycle": st["cycles"], "dry": dry, "decisions": len(decisions),
+    summary = {"cycle": st["cycles"],
+               "dry": {"all": dry_all, "l1": dry_l1, "l2": dry_l2, "l3": dry_l3},
+               "decisions": len(decisions),
                "executed": executed, "gate_all": gate_all,
                "cooldown_h": (round(hours_since, 1) if hours_since is not None else None)}
     audit("留痕", {"audit_file": AUDIT, "state": STATE},
-          "本轮闭环完成", result="cycles=%d gate_all=%s dry=%s" % (st["cycles"], gate_all, dry), t0=t0)
+          "本轮闭环完成",
+          result="cycles=%d gate_all=%s dry(all/l1/l2/l3)=%s/%s/%s/%s"
+                 % (st["cycles"], gate_all, dry_all, dry_l1, dry_l2, dry_l3), t0=t0)
     if "--json" in sys.argv:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
