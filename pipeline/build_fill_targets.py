@@ -49,23 +49,60 @@ def cfg(k):
         return None
 
 
-def tmdb_season_counts(tmdb_id, season=None):
-    """返回 {season: 集数}；只查需要的那一季时就传 season。"""
-    key = "%d|%s" % (tmdb_id, season if season is not None else "all")
+_CACHE = None
+_API_LEFT = [60]
+_DEADLINE = [0.0]
+
+
+def _cache_load():
+    global _CACHE
+    if _CACHE is None:
+        try:
+            _CACHE = json.load(open(CACHE, encoding="utf-8"))
+        except Exception:                                  # noqa: BLE001
+            _CACHE = {}
+    return _CACHE
+
+
+def _cache_save():
+    if _CACHE is None:
+        return
     try:
-        cache = json.load(open(CACHE, encoding="utf-8"))
+        tmp = CACHE + ".tmp"
+        json.dump(_CACHE, open(tmp, "w", encoding="utf-8"), ensure_ascii=False)
+        os.replace(tmp, CACHE)
     except Exception:                                      # noqa: BLE001
-        cache = {}
-    if key in cache and isinstance(cache[key], dict):
-        return cache[key].get("counts") or {}
-    tok = cfg("tmdb_token")
+        pass
+
+
+def tmdb_season_counts(tmdb_id, season=None):
+    """返回 {season: 集数}。
+
+    关键性能点（2026-11-19 实测）：缓存文件 14MB，**每次调用都 json.load + 回写**
+    会让 800 部剧跑成 >300s（超时）。现在进程内只加载一次、结束时写一次，
+    并且优先按单季缓存键 `<tmdb>|<season>` 命中（现有缓存就是这种键）。
+    """
+    cache = _cache_load()
+    if season is not None:
+        hit = cache.get("%d|%d" % (tmdb_id, season))
+        if isinstance(hit, dict) and hit.get("counts"):
+            return {int(k): int(v) for k, v in hit["counts"].items()}
+    else:
+        hit = cache.get("%d|all" % tmdb_id)
+        if isinstance(hit, dict) and hit.get("counts"):
+            return {int(k): int(v) for k, v in hit["counts"].items()}
+
+    if _API_LEFT[0] <= 0 or time.time() > _DEADLINE[0]:
+        return {}
+    _API_LEFT[0] -= 1
+    tok = str(cfg("tmdb_token") or "")
     base = "https://api.themoviedb.org/3/tv/%d" % tmdb_id
     counts = {}
     try:
         if season is not None:
             url = base + "/season/%d?language=zh-CN" % season
             req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
-            with urllib.request.urlopen(req, timeout=25) as r:
+            with urllib.request.urlopen(req, timeout=20) as r:
                 d = json.loads(r.read())
             eps = d.get("episodes") or []
             if eps:
@@ -73,23 +110,17 @@ def tmdb_season_counts(tmdb_id, season=None):
         else:
             req = urllib.request.Request(base + "?language=zh-CN",
                                          headers={"Authorization": "Bearer " + tok})
-            with urllib.request.urlopen(req, timeout=25) as r:
+            with urllib.request.urlopen(req, timeout=20) as r:
                 d = json.loads(r.read())
             for s in d.get("seasons") or []:
                 n = int(s.get("season_number") or 0)
-                if n <= 0:
-                    continue
-                counts[n] = int(s.get("episode_count") or 0)
+                if n > 0:
+                    counts[n] = int(s.get("episode_count") or 0)
     except Exception:                                      # noqa: BLE001
         return {}
     if counts:
-        cache[key] = {"counts": counts, "ts": int(time.time())}
-        try:
-            tmp = CACHE + ".tmp"
-            json.dump(cache, open(tmp, "w", encoding="utf-8"), ensure_ascii=False)
-            os.replace(tmp, CACHE)
-        except Exception:                                  # noqa: BLE001
-            pass
+        key = "%d|%s" % (tmdb_id, season if season is not None else "all")
+        cache[key] = {"counts": {str(k): v for k, v in counts.items()}, "ts": int(time.time())}
     return counts
 
 
@@ -120,16 +151,48 @@ def main():
     ap.add_argument("--limit-missing-per-series", type=int, default=50)
     ap.add_argument("--focus", type=int, default=0, help="强制排到最前的 tmdb id")
     ap.add_argument("--focus-missing", type=int, default=0, help="focus 剧本轮最多放几集")
+    ap.add_argument("--api-budget", type=int, default=60, help="单轮最多打几次 TMDB")
+    ap.add_argument("--time-budget", type=int, default=120, help="单轮最多跑几秒")
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
 
+    _API_LEFT[0] = a.api_budget
+    _DEADLINE[0] = time.time() + a.time_budget
     have = load_have()
     items = []
+    # focus 剧必须最先算：否则 800 部剧的扫描会先把 TMDB 预算吃光，
+    # 轮到它时预算为 0 → 算出「无缺口」（2026-11-19 实测踩到）。
+    focus_items = []
+    if a.focus and a.focus in have:
+        sfs = have[a.focus]
+        for season in sorted(sfs["eps"]):
+            cnt = tmdb_season_counts(a.focus, season)
+            total = int(cnt.get(season) or 0)
+            if total <= 0 or total > 800:
+                continue
+            miss = [e for e in range(1, total + 1) if e not in sfs["eps"][season]]
+            if miss:
+                focus_items.append({"tmdb": a.focus, "lib": sfs["lib"], "dir": sfs["title"],
+                                    "series": (sfs["title"] or "").split(" (")[0],
+                                    "season": season, "missing": miss,
+                                    "total_missing": len(miss)})
+                break                     # 长连载剧一次只推进一个季，补齐再下一季
+        if a.focus_missing:
+            for x in focus_items:
+                x["missing"] = x["missing"][: a.focus_missing]
+        print("  focus %d: %d 季有缺口，本轮 %d 集" % (
+            a.focus, len(focus_items), sum(len(x["missing"]) for x in focus_items)),
+            file=sys.stderr, flush=True)
+
+    done = 0
     for tmdb, s in have.items():
-        counts = tmdb_season_counts(tmdb)
-        if not counts:
+        if tmdb == a.focus:
             continue
+        done += 1
+        if done % 100 == 0:
+            print("  …已扫 %d 部（API 余 %d）" % (done, _API_LEFT[0]), file=sys.stderr, flush=True)
         for season in sorted(s["eps"]):
+            counts = tmdb_season_counts(tmdb, season)
             total = int(counts.get(season) or 0)
             if total <= 0 or total > 800:
                 continue
@@ -145,26 +208,12 @@ def main():
             })
 
     # 小缺口优先（能快速出片），长连载剧按轮次推进
-    items.sort(key=lambda x: (x["total_missing"], x["tmdb"], x["season"]))
+    if focus_items:
+        items = focus_items + [x for x in items if x["tmdb"] != a.focus]
+    # focus 剧钉在最前（长连载剧专项），其余按缺口从小到大排
+    items.sort(key=lambda x: (0 if (a.focus and x["tmdb"] == a.focus) else 1,
+                              x["total_missing"], x["tmdb"], x["season"]))
     items = items[: a.limit_series]
-
-    focus = [x for x in items if x["tmdb"] == a.focus] if a.focus else []
-    if a.focus:
-        # focus 剧可能被 limit 截掉，单独补算
-        if not focus and a.focus in have:
-            s = have[a.focus]
-            counts = tmdb_season_counts(a.focus)
-            for season in sorted(s["eps"]):
-                total = int(counts.get(season) or 0)
-                miss = [e for e in range(1, total + 1) if e not in s["eps"][season]]
-                if miss:
-                    focus.append({"tmdb": a.focus, "lib": s["lib"], "dir": s["title"],
-                                  "series": (s["title"] or "").split(" (")[0],
-                                  "season": season, "missing": miss, "total_missing": len(miss)})
-        if a.focus_missing:
-            for x in focus:
-                x["missing"] = x["missing"][: a.focus_missing]
-        items = focus + [x for x in items if x["tmdb"] != a.focus]
 
     total_eps = sum(len(x["missing"]) for x in items)
     print("  系列 %d 个 / 缺集 %d 集" % (len(items), total_eps))
@@ -175,6 +224,7 @@ def main():
         f = next((x for x in items if x["tmdb"] == a.focus), None)
         print("  focus %s: %s" % (a.focus, ("S%02d 本轮 %d 集" % (f["season"], len(f["missing"]))) if f else "无缺口"))
 
+    _cache_save()
     if a.dry:
         return 0
     if os.path.exists(OUT):

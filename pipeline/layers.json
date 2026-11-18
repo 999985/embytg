@@ -132,6 +132,7 @@
   "tgpipe.py",
   "tgpipe_tick.py",
   "src_budget_rebalance.py",
+  "build_fill_targets.py",
   "tgsrc_copy.py",
   "probe_restricted_channels.py",
 
