@@ -63,12 +63,17 @@ async def probe(client, name):
     out["with_media"] = len(media)
     if not media:
         return out
-    m = media[0]
-    out["msg_id"] = m.id
-    doc = getattr(m, "document", None) or getattr(getattr(m, "video", None), "document", None)
+    # 优先挑带 document（视频/文件）的消息；照片没法验证「能不能下载片源」
+    m, doc = None, None
+    for cand in media:
+        d = getattr(cand, "document", None)
+        if d is not None:
+            m, doc = cand, d
+            break
     if doc is None:
-        out["media_kind"] = "photo/other"
+        out["media_kind"] = "只有图片，没有文件消息"
         return out
+    out["msg_id"] = m.id
     out["size_mb"] = round((getattr(doc, "size", 0) or 0) / 1e6, 1)
     out["mime"] = getattr(doc, "mime_type", "")
     # 只拉 512KB 验证「能不能取字节」，不落盘
