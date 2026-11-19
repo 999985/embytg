@@ -37,6 +37,7 @@ import post_ingest as P         # noqa: E402
 import source_pull as SP        # noqa: E402
 import src_guard as SG          # noqa: E402
 import lane_queue as LQ         # noqa: E402
+import quality_gate as QG       # noqa: E402 —— 画质判据唯一入口（两条线：STOCK/ADMIT）
 
 LOCK = os.path.join(HERE, ".gha_next.lock")
 # 2026-11-13 软租约改造后，源解析不再整源排除被占用的源（那会让第 4/5 台
@@ -851,16 +852,14 @@ _EP_PATH_CACHE = {}
 
 
 def _rank_dims(width, height):
-    w, h = int(width or 0), int(height or 0)
-    if h >= 1800 or w >= 3000:
-        return 4
-    if h >= 1400 or w >= 2400:
-        return 3
-    if h >= 1000 or w >= 1800:
-        return 2
-    if h >= 700 or w >= 1200:
-        return 1
-    return 0
+    """分辨率等级 —— 统一走 quality_gate 的 OR 判档。
+
+    2026-11-19：原先这里按 `h>=1800 or w>=3000` 判 4K，会把 3840x1608 的宽银幕 4K
+    判成 4 级、把 1440x1080 判成 2 级以外的档位；现在单一真源在 quality_gate.tier()：
+      width≥3840 **或** height≥2160 → 2160p
+      width≥1920 **或** height≥1080 → 1080p
+    """
+    return QG.rank_of_dims(width, height)
 
 
 def upgrade_duplicate(item, target, quality, old_rel):
@@ -908,7 +907,13 @@ def upgrade_duplicate(item, target, quality, old_rel):
     return key, ""
 
 
-def valid_candidates(cands, min_bytes, max_bytes):
+def valid_candidates(cands, min_bytes, max_bytes, item=None):
+    """体积/接口校验 + 画质闸门（quality_gate，两条线）。
+
+    * 假 4K（2160p 但 <2.0Mbps）**一票否决**，直接不进候选
+    * 其余候选打两个标：`qg_admit`（达新源准入线）/ `qg_stock_ok`（不低于存量线）
+    * 排序：先按「过准入线」再按 score，避免拿"分辨率对了但码率更差"的那份
+    """
     out = []
     reasons = []
     for c in cands:
@@ -916,21 +921,44 @@ def valid_candidates(cands, min_bytes, max_bytes):
         if why:
             reasons.append("%s:%s" % (c["st"].label, why))
             continue
+        try:
+            admit = QG.candidate_verdict(c, item, line="admit")
+            stock = QG.candidate_verdict(c, item, line="stock")
+            c["qg"] = admit
+            c["qg_admit"] = bool(admit.get("ok"))
+            c["qg_stock_ok"] = not stock.get("ok")      # stock.ok=True 表示"该洗"= 不达标
+            if admit.get("reason") == "fake_4k":
+                reasons.append("%s:fake_4k(%sMbps)" % (c["st"].label, admit.get("mbps")))
+                QG.log_reject("candidate", (c.get("episode") or {}).get("Name", ""),
+                              c.get("size"), 0, admit.get("tier"), admit.get("mbps"), "fake_4k")
+                continue
+        except Exception as e:                          # noqa: BLE001
+            # 闸门自身出错不许卡死选源：退化成"未过线"，仍可兜底
+            c["qg"] = {"ok": False, "reason": "gate_error:%s" % str(e)[:60]}
+            c["qg_admit"] = False
+            c["qg_stock_ok"] = True
         out.append(c)
-    out.sort(key=lambda c: c["quality"]["score"], reverse=True)
+    out.sort(key=lambda c: (bool(c.get("qg_admit")), (c.get("qg") or {}).get("rank", 0),
+                            c["quality"]["score"]), reverse=True)
     return out, reasons
 
 
 def fill_target(item, ep, cands, min_bytes, max_bytes):
     if not target_existing(item, ep):
         return None, "no_target"
-    good, reasons = valid_candidates(cands, min_bytes, max_bytes)
+    good, reasons = valid_candidates(cands, min_bytes, max_bytes, item=item)
     if not good:
         return None, "no_valid_source" + ((":" + ",".join(reasons[:4])) if reasons else "")
     c = good[0]
     q = c["quality"]["label"]
     if rank_of(q) < 1:
         return None, "below_720"
+    if not c.get("qg_admit"):
+        # 无高画质源兜底：收入当前最高版本防空集，单独记账，不计入达标产出
+        QG.log_fallback("fill", {"series": item.get("series"), "season": item.get("season"),
+                                 "ep": ep, "label": q,
+                                 "mbps": (c.get("qg") or {}).get("mbps"),
+                                 "reason": (c.get("qg") or {}).get("reason")})
     target = target_with_quality(
         item["lib"], item["dir"], item["series"], item["season"], ep,
         q, ext_of(c["episode"]))
@@ -997,15 +1025,40 @@ def upgrade_target(item, cands, min_bytes, max_bytes):
                  if rank_of(c["quality"]["label"]) == current_rank
                  and same_label_better(c, item.get("current_size"))]
         good.sort(key=lambda c: -(c.get("size") or 0))
-    good, reasons = valid_candidates(good, min_bytes, max_bytes)
+    good, reasons = valid_candidates(good, min_bytes, max_bytes, item=item)
     if not good:
         return None, "no_higher_quality" + ((":" + ",".join(reasons[:4])) if reasons else "")
-    # 分辨率相同的一批里，按码率→帧率再排一次，别拿"分辨率对了但码率更差"的那份
-    good.sort(key=lambda c: cand_score(c, item), reverse=True)
+    # 排序（红线 1）：先看质量门禁是否放行，再按 best_pick 的
+    # 「真2160p > 达标1080p > 同档 HEVC/AV1 > 更高码率」排。
+    try:
+        import best_pick as _BP
+        _view = [{"label": ((c.get("quality") or {}).get("label") or ""),
+                  "size": int(c.get("size") or 0),
+                  "duration": float((c.get("episode") or {}).get("duration") or 0),
+                  "vcodec": ((c.get("episode") or {}).get("vcodec") or "")} for c in good]
+        _ranked = _BP.rank_candidates(_view)
+        if _ranked:
+            _idx = []
+            for o in _ranked:
+                for i, v in enumerate(_view):
+                    if i not in _idx and v["label"] == o["label"] and v["size"] == o["size"]:
+                        _idx.append(i)
+                        break
+            good = [good[i] for i in _idx]
+            if len(_idx) < len(_view):
+                reasons = list(reasons) + ["fake4k_veto=%d" % (len(_view) - len(_idx))]
+    except Exception:                                          # noqa: BLE001
+        pass
+    good.sort(key=lambda c: (bool(c.get("qg_admit")), cand_score(c, item)), reverse=True)
     c = good[0]
     q = c["quality"]["label"]
     if rank_of(q) < 2:
         return None, "below_1080"
+    if not c.get("qg_admit"):
+        QG.log_fallback("upgrade", {"series": item.get("series"), "season": item.get("season"),
+                                    "ep": item.get("ep"), "label": q,
+                                    "mbps": (c.get("qg") or {}).get("mbps"),
+                                    "reason": (c.get("qg") or {}).get("reason")})
     target = target_with_quality(
         item["lib"], item["dir"], item["series"], item["season"], item["ep"],
         q, ext_of(c["episode"]))

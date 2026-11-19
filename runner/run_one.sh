@@ -295,11 +295,13 @@ if [ "$MODE" = "auto" ]; then
   LANES_ORDER="$("$VENV" "$POLICY" next 2>/dev/null || echo new)"
   # 2026-11-19（E183）：policy.next 返回的是**全局**推荐窗口（当前固定两格 new/fill），
   # 四条 lane 拿到同一份候选 → 前两条被别人 claim 走后，剩下的一律 LANE_BUSY → IDLE_NO_JOB。
-  # 实测 slot2 连续 1389 次重启全是 `LANE_BUSY lane=new/fill` 后 exit 0，
-  # 而同一时刻 upgrade 队列压着 2000 集没人干。
-  # 修法：保留 policy 的优先级顺序，把没列进去的 lane 追加到尾部兜底
-  # （优先级不变，只是不再「没被推荐就绝不碰」）。
-  for _L in upgrade new fill; do
+  # 实测 slot2 连续 1389 次重启全是 `LANE_BUSY lane=new/fill` 后 exit 0。
+  #
+  # 但 upgrade **暂时不能**放进兜底：实测启用后第一条 upgrade claim 就卡死在收尾——
+  # `verify_upgrade_emby()` 要求 `len(matching)==1 且 old 消失`，而本项目按
+  # 「多版本共存、不删旧文件」执行，新旧两个文件同时在 Emby 里就是 2 条，永远不可能收敛。
+  # 等收尾判据支持多版本（或多版本命名被 Emby 合并成单条）后再打开。
+  for _L in new fill; do
     case " $LANES_ORDER " in *" $_L "*) ;; *) LANES_ORDER="$LANES_ORDER $_L" ;; esac
   done
 else
