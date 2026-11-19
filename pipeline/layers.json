@@ -15,7 +15,7 @@
   "self_audit.py",
   "status_now.py"
  ],
- "generated": "2026-11-17",
+ "generated": "2026-11-19",
  "legacy": [
   "_db_state.py",
   "_inspect_td.py",
@@ -80,6 +80,8 @@
   "build_ingest_worklist.py",
   "build_three_queues.py",
   "check_layout.py",
+  "dedupe_episodes.py",
+  "dedupe_movies.py",
   "disk_watch.sh",
   "drop_old.py",
   "emos_import.py",
