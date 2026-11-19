@@ -424,9 +424,16 @@ async def item_worker(slot, q, results, dry, cap):
             try:
                 import quality_gate as QG
                 _bad, _m = QG.too_low(int(doc.document.size or 0), _dur, qual)
+                # 2026-11-19 用户：「机器人转载你还得多看看，不合适就掐了，不要盲目转载」
+                # 电影按「可交付」线卡（1080p 2.0 / 2160p 4.0），不是「该洗」线 ——
+                # 620MB 的「1080p 电影」进来只会污染片库，还要以后再洗一遍。
+                _floor = QG.ADMIT_MIN_MBPS.get(qual)
+                if _floor and _m and _m < _floor:
+                    _bad = True
                 if _bad:
                     QG.log_reject("ysdq", name, int(doc.document.size or 0), _dur, qual, _m)
-                    print("  [slot%d] %s → 码率 %.1fMbps 过低，跳过" % (slot, name[:40], _m))
+                    print("  [slot%d] %s → 码率 %.1fMbps 低于交付线 %.1f，跳过"
+                          % (slot, name[:40], _m, _floor or 0))
                     results["lowq"] = results.get("lowq", 0) + 1
                     continue
             except Exception:                                  # noqa: BLE001

@@ -190,6 +190,15 @@ def main():
 
     want = set(parse_eps(a.eps)) if a.eps else set()
     todo = [it for it in eps_list if not want or int(it.get("IndexNumber") or 0) in want]
+    # 2026-11-19：emos 同一部剧有「真 4K 2.1GB/14Mbps」也有「1080p remux 13.4GB/32Mbps」。
+    # 后者每集 13GB，1342 集要 17TB，本机只剩 35GB 磁盘 —— 全量洗版必须设体积上限。
+    # 默认 6GB：能容纳 2-4GB 的高码率 4K，挡住 remux。
+    _cap = float(os.environ.get("EMOS_MAX_GB", "6"))
+    _over = [it for it in todo if ((it.get("MediaSources") or [{}])[0].get("Size") or 0) / 1e9 > _cap]
+    if _over:
+        print("  超过 %.0fGB 上限的 %d 集已跳过（remux 不参与洗版）" % (_cap, len(_over)))
+    todo = [it for it in todo
+            if ((it.get("MediaSources") or [{}])[0].get("Size") or 0) / 1e9 <= _cap]
     todo = todo[: a.limit]
     print("  本次处理 %d 集" % len(todo))
 
