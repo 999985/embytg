@@ -24,20 +24,23 @@ SCAN_LIMIT = os.environ.get("TGPIPE_SCAN_LIMIT", "200")
 
 
 def pending_count():
-    """队列真源是 tg.db 的 pending 表（tg_pending.json 只是遗留文件）。"""
-    path = os.path.join(HERE, "tg.db")
+    """**未消费**条数（总数 - cursor）。
+
+    2026-11-20 事故：原来只数 pending 表行数。队列消费完后行还在（cursor=36/36），
+    于是「pending=36 ≥ 阈值 30」永远成立 → 永远不补扫 → 转存链路静默停摆，
+    表面上定时器每分钟都成功退出。判据必须和 apply 用同一个真源（tgstore 的 cursor），
+    否则两处口径不一致就必然再停一次。
+    """
     try:
-        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=10)
-    except Exception as e:                             # noqa: BLE001
-        print("# 打不开 tg.db: %s" % e, file=sys.stderr, flush=True)
-        return 0
-    try:
-        return int(con.execute("select count(*) from pending").fetchone()[0])
+        sys.path.insert(0, HERE)
+        import tgpipe as T
+        q = T.load_json(T.PENDING, {"items": [], "cursor": 0})
+        total = len(q.get("items") or [])
+        cursor = int(q.get("cursor") or 0)
+        return max(0, total - cursor)
     except Exception as e:                             # noqa: BLE001
         print("# 读 pending 失败: %s" % e, file=sys.stderr, flush=True)
         return 0
-    finally:
-        con.close()
 
 
 def run(*args):

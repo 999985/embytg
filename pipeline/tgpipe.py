@@ -187,16 +187,24 @@ def emby_media_updated(paths):
         print(f"# [full 回落] /Library/Refresh（本批新增 {len(paths)} 路径）", flush=True)
         return
     ok, fail = 0, []
-    for i in range(0, len(paths), NOTIFY_BATCH):
-        chunk = paths[i:i + NOTIFY_BATCH]
-        body = {"Updates": [{"Path": p, "UpdateType": "Created"} for p in chunk]}
-        try:
-            emby("/Library/Media/Updated", "POST", body)
-            ok += len(chunk)
-        except Exception as e:
-            fail.extend(chunk)
-            print(f"  ! Media/Updated 批次失败 {type(e).__name__}: {str(e)[:120]}",
-                  file=sys.stderr, flush=True)
+    # 2026-11-20 根因：`POST /Library/Media/Updated` **建不出新 Episode**。
+    # 实测 20 条已登记文件在 Emby 全查不到（reconcile 报 episode_missing_emby），
+    # 而 TargetedScan 插件（/Library/ScanPaths）按文件路径送扫能 Created=1。
+    # 所以通知出口统一走 emby_scan.scan_paths —— 与收尾链路口径一致。
+    try:
+        import emby_scan
+        res = emby_scan.scan_paths(paths)
+        ok = int(res.get("Created", 0)) + int(res.get("Refreshed", 0))
+        if res.get("Failed") or res.get("PathNotFound"):
+            fail.extend(paths)
+            print(f"  ! ScanPaths 部分失败: {res}", file=sys.stderr, flush=True)
+        else:
+            print(f"# 送扫 {len(paths)} 条 → Created={res.get('Created')} "
+                  f"Refreshed={res.get('Refreshed')} skipped={res.get('skipped', 0)}", flush=True)
+    except Exception as e:
+        fail.extend(paths)
+        print(f"  ! ScanPaths 失败 {type(e).__name__}: {str(e)[:120]}",
+              file=sys.stderr, flush=True)
     if fail:
         try:
             with open(NOTIFY_LOG, "a", encoding="utf-8") as f:

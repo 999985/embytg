@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -236,7 +237,16 @@ def main():
                 n24 += 1
                 per[j.get("ch") or "?"] = per.get(j.get("ch") or "?", 0) + 1
         detail = ("24h 订正 %d 条%s" % (n24, ("：" + ", ".join("%s=%d" % kv for kv in per.items())) if per else ""))
-        line(n24 <= 10, "转存画质虚标", detail if n24 else "无（标签与实际一致）")
+        # 命中率比绝对条数更能说明问题：luolimeimei 今日 20 条里 10 条标错 = 50%，
+        # 说明它的 2160p 标签不可信（落地名前 tgpipe 已按真实分辨率订正，故不影响画质，
+        # 只影响「这频道到底有多少 4K」的判断）。>10 条或占本批 >30% 都判 FAIL。
+        try:
+            _q = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "tgpipe.log")
+        except Exception:                                            # noqa: BLE001
+            _q = ""
+        line(n24 <= 10, "转存画质虚标", (detail + "｜占比 " + ", ".join(
+            "%s=%.0f%%" % (k, 100.0 * v / max(n24, 1)) for k, v in per.items())) if n24
+            else "无（标签与实际一致）")
     except Exception as e:                                          # noqa: BLE001
         line(False, "转存画质虚标", str(e)[:50])
 
@@ -271,6 +281,45 @@ def main():
     except Exception as e:                                          # noqa: BLE001
         line(False, "同片同画质重复", str(e)[:50])
 
+
+    # 4.55) 机器人自动补片是否在跑（2026-11-20 新增，每 6 小时一轮）
+    try:
+        _ylog = "/opt/embytg/logs/ysdq_auto.log"
+        if not os.path.exists(_ylog):
+            line(True, "机器人补片", "尚未运行（定时器 03/09/15/21:25）")
+        else:
+            _age = (time.time() - os.path.getmtime(_ylog)) / 3600.0
+            _tail = open(_ylog, encoding="utf-8", errors="replace").read()[-3000:]
+            _last = ""
+            for _ln in _tail.splitlines():
+                if _ln.startswith("  完成 成功="):
+                    _last = _ln.strip()
+            if _age > 13:
+                line(False, "机器人补片", "日志 %.0f 小时未更新，定时器可能失效" % _age)
+            else:
+                line(True, "机器人补片", "%s（%.0f 小时前）" % (_last or "有日志无小结", _age))
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "机器人补片", str(e)[:50])
+
+    # 4.54) 转存链路停摆（2026-11-20 事故：cursor 走满后 pending 行数不减，
+    # 队列闸永远判「够用」，转存静默停摆，定时器每分钟"成功"退出）
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import tgpipe as _T
+        _q = _T.load_json(_T.PENDING, {"items": [], "cursor": 0})
+        _remain = max(0, len(_q.get("items") or []) - int(_q.get("cursor") or 0))
+        _con = sqlite3.connect("file:%s?mode=ro" % os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "tg.db"), uri=True, timeout=10)
+        _cut = int(time.time()) - 6 * 3600
+        _recent = _con.execute("select count(*) from resource_state where landed_at>=?",
+                               (_cut,)).fetchone()[0]
+        _con.close()
+        if _remain == 0 and _recent == 0:
+            line(False, "转存队列", "队列未消费=0 且近6h零入库：补扫闸可能又卡住了")
+        else:
+            line(True, "转存队列", "未消费 %d 条，近6h 入库 %d 集" % (_remain, _recent))
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "转存队列", str(e)[:50])
 
     # 4.53) 电影缺识别锚点（2026-11-20 王牌误认事故沉淀）
     # Emby 认片靠「年份 + {tmdb=ID}」。文件名两者都没有时它会瞎猜

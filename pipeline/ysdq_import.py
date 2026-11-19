@@ -180,7 +180,10 @@ async def fetch_item(c, payload, wait=18.0):
             return
         if e.message.document and "doc" not in box:
             box["doc"] = e.message
-        elif not box.get("txt") and e.message.raw_text:
+        # 简介是**文件消息的 caption**，不是单独一条文本消息 ——
+        # 原来只在「没文件的消息」里取 txt，于是真正的标题/年份/分类全丢，
+        # 表现为「无年份不入库」。这里改成任何非空文本都收（优先带附件的）。
+        if e.message.raw_text and (not box.get("txt") or e.message.document):
             box["txt"] = e.message.raw_text
 
     await c.send_message(BOT, "/start " + payload)
