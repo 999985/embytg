@@ -126,6 +126,7 @@
   "renumber_decide.py",
   "renumber_plan.py",
   "renumber_todb.py",
+  "reprioritize_sources.py",
   "restore_drill.py",
   "restore_fetchers.py",
   "restore_to_new_host.sh",
@@ -147,6 +148,7 @@
   "todb_titles.py",
   "todb_watch.py",
   "web_lookup.py",
+  "ysdq_batch.py",
   "ysdq_import.py"
  ]
 }

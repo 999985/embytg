@@ -38,6 +38,9 @@ def existing_movies():
     have = set()
     for (rel,) in rows:
         base = os.path.basename(rel or "")
+        # 去掉 {tmdb=…} 与画质/容器尾巴，只留「片名 (年份)」
+        base = re.sub(r"\s*\{tmdb=\d+\}", "", base)
+        base = re.sub(r"\s*-\s*(2160p|1080p|720p|SD).*$", "", base)
         m = re.match(r"^(.+?)\s*\((\d{4})\)", base)
         if m:
             have.add((m.group(1).strip(), int(m.group(2))))
@@ -59,13 +62,16 @@ async def worker(slot, queue, env, stats, dry):
         GS.slot_release(slot, TAG)
         return
     ent = await c.get_entity(Y.BOT)
+    await c.send_message(ent, "/start")          # 每个号只在连接时重置一次会话
+    await asyncio.sleep(2.0)
     while True:
         try:
             title, year = queue.get_nowait()
         except asyncio.QueueEmpty:
             break
         try:
-            res = await Y.bot_search(c, title)
+            # 并发时机器人回得慢，单次 16s 会漏；重试 3 次，间隔带抖动
+            res = await Y.bot_search(c, title, wait=40.0)   # 只发一次，慢就等
             if not res:
                 print("  [slot%d] %s → 没搜到" % (slot, title))
                 stats["miss"] += 1
@@ -89,10 +95,19 @@ async def worker(slot, queue, env, stats, dry):
             genre = dm.group(1) if dm else ""
             t = Y.safe_name(pick["title"])
             y = pick["year"] or 0
+            _ty, _tid = Y.tmdb_lookup(t)
+            if not y and _ty:
+                y = _ty
+                print("  [slot%d] %s 年份由 TMDB 补全: %s" % (slot, t, y))
+            if not y:
+                print("  [slot%d] %s → 拿不到年份，跳过（无年份必被 Emby 认错片）" % (slot, t))
+                stats["miss"] += 1
+                continue
             q = pick["qual"]
             lib = Y.pick_dir(genre)
-            folder = "%s/%s (%s)" % (lib, t, y) if y else "%s/%s" % (lib, t)
-            name = "%s (%s) - %s.mkv" % (t, y, q) if y else "%s - %s.mkv" % (t, q)
+            anchor = " {tmdb=%s}" % (_tid or "") if _tid else ""
+            folder = "%s/%s (%s)%s" % (lib, t, y, anchor)
+            name = "%s (%s)%s - %s.mkv" % (t, y, anchor, q)
             fwd = await c.forward_messages(Y.STORE_CH, doc.id, from_peer=ent)
             mid = fwd[0].id if isinstance(fwd, list) else fwd.id
             TC.register(folder, name, [(mid, int(doc.document.size or 0))])
@@ -132,7 +147,15 @@ async def run(titles, slots, dry):
         name, year = (m.group(1), int(m.group(2))) if m else (t.strip(), 0)
         if not name:
             continue
-        dup = any((name == h[0] and (not year or year == h[1] or h[1] == 0)) for h in have)
+        def _hit(h):
+            hn, hy = h
+            if year and hy and abs(hy - year) > 1:
+                return False
+            if not hn:
+                return False
+            # 双向包含：库里叫「封神第一部：朝歌风云」，查询叫「封神第一部」
+            return hn == name or (len(name) >= 2 and name in hn) or (len(hn) >= 2 and hn in name)
+        dup = any(_hit(h) for h in have)
         if dup:
             skipped.append(name)
             continue
@@ -162,6 +185,7 @@ def main():
     ap.add_argument("--slots", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--apply", action="store_true", help="兼容参数：默认就是真跑")
     a = ap.parse_args()
     titles = list(a.title)
     if a.list:

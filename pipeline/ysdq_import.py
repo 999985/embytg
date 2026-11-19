@@ -17,6 +17,7 @@
 """
 import argparse
 import asyncio
+import json
 import os
 import re
 import sys
@@ -53,6 +54,15 @@ def load_env():
     return env
 
 
+CAM_WORDS = ("抢先版", "枪版", "抢鲜版", "TC版", "TS版", "HDTS", "HDTC", "枪鲜", "预告片", "花絮")
+
+
+def is_cam(text):
+    """抢先版/枪版一律不收：画质和音质都不可用，进了库等于污染画质策略。"""
+    t = text or ""
+    return any(w in t for w in CAM_WORDS)
+
+
 def parse_results(msg):
     """把一条搜索结果消息解析成 [{idx,text,title,year,qual,payload}]。"""
     out = []
@@ -72,7 +82,8 @@ def parse_results(msg):
         title = re.sub(r"\s+", " ", title)
         payload = ent.url.split("start=")[-1] if "start=" in (ent.url or "") else ""
         out.append({"idx": int(m.group(1)), "text": body, "title": title, "year": year,
-                    "qual": qual, "raw_q": head, "payload": payload})
+                    "qual": qual, "raw_q": head, "payload": payload,
+                    "cam": is_cam(body)})
     if out:
         return out
     # 机器人实际给的实体文本不含序号（"色，戒 高清 2007年"），序号在链接外面 ——
@@ -89,7 +100,7 @@ def parse_results(msg):
         payload = ent.url.split("start=")[-1] if "start=" in (ent.url or "") else ""
         if payload:
             out.append({"idx": i, "text": body, "title": title, "year": year, "qual": qual,
-                        "raw_q": head, "payload": payload})
+                        "raw_q": head, "payload": payload, "cam": is_cam(body)})
     return out
 
 
@@ -103,7 +114,10 @@ def best_match(results, query, year=0):
     if not results:
         return None
     q = query.strip()
-    cands = [r for r in results if (not year or r["year"] == year)] or list(results)
+    clean = [r for r in results if not r.get("cam")]
+    if not clean:
+        return None                      # 全是抢先版/枪版 → 当没搜到
+    cands = [r for r in clean if (not year or r["year"] == year)] or clean
     best, score = None, 0.0
     for r in cands:
         t = (r["title"] or "").strip()
@@ -121,12 +135,17 @@ def best_match(results, query, year=0):
             best, score = r, s
     return best if score >= 0.6 else None
 
-async def bot_search(c, keyword, wait=16.0):
-    """轮询最近消息（比事件handler稳：机器人有时改同一消息而不是发新消息）。"""
+async def bot_search(c, keyword, wait=35.0, start=False):
+    """发**一次**关键词，然后耐心轮询。
+
+    机器人只是回得慢（实测 10-30s），不是丢了：重发关键词只会让它重复劳动，
+    反而更慢、还刷屏。所以这里绝不重发，只把等待窗口拉长。
+    """
     ent = await c.get_entity(BOT)
-    # 必须先 /start：不重置会话，机器人对同一用户的连续搜索会静默不回
-    await c.send_message(ent, "/start")
-    await asyncio.sleep(3.5)
+    if start:
+        # 会话重置只做一次（每个号连上时做），不跟着每次搜索重复发
+        await c.send_message(ent, "/start")
+        await asyncio.sleep(3.0)
     last = await c.get_messages(ent, limit=1)
     before = last[0].id if last else 0
     await c.send_message(ent, keyword)
@@ -179,6 +198,49 @@ def pick_dir(desc):
     return DEFAULT_DIR
 
 
+def tmdb_lookup(title, kind="movie"):
+    """按片名查 TMDB，返回 (年份, tmdb_id)；查不到返回 (0, 0)。
+
+    为什么必须做：
+      1) 目录/文件名不带年份时，Emby 会按名字模糊匹配到别的年份的片
+         （实测「王牌 (2025)」被认成「王牌保镖 (2017)」）；
+      2) 不带 `{tmdb=ID}` 锚点时，Emby 全靠猜。库里历史文件全是
+         `片名 (年) {tmdb=ID} - 画质.ext`，所以新导入必须沿用同一格式。
+    拿不到就返回 0 —— 调用方据此拒绝入库，宁缺毋错。
+    """
+    import urllib.parse
+    import urllib.request
+    try:
+        from embytg_conf import cfg
+        api = cfg("tmdb_api").rstrip("/")
+        tk = cfg("tmdb_token")
+    except Exception:                                          # noqa: BLE001
+        return 0, 0
+    q = urllib.parse.urlencode({"query": title, "language": "zh-CN", "include_adult": "false"})
+    req = urllib.request.Request("%s/search/%s?%s" % (api, kind, q),
+                                 headers={"Authorization": "Bearer %s" % tk,
+                                          "accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read())
+    except Exception:                                          # noqa: BLE001
+        return 0, 0
+    best = (0, 0)
+    for it in (d.get("results") or [])[:8]:
+        nm = (it.get("title") or it.get("name") or "").strip()
+        if nm != title.strip():
+            continue
+        rd = it.get("release_date") or it.get("first_air_date") or ""
+        y = int(rd[:4]) if rd[:4].isdigit() else 0
+        if y and (y > best[0]):
+            best = (y, int(it.get("id") or 0))
+    return best
+
+
+def tmdb_year(title, kind="movie"):
+    return tmdb_lookup(title, kind)[0]
+
+
 def safe_name(s):
     return re.sub(r'[\\/:*?"<>|]', " ", s).strip()
 
@@ -187,7 +249,8 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--search", default="")
     ap.add_argument("--payload", default="")
-    ap.add_argument("--pick", type=int, default=1)
+    ap.add_argument("--pick", type=int, default=0,
+                    help="指定第几条；不填=按片名自动匹配，匹配不上就不入")
     ap.add_argument("--dir", default="", help="覆盖库目录，如 Movies/动作片")
     ap.add_argument("--apply", action="store_true")
     a = ap.parse_args()
@@ -203,13 +266,22 @@ async def main():
     if a.payload:
         item = {"payload": a.payload, "title": a.payload, "year": 0, "qual": "1080p"}
     else:
-        res = await bot_search(c, a.search)
+        res = await bot_search(c, a.search, start=True)
         if not res:
             print("  没搜到"); await c.disconnect(); return 2
-        print("  共 %d 条，前 8 条：" % len(res))
-        for r in res[:8]:
+        clean = [r for r in res if not r.get("cam")]
+        print("  共 %d 条（剔除抢先版/枪版 %d 条），前 8 条：" % (len(clean), len(res) - len(clean)))
+        for r in clean[:8]:
             print("   %-3s %-44s %s %s" % (r["idx"], r["text"][:44], r["year"], r["payload"]))
-        item = next((r for r in res if r["idx"] == a.pick), res[0])
+        if not clean:
+            print("  全部是抢先版/枪版，不收"); await c.disconnect(); return 2
+        if a.pick:
+            item = next((r for r in clean if r["idx"] == a.pick), clean[0])
+        else:
+            item = best_match(clean, a.search, 0)          # 不指定就按片名匹配，宁缺毋错
+            if not item:
+                print("  没有能对上「%s」的结果，不入库" % a.search)
+                await c.disconnect(); return 2
         print("  选中: %s" % item["text"])
 
     if not a.apply:
@@ -227,10 +299,19 @@ async def main():
 
     title = safe_name(item.get("title") or "未命名")
     year = item.get("year") or 0
+    _y, _tid = tmdb_lookup(title)
+    if not year and _y:
+        year = _y
+        print("  年份由 TMDB 补全: %s (%s) id=%s" % (title, year, _tid))
+    if not year:
+        print("  拿不到年份，不入库（无年份必被 Emby 认错片）：%s" % title)
+        await c.disconnect()
+        return 4
+    anchor = " {tmdb=%s}" % (_tid or "") if _tid else ""
     qual = item.get("qual") or "1080p"
     lib = a.dir or pick_dir(genre)
-    folder = "%s/%s (%s)" % (lib, title, year) if year else "%s/%s" % (lib, title)
-    name = "%s (%s) - %s.mkv" % (title, year, qual) if year else "%s - %s.mkv" % (title, qual)
+    folder = "%s/%s (%s)%s" % (lib, title, year, anchor)
+    name = "%s (%s)%s - %s.mkv" % (title, year, anchor, qual)
 
     fwd = await c.forward_messages(STORE_CH, doc.id, from_peer=await c.get_entity(BOT))
     mid = fwd[0].id if isinstance(fwd, list) else fwd.id

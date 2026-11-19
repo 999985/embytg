@@ -240,6 +240,83 @@ def main():
     except Exception as e:                                          # noqa: BLE001
         line(False, "转存画质虚标", str(e)[:50])
 
+    # 4.52) 同片同画质重复入库（2026-11-20 封神第一部事故沉淀）
+    # 用户策略是「低画质删不掉就并存，高画质并列」，所以同片名同一年份出现两条**不同画质**
+    # 是设计内的；真正要抓的是「同片名 + 同一年份 + 同一画质」两条 —— 那是重复导入。
+    try:
+        import urllib.parse as _up
+        import urllib.request as _ur
+        _b = EMBY
+        _t = TOKEN
+        _q = _up.urlencode({"IncludeItemTypes": "Movie", "Recursive": "true",
+                            "Fields": "Path,ProductionYear", "Limit": "5000"})
+        _d = json.loads(_ur.urlopen(_b + "/Items?" + _q + "&api_key=" + _t, timeout=40).read())
+        _seen = {}
+        for _it in _d.get("Items") or []:
+            _p = _it.get("Path") or ""
+            _base = os.path.basename(_p)
+            # 用**文件名**做键，不用 Emby 的 Name：Emby 会把「王牌 (2025)」误认成
+            # 「王牌保镖 (2017)」，按 Name+年份分组会误报（真重复 = 同名文件出现两份）
+            _key = re.sub(r"\s*-\s*(2160p|1080p|720p|SD).*$", "", os.path.splitext(_base)[0])
+            _qm = re.search(r"-\s*(2160p|1080p|720p|SD)", _base)
+            _ql = _qm.group(1) if _qm else "?"
+            _seen.setdefault((_key.strip(), _ql), []).append(_p)
+        _dups = {k: v for k, v in _seen.items() if len(v) > 1}
+        if _dups:
+            _s = "; ".join("%s(%s,%s)×%d" % (k[0][:12], k[1], k[2], len(v))
+                           for k, v in list(_dups.items())[:3])
+            line(False, "同片同画质重复", "%d 组：%s" % (len(_dups), _s))
+        else:
+            line(True, "同片同画质重复", "无")
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "同片同画质重复", str(e)[:50])
+
+
+    # 4.53) 电影缺识别锚点（2026-11-20 王牌误认事故沉淀）
+    # Emby 认片靠「年份 + {tmdb=ID}」。文件名两者都没有时它会瞎猜
+    # （「王牌 (2025)」被认成「王牌保镖 (2017)」）。新导入必须两个锚点之一，
+    # 这条检查是「以后别再犯」的兜底：0 = 全部有锚点。
+    try:
+        _q = urllib.parse.urlencode({"IncludeItemTypes": "Movie", "Recursive": "true",
+                                     "Fields": "Path", "Limit": "6000"})
+        _d = json.loads(urllib.request.urlopen(EMBY + "/Items?" + _q + "&api_key=" + TOKEN,
+                                              timeout=40).read())
+        _bad = []
+        for _it in _d.get("Items") or []:
+            _base = (_it.get("Path") or "").split("/")[-1]
+            if not re.search(r"\((\d{4})\)", _base) and "{tmdb=" not in _base:
+                _bad.append(_base)
+        line(not _bad, "电影识别锚点",
+             "0 条无锚点" if not _bad else "%d 条无年份无 tmdb：%s" % (len(_bad), " / ".join(_bad[:3])))
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "电影识别锚点", str(e)[:50])
+
+    # 4.51) emos 夜间 4K 补版窗口是否真在产出（2026-11-20 新增）
+    # 定时器 02:10 跑 emos_night.py，日志 /opt/embytg/logs/emos_night.log。
+    # 判据只看「最近一次运行」：跑了但 0 集成功 = 有问题；没跑 = 定时器挂了。
+    try:
+        elog = "/opt/embytg/logs/emos_night.log"
+        if not os.path.exists(elog):
+            line(True, "夜间4K补版", "尚未运行（定时器 02:10 首跑）")
+        else:
+            age_h = (time.time() - os.path.getmtime(elog)) / 3600.0
+            tail = open(elog, encoding="utf-8", errors="replace").read()[-4000:]
+            last = None
+            for ln in tail.splitlines():
+                if ln.startswith("  完成 "):
+                    last = ln.strip()
+            if age_h > 26:                     # 超过一天没动 = 定时器/服务挂了
+                line(False, "夜间4K补版", "日志 %.0f 小时未更新，定时器可能失效" % age_h)
+            elif last and "完成 0/" in last:
+                line(False, "夜间4K补版", "最近一轮 0 集成功：%s" % last)
+            else:
+                line(True, "夜间4K补版", "%s（%.0f 小时前）" % (last or "有日志无小结", age_h))
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "夜间4K补版", str(e)[:50])
+
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "转存画质虚标", str(e)[:50])
+
     # 4.51) 幻影台账：根目录 tg.db 空壳（2026-11-16 新增）
     # 真源只有 pipeline/tg.db。根目录那份被查询会读到 0 条 → 误判「台账全丢」。
     try:
