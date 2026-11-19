@@ -519,6 +519,7 @@ def verify(series_list, sample=10, strict_emby=False, only_file=None):
                         pass
         vids.sort(reverse=True)          # 最新入库优先，避免抽到旧集误判 PASS
         source_ph = None
+        _ph_season = None
         if only_file:
             vids = [v for v in vids if v[2] == only_file]
             if not vids:
@@ -538,8 +539,12 @@ def verify(series_list, sample=10, strict_emby=False, only_file=None):
                 m = re.search(r"<title>(.*?)</title>", open(nfo, encoding="utf-8", errors="ignore").read(), re.S)
                 title = (m.group(1).strip() if m else "")
                 if not title or PLACEHOLDER.match(title):
-                    if source_ph is None:
-                        source_ph = source_placeholders(lib, sdir)
+                    _m2 = SE.search(f)
+                    _season = int(_m2.group(1)) if _m2 else None
+                    _ep_no = int(_m2.group(2)) if _m2 else None
+                    if source_ph is None or _ph_season != _season:
+                        source_ph = source_placeholders(lib, sdir, _season or 1)
+                        _ph_season = _season
                     # 数据源整季都没有真标题时，NFO 占位属来源限制，不冒充刮削失败。
                     #
                     # 2026-11-14（E085）：**部分集没有真标题也不该让整条收尾失败**。
@@ -551,19 +556,17 @@ def verify(series_list, sample=10, strict_emby=False, only_file=None):
                     # 判据改成：**本集占位且数据源这一集确实没有真标题** → 记 warning，
                     # 不算失败。真故障（数据源有标题却没写进 NFO）仍然 FAIL。
                     _ep_no = None
-                    try:
-                        _m = SE.search(f)
-                        if _m:
-                            _ep_no = int(_m.group(1))
-                    except Exception:                  # noqa: BLE001
-                        _ep_no = None
+                    _m2 = SE.search(f)
+                    if _m2:
+                        _ep_no = int(_m2.group(2))
                     _src_lacks = (source_ph[0] > 0 and source_ph[1] == 0)
                     if not _src_lacks and _ep_no is not None:
-                        # 逐集确认：该集在数据源里是否真的没有标题
+                        # 逐集确认：该集在数据源里是否真的没有标题（季号必须一起传，
+                        # 否则只会查 S1 —— 法警小队 S02E05 就是这么被误判成故障的）
                         try:
                             from ingest_review import episode_has_real_title
                             _src_lacks = not episode_has_real_title(
-                                lib, sdir, _ep_no)
+                                lib, sdir, _ep_no, _season)
                         except Exception:              # noqa: BLE001
                             _src_lacks = False
                     if not _src_lacks:

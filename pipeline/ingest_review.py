@@ -108,38 +108,48 @@ def nfo_gaps():
     return n
 
 
-def source_placeholders(lib, sdir, cache={}):
-    """判断该剧在数据源里是否本身就是占位标题（TMDB 全是「第 N 集」）。
+def source_placeholders(lib, sdir, season=1, cache={}):
+    """判断该季在数据源里是否本身就是占位标题（TMDB 全是「第 N 集」）。
     返回 (总集数, 非占位数)；拿不到返回 (0,0)。
-    目的：区分「流程没写标题」与「数据源根本没标题」，避免每天误报。"""
-    if sdir in cache:
-        return cache[sdir]
+    目的：区分「流程没写标题」与「数据源根本没标题」，避免每天误报。
+
+    2026-11-19：季号由调用方给 —— 原来写死 season/1，S02+ 的占位集永远按
+    「第一季有真标题」判成故障（与 episode_has_real_title 同一个根因）。"""
+    _key = (sdir, int(season or 1))
+    if _key in cache:
+        return cache[_key]
     m = re.search(r"\{tmdb=(\d+)\}", sdir)
     if not m:
-        cache[sdir] = (0, 0)
-        return cache[sdir]
+        cache[_key] = (0, 0)
+        return cache[_key]
     try:
         k = CFG["tmdb_api_key"]
-        u = "%s/tv/%s/season/1?api_key=%s&language=zh-CN" % (CFG["tmdb_api"], m.group(1), k)
+        u = "%s/tv/%s/season/%d?api_key=%s&language=zh-CN" % (
+            CFG["tmdb_api"], m.group(1), int(season or 1), k)
         d = json.loads(urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}),
                                               timeout=25).read().decode())
         names = [e.get("name") or "" for e in d.get("episodes", [])]
         good = sum(1 for n in names if n and not PLACEHOLDER.match(n))
-        cache[sdir] = (len(names), good)
+        cache[_key] = (len(names), good)
     except Exception:                                              # noqa: BLE001
-        cache[sdir] = (0, 0)
-    return cache[sdir]
+        cache[_key] = (0, 0)
+    return cache[_key]
 
 
-def episode_has_real_title(lib, sdir, ep_no, cache={}):
+def episode_has_real_title(lib, sdir, ep_no, season=None, cache={}):
     """该集在数据源（TMDB）里是否有真实标题。
 
     2026-11-14（E085）：`source_placeholders` 只能回答「整季都没有标题」，
     但真实情况更细：FX战士久留美 S01 共 12 集，7 集有真标题、5 集没有。
     收尾验收把「某集没标题」判成 FAIL，导致 claim 永不释放、卡死整条链路。
     这里按集号精确判断，只有「这一集确实没有」才豁免。
+
+    2026-11-19（本轮）：**季号必须由调用方给。** 原来从 `sdir`（剧目录）里
+    `re.search(r"Season\\s*(\\d+)")`，而剧目录永远不带 Season → 恒等于 1：
+    法警小队 S02E05 拿 S1E5 的「迷失少女」比对，判成「源有标题」→ 收尾 FAIL
+    （S02+ 的占位集全中）。现在调用方传集实际所在季，缺省时才算 1。
     """
-    key = (sdir, int(ep_no))
+    key = (sdir, int(season or 0), int(ep_no))
     if key in cache:
         return cache[key]
     m = re.search(r"\{tmdb=(\d+)\}", sdir)
@@ -148,10 +158,11 @@ def episode_has_real_title(lib, sdir, ep_no, cache={}):
         return cache[key]
     try:
         k = CFG["tmdb_api_key"]
-        sm = re.search(r"Season\s*(\d+)", sdir, re.I)
-        season = int(sm.group(1)) if sm else 1
+        if not season:
+            sm = re.search(r"Season\s*(\d+)", sdir, re.I)
+            season = int(sm.group(1)) if sm else 1
         u = "%s/tv/%s/season/%d?api_key=%s&language=zh-CN" % (
-            CFG["tmdb_api"], m.group(1), season, k)
+            CFG["tmdb_api"], m.group(1), int(season), k)
         d = json.loads(urllib.request.urlopen(
             urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}),
             timeout=25).read().decode())
