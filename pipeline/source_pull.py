@@ -72,8 +72,8 @@ _SEARCH_TTL_HIT = 3 * 86400
 _SEARCH_TTL_MISS = 6 * 3600
 # L2：**磁盘**缓存。这是关键——`gha_next3.py` 每个周期是一个新进程，只处理一个决策，
 # 所以进程内字典跨不了周期，等于没做。真正省配额的是这个 SQLite 表。
-_SEARCH_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          ".src_search_cache.db")
+_SEARCH_DB = os.environ.get("EMBYTG_SRC_CACHE_DB") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".src_search_cache.db")
 
 
 def human(n):
@@ -101,6 +101,12 @@ def _norm_title(s):
 # 剧集列表是「一天变一次」（日更剧）甚至「一周变一次」（周更剧），
 # 24 小时滞后对入库没有任何实际影响 —— 一天有 24 小时去捡。
 _EP_TTL = 24 * 3600
+# 2026-11-19（E184）：负缓存。列集失败（超时 / 5xx / 429）以前**不缓存**，于是
+# 同一部剧、同一个源、同一条 URL 被同一轮决策反复重试：实测 11-18 一天 168 次
+# 失败列集里 120 次是重复（48 个不同键），aaa.yusen6 一条 25s 超时 2 分钟内重打 5 次
+# ——单键一天白烧 125 秒 + 5 次配额。失败结果按 (源,路径) 记 10 分钟，
+# 窗口内**照旧抛同样的异常**给上层（语义不变：仍然失败），只是不再打源站。
+_EP_ERR_TTL = int(float(os.getenv("EMBYTG_EP_ERR_TTL", "600")))
 _EP_CACHE = {}
 
 
@@ -128,8 +134,18 @@ def cache_stats():
         c.execute("CREATE TABLE IF NOT EXISTS cache_stat(kind TEXT PRIMARY KEY, n INTEGER)")
         for k, n in c.execute("SELECT kind,n FROM cache_stat").fetchall():
             out[k] = int(n)
+        # 2026-11-19（E184）：**活行数**要跟命中率一起看。
+        # 之前只看「命中 5115 / 未命中 5174」会以为缓存健康，而表里只有 6 行 ——
+        # 命中数掩盖了「写入没落地」。现在一条命令同时给出行数与写入错误计数。
+        try:
+            out["ep_rows"] = int(c.execute(
+                "SELECT count(*) FROM ep_cache WHERE k NOT LIKE '!err%'").fetchone()[0])
+            out["ep_err_rows"] = int(c.execute(
+                "SELECT count(*) FROM ep_cache WHERE k LIKE '!err%'").fetchone()[0])
+        except Exception:                                        # noqa: BLE001
+            pass
         c.close()
-    except Exception:                                       # noqa: BLE001
+    except Exception:                                            # noqa: BLE001
         pass
     return out
 
@@ -154,17 +170,78 @@ def _ep_l2_get(k, now):
 
 
 def _ep_l2_put(k, rec):
+    """写 L2。失败**必须可见**：原来 except: pass 让「缓存写了 5000 次只留下 6 行」
+    这种事故静默了四天（2026-11-19 排查实录）。现在失败计入 cache_stat。"""
+    c = None
     try:
         ts, data = rec
+        now = time.time()
         c = _l2_conn()
         c.execute("CREATE TABLE IF NOT EXISTS ep_cache(k TEXT PRIMARY KEY, ts REAL, body TEXT)")
         c.execute("INSERT OR REPLACE INTO ep_cache VALUES(?,?,?)",
                   (k, ts, json.dumps(data, ensure_ascii=False)))
-        c.execute("DELETE FROM ep_cache WHERE ts < ?", (ts - _EP_TTL * 4,))
+        # 2026-11-19（E184）：清理基准原本是**记录自己的 ts** —— 任何一条时间单位错的
+        # 记录（ms / 0 / 未来时间）都会一次性清空整张表，而异常被吞掉，没人看得见。
+        # 改成当前墙钟做基准；一次删超过 50 条记成 ep_purge_bulk，把「整表被抹」变成
+        # 可观测事件（本次排查就是因为这个盲区多花了一小时）。
+        c.execute("CREATE TABLE IF NOT EXISTS cache_stat(kind TEXT PRIMARY KEY, n INTEGER)")
+        cur = c.execute("DELETE FROM ep_cache WHERE k NOT LIKE '!err%' AND ts < ?",
+                        (now - _EP_TTL * 4,))
+        if (cur.rowcount or 0) > 50:
+            c.execute("INSERT INTO cache_stat(kind,n) VALUES('ep_purge_bulk',1) "
+                      "ON CONFLICT(kind) DO UPDATE SET n=n+1")
         c.commit()
         c.close()
-    except Exception:                                       # noqa: BLE001
-        pass
+    except Exception as e:                                       # noqa: BLE001
+        try:
+            if c is not None:
+                c.close()
+        except Exception:                                        # noqa: BLE001
+            pass
+        _stat("ep_put_err:" + type(e).__name__)
+
+
+# ---- 列集负缓存（2026-11-19 / E184）----
+# 失败也记一笔：同一 (源,路径) 在 _EP_ERR_TTL 内直接抛同样的错，不再打源站。
+_EP_ERR_PREFIX = "!err\x1f"
+
+
+def _ep_err_get(k, now):
+    try:
+        c = _l2_conn()
+        c.execute("CREATE TABLE IF NOT EXISTS ep_cache(k TEXT PRIMARY KEY, ts REAL, body TEXT)")
+        row = c.execute("SELECT ts, body FROM ep_cache WHERE k=?",
+                        (_EP_ERR_PREFIX + k,)).fetchone()
+        c.close()
+        if not row:
+            return None
+        ts, body = row
+        if now - float(ts) >= _EP_ERR_TTL:
+            return None
+        _stat("ep_err_hit")
+        return (json.loads(body or "{}") or {}).get("err") or "cached failure"
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _ep_err_put(k, msg):
+    c = None
+    try:
+        now = time.time()
+        c = _l2_conn()
+        c.execute("CREATE TABLE IF NOT EXISTS ep_cache(k TEXT PRIMARY KEY, ts REAL, body TEXT)")
+        c.execute("INSERT OR REPLACE INTO ep_cache VALUES(?,?,?)",
+                  (_EP_ERR_PREFIX + k, now,
+                   json.dumps({"err": str(msg)[:200]}, ensure_ascii=False)))
+        c.execute("DELETE FROM ep_cache WHERE k LIKE '!err%' AND ts < ?", (now - _EP_ERR_TTL,))
+        c.commit()
+        c.close()
+    except Exception:                                            # noqa: BLE001
+        try:
+            if c is not None:
+                c.close()
+        except Exception:                                        # noqa: BLE001
+            pass
 
 
 def _ep_get(g, st, path):
@@ -192,11 +269,17 @@ def _ep_get(g, st, path):
     if l2 is not None:
         _EP_CACHE[key] = l2
         return l2[1]
+    # 2026-11-19（E184）：近期失败过就直接抛，不再打源站（负缓存 10 分钟）。
+    err = _ep_err_get(k, now)
+    if err is not None:
+        raise RuntimeError("源 %s 列集近 %ds 内失败过（负缓存）：%s"
+                           % (key[0], _EP_ERR_TTL, err))
     data = None
     try:
         data = g.get(st, path)
     except Exception as e:                                          # noqa: BLE001
         if not any(s in str(e) for s in ("400", "404")):
+            _ep_err_put(k, e)
             raise
         # ① Limit 降级：同一路径换成后端能接受的分页大小
         for lim in ("500", "200", "100"):
@@ -208,6 +291,7 @@ def _ep_get(g, st, path):
                 break
             except Exception as e2:                                 # noqa: BLE001
                 if not any(s in str(e2) for s in ("400", "404")):
+                    _ep_err_put(k, e2)
                     raise
         # ② 端点改写：没实现 /Shows/{id}/Episodes 的源走 /Items?SeriesId=
         if data is None:
@@ -225,9 +309,11 @@ def _ep_get(g, st, path):
                 except Exception as e3:                             # noqa: BLE001
                     last = e3
                     if not any(s in str(e3) for s in ("400", "404")):
+                        _ep_err_put(k, e3)
                         raise
             if data is None:
                 if last is not None:
+                    _ep_err_put(k, last)
                     raise last
                 raise RuntimeError("源 %s 改写端点后仍无可用返回" % st.label)
     rec = (now, data)
@@ -981,8 +1067,12 @@ if __name__ == "__main__":
         tot = hit + miss
         print("列集缓存：命中 %d / 未命中 %d / 命中率 %.1f%%"
               % (hit, miss, (100.0 * hit / tot) if tot else 0.0))
+        print("  活行数 %s / 负缓存行 %s / 写入错误 %s / 批量清理 %s"
+              % (st.get("ep_rows", "?"), st.get("ep_err_rows", "?"),
+                 sum(v for k, v in st.items() if k.startswith("ep_put_err:")),
+                 st.get("ep_purge_bulk", 0)))
         for k in sorted(st):
-            if not k.startswith("ep_"):
+            if not k.startswith("ep_") and k not in ("ep_rows", "ep_err_rows"):
                 print("  %s: %d" % (k, st[k]))
         sys.exit(0)
     sys.exit(main())
