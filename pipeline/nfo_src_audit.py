@@ -61,17 +61,24 @@ def _api(base, tok, path, timeout=180):
         return json.loads(r.read() or b"{}")
 
 
-def emby_episodes():
-    """全库 Episode（Name/Path/Overview），分页拉取 —— N=20 万时只是一次 O(N) 扫描。"""
+def emby_episodes(days=0):
+    """Episode（Name/Path/Overview）。days>0 时只要近 N 天新增（Emby MinDateCreated）。
+
+    2026-11-19：全库扫描 1.4 万集要几分钟，而绝大多数缺口是历史存量（源本来就没有），
+    每天重扫一遍没有收益。日常巡检用 --days 7 只看新增，全量审计再手动跑。
+    """
     from embytg_conf import cfg
     base = (cfg("emby_url") or "http://127.0.0.1:8096").rstrip("/")
     tok = cfg("emby_token")
     limit = int(os.environ.get("NFO_AUDIT_LIMIT") or 1000)
     out, start = [], 0
     while True:
-        q = urllib.parse.urlencode({"Recursive": "true", "IncludeItemTypes": "Episode",
-                                    "Fields": "Overview,Path", "Limit": limit,
-                                    "StartIndex": start})
+        _q = {"Recursive": "true", "IncludeItemTypes": "Episode",
+              "Fields": "Overview,Path", "Limit": limit, "StartIndex": start}
+        if days:
+              _q["MinDateCreated"] = time.strftime(
+                  "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
+        q = urllib.parse.urlencode(_q)
         d = _api(base, tok, "/Items?" + q, timeout=240)
         it = d.get("Items") or []
         out += it
@@ -104,6 +111,8 @@ def main():
     ap.add_argument("--apply", action="store_true", help="写 NFO（真名优先，无真名写「剧名 第N集」）")
     ap.add_argument("--plot", action="store_true", help="顺带补缺失简介（写 NFO，不改标题）")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--days", type=int, default=0,
+                    help="只看近 N 天新增（0=全库；日常巡检建议 7）")
     a = ap.parse_args()
 
     import nfo_episodes_tmdb as NT
@@ -111,7 +120,7 @@ def main():
     import todb_titles as TT
 
     t0 = time.time()
-    items = emby_episodes()
+    items = emby_episodes(a.days)
     # 1) 候选：①Name 整条是占位；②Name == 文件名主干（=没有 NFO 或 NFO 标题就是文件名）
     cand, noplot = {}, 0
     for it in items:

@@ -755,7 +755,9 @@ def main():
         except Exception:                                          # noqa: BLE001
             _aud = {}
         if (not _aud) or (time.time() - float(_aud.get("ts") or 0) > _ttl):
-            _r = subprocess.run([sys.executable, os.path.join(HERE, "nfo_src_audit.py"), "--json"],
+            # 日常巡检只看近 7 天新增（全量 1.4 万集要几分钟，且历史缺口源本来就没有）
+            _r = subprocess.run([sys.executable, os.path.join(HERE, "nfo_src_audit.py"),
+                                 "--days", "7", "--json"],
                                 capture_output=True, text=True, timeout=1800)
             try:
                 _aud = json.load(open(_aud_p, encoding="utf-8"))
