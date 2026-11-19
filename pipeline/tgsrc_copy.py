@@ -86,7 +86,22 @@ def upload(env, slot, path):
     env2 = dict(os.environ)
     env2.update({k: v for k, v in env.items()})
     print("  上传: %s" % " ".join(cmd[1:]), flush=True)
-    r = subprocess.run(cmd, env=env2, capture_output=True, text=True)
+    # 2026-11-19：原来没有 timeout、且 capture_output 把进度全吞进内存 ——
+    # 2.09GB 那单卡了 40 分钟，日志里既没进度也没报错，无从判断是慢还是死。
+    # 现在按体积给预算（下限 20 分钟，按 8MB/s 估），超时就杀并打印尾部。
+    try:
+        _sz = os.path.getsize(path)
+    except OSError:
+        _sz = 0
+    _budget = max(1200, int(_sz / (8 * 1e6)) + 600)
+    try:
+        r = subprocess.run(cmd, env=env2, capture_output=True, text=True, timeout=_budget)
+    except subprocess.TimeoutExpired as _te:
+        _tail = ((_te.stdout or b"") if isinstance(_te.stdout, bytes) else (_te.stdout or ""))
+        if isinstance(_tail, bytes):
+            _tail = _tail.decode("utf-8", "ignore")
+        print("  上传超时（%ds，%.2fGB）：%s" % (_budget, _sz / 1e9, str(_tail)[-300:]), flush=True)
+        raise SystemExit("上传超时")
     out = (r.stdout or "") + (r.stderr or "")
     mani = ""
     for line in out.splitlines():
