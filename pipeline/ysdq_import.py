@@ -201,6 +201,20 @@ def pick_dir(desc):
     return DEFAULT_DIR
 
 
+def norm_key(s):
+    """比较用的归一化键：去掉标点/空格/版本词，只留中文与字母数字。
+
+    实测必要性：库里叫「那夜凌晨，我坐上了旺角开往大埔的红VAN」，
+    机器人给的是「那夜凌晨我坐上了旺角开往大埔的红VAN」——只差一个逗号，
+    按原串比较就判不出重复，于是同一部片被转存了两遍（各 2.53GB）。
+    """
+    s = (s or "").strip()
+    for w in ("原声版", "原声", "普通话", "国语", "粤语", "蓝光", "4K高清", "高清",
+              "抢先版", "枪版", "加长版", "导演剪辑版"):
+        s = s.replace(w, "")
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", s).lower()
+
+
 def tmdb_lookup(title, kind="movie"):
     """按片名查 TMDB，返回 (年份, tmdb_id)；查不到返回 (0, 0)。
 
@@ -231,7 +245,7 @@ def tmdb_lookup(title, kind="movie"):
     best = (0, 0)
     for it in (d.get("results") or [])[:8]:
         nm = (it.get("title") or it.get("name") or "").strip()
-        if nm != title.strip():
+        if norm_key(nm) != norm_key(title):
             continue
         rd = it.get("release_date") or it.get("first_air_date") or ""
         y = int(rd[:4]) if rd[:4].isdigit() else 0

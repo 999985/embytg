@@ -148,6 +148,7 @@
   "todb_titles.py",
   "todb_watch.py",
   "web_lookup.py",
+  "ysdq_auto.py",
   "ysdq_batch.py",
   "ysdq_import.py"
  ]
