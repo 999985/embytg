@@ -113,6 +113,7 @@
   "pc_register.py",
   "prewarm_daemon.py",
   "prewarm_ffprobe.sh",
+  "probe_bot.py",
   "probe_restricted_channels.py",
   "probe_sidesvc.sh",
   "probe_source_servers.py",
@@ -145,6 +146,7 @@
   "todb_sync.py",
   "todb_titles.py",
   "todb_watch.py",
-  "web_lookup.py"
+  "web_lookup.py",
+  "ysdq_import.py"
  ]
 }
