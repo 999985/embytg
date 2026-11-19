@@ -27,7 +27,7 @@ import sys
 
 sys.path.insert(0, "/opt/embytg/pipeline")
 
-FLOOR = {"2160p": 3.5, "1080p": 1.0, "720p": 0.5}
+FLOOR = {"2160p": 2.0, "1080p": 0.8, "720p": 0.4}
 FLOOR_DEFAULT = 0.6
 
 

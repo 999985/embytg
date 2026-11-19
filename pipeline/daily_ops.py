@@ -333,7 +333,7 @@ def main():
                 continue
             _m = _sz * 8 / _dur / 1e6
             _nm = (_it.get("Path") or "").split("/")[-1]
-            _floor = 3.5 if "2160p" in _nm else 1.0 if "1080p" in _nm else 0.5
+            _floor = 2.0 if "2160p" in _nm else 0.8 if "1080p" in _nm else 0.4
             if _m < _floor:
                 _low.append("%s(%.1fMbps/%.0fMB)" % (_nm[:24], _m, _sz / 1e6))
                 # 闸门上线后仍进来的才算回归；历史存量只报数不算失败

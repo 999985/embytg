@@ -122,12 +122,24 @@ def load_upgrade(limit):
             "quality": q, "rank": rank, "rel": r["rel"],
             "size": int(r["size"] or 0),
         }
+    # 2026-11-19：低码率集（标着 2160p 但实测只有 1-2 Mbps）原来永远进不了 upgrade
+    # 队列 —— 判据只看 rank>=4 就跳过。这里把它们注入，标记 reason=low_bitrate。
+    # 默认关闭（UPGRADE_LOWQ=1 开启），因为下游还要配合「同画质更高码率」替换逻辑。
+    lowq = set()
+    if os.environ.get("UPGRADE_LOWQ") == "1":
+        try:
+            import json as _j
+            for x in _j.load(open(os.path.join(HERE, ".lowq_library.json"), encoding="utf-8")):
+                lowq.add(((x.get("series") or "").strip(), int(x.get("ep") or 0)))
+        except Exception:                                  # noqa: BLE001
+            lowq = set()
     candidates = []
     for sid, s in series.items():
         eps = s.pop("eps")
         qmax = max((v["rank"] for v in eps.values()), default=0)
         for (season, ep), v in sorted(eps.items()):
-            if v["rank"] >= 4:
+            _is_lowq = (s["series"].strip(), ep) in lowq
+            if v["rank"] >= 4 and not _is_lowq:
                 continue
             candidates.append({
                 **s,
@@ -137,6 +149,7 @@ def load_upgrade(limit):
                 "current_rel": v["rel"],
                 "current_size": v.get("size") or 0,
                 "target_quality": "2160p",
+                "reason": "low_bitrate" if _is_lowq else "resolution",
                 "priority": (2 if qmax < 4 else 1, v["rank"], -season, -ep),
             })
     candidates.sort(key=lambda x: (x["priority"], x["tmdb"], x["season"], x["ep"]))

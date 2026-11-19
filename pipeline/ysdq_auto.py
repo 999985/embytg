@@ -117,8 +117,10 @@ def links_of(msg):
 
 
 PACE = "/opt/embytg/pipeline/.ysdq_pace.json"
-MIN_GAP = 90          # 同一账号两次发消息的最小间隔（秒）
-HOUR_CAP = 8          # 每个号每小时最多发几条消息（含搜索/取片）
+MIN_GAP = 60          # 同一账号两次发消息的最小间隔（秒）
+# 用户口径（2026-11-19）：限流是「发太快」触发的，不是小时总量。
+# 1 分钟一条稳定发，小时量可以很高；所以间隔是主约束，小时上限只做兜底。
+HOUR_CAP = 60         # 与 60s 间隔一致：1 条/分钟/号 → 4 号 = 240 条/小时
 
 
 def _pace_load():
@@ -503,7 +505,17 @@ def real_hint(first):
 
 
 async def run(keyword, pages, slots, dry, cap, payloads=None, only_4k=False):
-    leased = [n for n in range(1, slots + 1) if GS.slot_lease(n, TAG, ttl=3600)]
+    # 号是上传 lane 与机器人补片**共用**的排他资源：上传 job 期间拿不到。
+    # --wait-slot 给一个等待窗口，等上传 job 结束再抢（否则一到点就空跑一轮）。
+    import os as _os
+    _wait = int(_os.environ.get("YSDQ_WAIT_SLOT", "0") or 0)
+    _deadline = time.time() + _wait
+    leased = []
+    while True:
+        leased = [n for n in range(1, slots + 1) if GS.slot_lease(n, TAG, ttl=3600)]
+        if leased or time.time() >= _deadline:
+            break
+        await asyncio.sleep(60)
     # 冷却中的号（FloodWait）不能当扫描器，否则整轮空转
     pace = _pace_load()
     now = time.time()

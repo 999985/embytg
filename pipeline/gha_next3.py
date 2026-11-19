@@ -955,6 +955,36 @@ def same_label_better(c, cur_size, ratio=None):
     return bool(cur) and sz >= cur * r
 
 
+def cand_score(c, item):
+    """候选排序键：分辨率 → 码率 → 帧率（用户 2026-11-19：三者都要看，选最好的）。
+
+    码率用「体积 × 8 / 时长」算真实值；拿不到时长就用条目 runtime（默认 40 分钟）。
+    帧率取源站给的 fps（有就比，没有按 0，不会因此把候选压下去）。
+    """
+    q = c.get("quality") or {}
+    res = rank_of(q.get("label"))
+    size = float(c.get("size") or 0)
+    dur = 0
+    for k in ("duration", "runtime", "duration_sec"):
+        try:
+            dur = float((c.get("episode") or {}).get(k) or q.get(k) or c.get(k) or 0)
+        except (TypeError, ValueError):
+            dur = 0
+        if dur:
+            break
+    if not dur:
+        try:
+            dur = float(item.get("runtime") or 0) * 60
+        except (TypeError, ValueError):
+            dur = 0
+    mbps = (size * 8 / dur / 1e6) if (dur and size) else 0.0
+    try:
+        fps = float(q.get("fps") or (c.get("episode") or {}).get("fps") or 0)
+    except (TypeError, ValueError):
+        fps = 0.0
+    return (res, round(mbps, 2), round(fps, 1))
+
+
 def upgrade_target(item, cands, min_bytes, max_bytes):
     current_rank = rank_of(item.get("current_quality"))
     good = [c for c in cands if rank_of(c["quality"]["label"]) > current_rank]
@@ -970,6 +1000,8 @@ def upgrade_target(item, cands, min_bytes, max_bytes):
     good, reasons = valid_candidates(good, min_bytes, max_bytes)
     if not good:
         return None, "no_higher_quality" + ((":" + ",".join(reasons[:4])) if reasons else "")
+    # 分辨率相同的一批里，按码率→帧率再排一次，别拿"分辨率对了但码率更差"的那份
+    good.sort(key=lambda c: cand_score(c, item), reverse=True)
     c = good[0]
     q = c["quality"]["label"]
     if rank_of(q) < 2:

@@ -148,6 +148,7 @@
   "todb_sync.py",
   "todb_titles.py",
   "todb_watch.py",
+  "upgrade_episodes.py",
   "web_lookup.py",
   "ysdq_auto.py",
   "ysdq_batch.py",
