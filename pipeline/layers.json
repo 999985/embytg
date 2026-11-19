@@ -80,6 +80,7 @@
   "build_ingest_worklist.py",
   "build_three_queues.py",
   "check_layout.py",
+  "clean_dup_items.py",
   "dedupe_episodes.py",
   "dedupe_movies.py",
   "disk_watch.sh",

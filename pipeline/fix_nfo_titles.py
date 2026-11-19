@@ -20,7 +20,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 ROOTS = "/opt/embytg/mnt/embytg/TV"
-SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
+SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})")
 VIDEO_EXT = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".m4v"}
 QUAL_RE = re.compile(r"(2160p|1080p|720p|480p|SD|4K|UHD)", re.I)
 

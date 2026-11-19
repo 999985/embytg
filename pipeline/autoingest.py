@@ -52,7 +52,7 @@ ORACLE_MEDIA_DISABLED = os.path.join(HERE, ".oracle_media_ingest.disabled")
 CFG = json.load(open("/opt/embytg/config.json", encoding="utf-8"))
 TGDB = os.path.join(HERE, "tg.db")
 PC_REGISTER = os.path.join(HERE, "pc_register.py")
-SE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
+SE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})")
 TMDB = CFG["tmdb_api"]
 KEY = CFG["tmdb_api_key"]
 

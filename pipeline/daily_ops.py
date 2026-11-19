@@ -790,6 +790,14 @@ def main():
         line(r.returncode == 0, "阈值", tail[-1] if tail else "已刷新")
     except Exception as e:                                          # noqa: BLE001
         line(False, "阈值", str(e)[:60])
+    # 源优先级按真实产出重排（静态文件会腐烂：死源压着出片源，每轮先撞墙再熔断）
+    try:
+        r = subprocess.run([sys.executable, os.path.join(HERE, "reprioritize_sources.py")],
+                           capture_output=True, text=True, timeout=60)
+        tail = [l.strip() for l in (r.stdout or "").strip().splitlines() if l.strip()]
+        line(r.returncode == 0, "源优先级", tail[0] if tail else "已按真实产出对齐")
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "源优先级", str(e)[:60])
 
     # 5) 入库（GHA，2026-11-11 起媒体数据面移交 GitHub Actions）
     sec("5) 入库（韩国 runner）")

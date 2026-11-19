@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nfo_sidecar import rename_with_sidecars        # noqa: E402
 
 VIDEO_EXT = {".mp4", ".mkv", ".ts"}
-SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
+SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})")
 CFG = json.load(open("/opt/embytg/config.json", encoding="utf-8"))
 
 

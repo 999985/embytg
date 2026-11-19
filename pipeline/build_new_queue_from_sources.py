@@ -198,6 +198,23 @@ def load_source_priority():
             out[str(k)] = int(v)
         except (TypeError, ValueError):
             continue                       # 单个坏值跳过，不影响其他源
+    # 2026-11-20：静态文件会腐烂 —— 源站状态天天变，而数字是人写的。
+    # 有产出的源必须永远排在没产出的源前面，所以消费方每轮按**真实 ok 产出**
+    # 重排一次（reprioritize_sources.rank），不再依赖有人记得跑那个脚本。
+    # 回归用例 test_producing_source_outranks_dead 就是这条不变式。
+    try:
+        import reprioritize_sources as _RP
+        _budget = {}
+        try:
+            with open(os.path.join(HERE, ".gha_src_budget.json"), encoding="utf-8") as f:
+                _budget = (json.load(f) or {}).get("sources") or {}
+        except Exception:                                  # noqa: BLE001
+            pass
+        live = _RP.rank(d, _budget)
+        if live:
+            out = live
+    except Exception:                                      # noqa: BLE001
+        pass                               # 重排失败退回静态值，不阻断建队列
     return out
 
 

@@ -43,6 +43,49 @@ def speed_of(measured, key):
         return 0.0
 
 
+def rank(prio, budget_sources):
+    """按真实产出算出应有的优先级，**不读写文件**。
+
+    2026-11-20：判据必须是「有产出的源永远高于没产出的源」，而
+    `config/source_priority.json` 是人写的、会腐烂（yuntv 全端点 403 后
+    仍压着在出片的源，每条 lane 先撞墙再熔断，回归用例
+    `test_producing_source_outranks_dead` 直接 FAIL）。
+    所以把规则做成函数，消费方（build_new_queue_from_sources）每轮直接调用，
+    不再依赖「有人记得跑 reprioritize_sources.py」。
+
+    `ok` 是**当日**计数（预算文件按日重置），所以：
+      - 今天一次成功都没有（刚过 00:00）→ 返回 {}，由调用方沿用静态值，
+        不能把所有源一起沉底；
+      - 有成功记录 → 按 ok 降序排，ok==0 一律进死源档；
+      - 只在预算文件里出现过的新源也参与排序（加一个源自动生效）。
+    """
+    prio = prio or {}
+    budget_sources = budget_sources or {}
+    measured = prio.get("_measured") or {}
+    verified = set(prio.get("_verified_top") or [])
+    labels = {k for k in prio if not str(k).startswith("_")}
+    labels |= {k for k in budget_sources if not str(k).startswith("_")}
+    labels = sorted(labels)
+    ok = {k: int(((budget_sources or {}).get(k) or {}).get("ok") or 0)
+          for k in labels}
+    if not any(ok.values()):
+        return {}
+
+    producing = sorted([k for k in labels if ok[k] > 0],
+                       key=lambda k: (-ok[k], -speed_of(measured, k), k))
+    dead = sorted([k for k in labels if ok[k] == 0],
+                  key=lambda k: (-speed_of(measured, k), k))
+
+    out = {}
+    for i, k in enumerate(producing):
+        # 下限 DEAD_SCORE+1：产出源多到 100-i*5 掉到死源档时，
+        # 「产出源高于死源」这个不变式会被算术破坏。
+        out[k] = max(DEAD_SCORE + 1, TOP_BASE - i * 5)
+    for k in dead:
+        out[k] = VERIFIED_TOP if k in verified else DEAD_SCORE
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry", action="store_true")
@@ -50,22 +93,14 @@ def main():
 
     prio = load(PRIO, {})
     budget = load(BUDGET, {}).get("sources") or {}
-    measured = prio.get("_measured") or {}
-    verified = set(prio.get("_verified_top") or [])
 
     labels = [k for k in prio if not k.startswith("_")]
     ok = {k: int((budget.get(k) or {}).get("ok") or 0) for k in labels}
 
-    producing = sorted([k for k in labels if ok[k] > 0],
-                       key=lambda k: (-ok[k], -speed_of(measured, k), k))
-    dead = [k for k in labels if ok[k] == 0]
-    dead.sort(key=lambda k: (-speed_of(measured, k), k))
-
-    new = {}
-    for i, k in enumerate(producing):
-        new[k] = TOP_BASE - i * 5
-    for k in dead:
-        new[k] = VERIFIED_TOP if k in verified else DEAD_SCORE
+    new = rank(prio, budget)
+    if not new:
+        print("  今日暂无任何成功产出记录，保留静态优先级（不把全部源沉底）")
+        return 0
 
     changed = {k: (prio.get(k), new[k]) for k in new if prio.get(k) != new[k]}
     if not changed:

@@ -45,7 +45,7 @@ CFG = json.load(open("/opt/embytg/config.json", encoding="utf-8"))
 EMBY = (CFG.get("emby_url") or "http://127.0.0.1:8096").rstrip("/")
 TOKEN = CFG["emby_token"]
 PLACEHOLDER = re.compile(r"^第\s*\d+\s*[集期]$|^Episode\s*\d+$", re.I)
-EP_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
+EP_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})")
 SERIES_LOCK_FIELDS = ["Name", "Overview", "SortName", "OriginalTitle"]
 
 
@@ -483,7 +483,7 @@ def verify(series_list, sample=10, strict_emby=False, only_file=None):
     """抽样验收：NFO 在不在、标题是否占位、Emby Name 是否等于 NFO 标题。
     注意：Emby 的 /Items?Path= 过滤不可靠（实测恒空），改为按 Series 取全部 Episode；
     指定 only_file 时按完整 Path 比对，不能只看季集号（旧路径可能同名）。"""
-    SE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
+    SE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})")
     bad = {"no_nfo": [], "placeholder": [], "name_mismatch": [], "emby_missing": []}
     checked = 0
     q = urllib.parse.urlencode({"Recursive": "true", "IncludeItemTypes": "Series",

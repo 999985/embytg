@@ -549,16 +549,25 @@ def main():
     rep["budget"] = {"daily_limit": lim, "used": used,
                      "saturated": [k for k, v in used.items() if lim and v >= lim]}
 
-    # 5) Emby 增长（与上次快照比）
+    # 5) Emby 增长（与上次快照比）—— 同时记台账键数：
+    #    只有「Emby 掉了、台账没掉」才是异常；Emby 回落到台账 = 同 Path 重复条目
+    #    被清理后的**收敛**（E115/E125 口径），不是丢数据。
     ep = emby_episodes()
+    try:
+        import reconcile as _RC
+        ledger_n = len(_RC.ledger_tgdb())
+    except Exception:                                          # noqa: BLE001
+        ledger_n = None
     hist = load(".gha_report_history.json", {})
     prev = None
     for d in sorted(hist):
         if d < today.isoformat():
-            prev = (d, hist[d].get("episodes"))
+            prev = (d, hist[d].get("episodes"), hist[d].get("ledger"))
     rep["emby_episodes"] = ep
+    rep["ledger_keys"] = ledger_n
+    rep["emby_surplus"] = (ep - ledger_n) if ledger_n else None
     rep["emby_delta"] = (ep - prev[1]) if prev and prev[1] else None
-    hist[today.isoformat()] = {"episodes": ep, "ts": rep["ts"]}
+    hist[today.isoformat()] = {"episodes": ep, "ledger": ledger_n, "ts": rep["ts"]}
     json.dump(hist, open(HIST, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
     # 6) 判定
@@ -656,8 +665,23 @@ def main():
         sat = [str(x) for x in (rep["budget"]["saturated"] or [])]
         notes.append("源日配额已用满（正常满负荷，次日 00:00 CST 重置）：%s"
                      % ",".join(sat[:3]))
+    _surplus = rep.get("emby_surplus")
+    _surplus = int(_surplus) if isinstance(_surplus, (int, float)) else None
     if rep["emby_delta"] is not None and rep["emby_delta"] < 0:
-        problems.append("Emby 集数下降 %d（可能误删/索引异常）" % abs(rep["emby_delta"]))
+        drop = abs(int(rep["emby_delta"]))
+        surplus = _surplus
+        prev_led = prev[2] if prev and len(prev) > 2 else None
+        led_drop = (prev_led - rep["ledger_keys"]) if (prev_led and rep.get("ledger_keys")) else 0
+        if led_drop > 0:
+            problems.append("台账减少 %d 条（真实删除，查 drop_old / td_sweep 记录）" % led_drop)
+        elif surplus is not None and abs(surplus) <= 2:
+            notes.append("Emby 集数 −%d 已收敛到台账（%d=%d，同 Path 重复条目清理，非丢失）"
+                         % (drop, ep, rep["ledger_keys"]))
+        else:
+            problems.append("Emby 集数下降 %d（Emby 与台账差 %s）" % (drop, surplus))
+    elif _surplus is not None and _surplus > 2:
+        notes.append("Emby 比台账多 %d 条（同 Path 重复条目，E125 口径，不计入故障）"
+                     % _surplus)
     rep["verdict"] = "PASS" if not problems else ("FAIL" if rep["done_3h"] == 0 else "WARN")
     rep["problems"] = problems
     rep["notes"] = notes
@@ -686,7 +710,7 @@ def main():
         for p in problems:
             print("    ✘", p)
     else:
-        print("  ✅ 正常：有完成、无卡单、队列有余量、集数未下降")
+        print("  ✅ 正常：有完成、无卡单、队列有余量、Emby 与台账一致")
     for n in notes:
         print("  ℹ", n)
     return 0 if rep["verdict"] == "PASS" else (1 if rep["verdict"] == "WARN" else 2)

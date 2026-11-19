@@ -42,7 +42,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nfo_sidecar import rename_with_sidecars          # noqa: E402  E022：视频+NFO+海报+字幕整体搬
 
-SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
+SE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})")
 TV_ROOT = "/opt/embytg/mnt/embytg/TV"
 VIDEO_EXT = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".m4v", ".flv", ".wmv"}
 
