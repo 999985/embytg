@@ -1019,7 +1019,13 @@ def upgrade_target(item, cands, min_bytes, max_bytes):
     # 注意：同画质替换的目标文件名与现有文件**完全相同**（都是 `S01E01 - 1080p.mkv`），
     # 直接被 check_existing 的 path_exists 挡住；强行覆盖又要先删旧文件（不可逆）。
     # 所以这条默认关闭，只有显式 UPGRADE_SAME_LABEL=1 且下游支持「原地替换」时才开。
-    if item.get("current_size") and os.environ.get("UPGRADE_SAME_LABEL") == "1":
+    # 2026-11-19：P1 洗版主路径。同画质但码率高 1.5 倍以上也算升级，
+    # 落地名加 -hq 后缀（`SxxExx - 2160p-hq.mp4`），与旧文件同 base 不同 version，
+    # Emby 会合并成同一集的多个版本 —— 满足「低画质不删、默认高画质」的红线。
+    # ⚠ 2026-11-19 实测：Emby 4.10 **不会**把同 base 不同 version 的剧集文件合并成多版本
+    # （幻视任务 E1-E7：2 个文件 → 2 条独立条目，各 1 个 MediaSource）。
+    # 所以 -hq 落地会产生重复条目，默认关闭；要开必须用户在「重复条目」和「保留低画质」之间选。
+    if item.get("current_size") and os.environ.get("UPGRADE_SAME_LABEL", "0") == "1":
         # 同画质更优版本（高码率）也纳入，按体积比判
         good += [c for c in cands
                  if rank_of(c["quality"]["label"]) == current_rank
@@ -1059,9 +1065,10 @@ def upgrade_target(item, cands, min_bytes, max_bytes):
                                     "ep": item.get("ep"), "label": q,
                                     "mbps": (c.get("qg") or {}).get("mbps"),
                                     "reason": (c.get("qg") or {}).get("reason")})
+    _suffix = "-hq" if rank_of(q) == current_rank else ""
     target = target_with_quality(
         item["lib"], item["dir"], item["series"], item["season"], item["ep"],
-        q, ext_of(c["episode"]))
+        q + _suffix, ext_of(c["episode"]))
     return (target, c), ""
 
 

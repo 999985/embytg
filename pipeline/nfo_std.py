@@ -70,6 +70,37 @@ def episode_info(series_tmdb, season, ep):
     return info
 
 
+def write_episode_nfo_info(video_path, season, ep, info):
+    """按标准字段写 `.nfo`，info 由调用方给（TMDB / TODB 归一化后的同一结构）。
+
+    2026-11-19：**唯一写入器的第二个入口。** 占位审计（nfo_src_audit.py）已经拿到了
+    标题/简介/日期，不该自己拼 XML —— 同一部剧里两种 XML 是「刮错了」的经典来源。
+    info: {title, plot, air, runtime}
+    """
+    title = (info or {}).get("title") or ""
+    if not title:
+        return None
+    rows = ['<?xml version="1.0" encoding="utf-8" standalone="yes"?>', "<episodedetails>",
+            "  <title>%s</title>" % _esc(title),
+            "  <season>%d</season>" % int(season),
+            "  <episode>%d</episode>" % int(ep)]
+    if (info or {}).get("plot"):
+        rows.append("  <plot>%s</plot>" % _esc(str(info["plot"])[:1500]))
+    if (info or {}).get("air"):
+        rows += ["  <premiered>%s</premiered>" % info["air"],
+                 "  <aired>%s</aired>" % info["air"]]
+    if (info or {}).get("runtime"):
+        rows.append("  <runtime>%d</runtime>" % int(info["runtime"]))
+    rows.append("</episodedetails>")
+    path = os.path.splitext(video_path)[0] + ".nfo"
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+        return path
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
 def write_episode_nfo(video_path, series_tmdb, season, ep, fallback_title=None):
     """按标准字段写 `.nfo`，返回写入路径或 None（拿不到任何标题时不写，避免制造不一致）。"""
     info = episode_info(series_tmdb, season, ep)

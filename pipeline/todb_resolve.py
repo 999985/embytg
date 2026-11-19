@@ -308,6 +308,11 @@ def write_nfo(path, s, e, info, overwrite=False):
     _old_t = _existing_title(nfo)
     if _PLACEHOLDER.match(_new_t) and _old_t and not _PLACEHOLDER.match(_old_t):
         return "skip_placeholder"
+    # 2026-11-19：TODB 对相当多剧集的「中文集名」本身就是「第 N 集」占位
+    # （雷霆令 vid=371424 全 34 集都是），且没有简介 —— 这种写入没有任何收益，
+    # 只会把 NFO 的 mtime 刷来刷去，直接跳过。
+    if _PLACEHOLDER.match(_new_t) and not (info.get("d") or "").strip():
+        return "skip_empty_placeholder"
     rows = ['<?xml version="1.0" encoding="utf-8" standalone="yes"?>', "<episodedetails>",
             "  <title>%s</title>" % xml_esc(info["t"]),
             "  <season>%d</season>" % s, "  <episode>%d</episode>" % e]

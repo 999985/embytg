@@ -736,39 +736,47 @@ def main():
     except Exception as e:                                          # noqa: BLE001
         line(None, "Series NFO", str(e)[:60])
 
-    # 4.75) NFO 内容完整性（2026-11-19 谷雨 E11 之后刮削异常沉淀）
-    # 原来只查「有没有 tvshow.nfo」，不查里面有没有内容 —— 于是
-    # 2089 集缺简介、1045 集标题是「第 N 集」占位，一直没人报。
-    # 判据：plot 为空 或 标题形如「第 N 集」；>5% 判 FAIL。
+    # 4.75) NFO 内容完整性（2026-11-19 判据重写）
+    # 旧判据「占位标题占比 >5% 判 FAIL」把「上游没有数据」当成「我们出错」：
+    # 1045 集占位里有 1007 集在 TODB 与 TMDB **两边都是占位**（三源确实没有真名，
+    # 谷雨 E28-E30 连 TMDB 自己都填「第 28 集」），占比 7.2% 永远压不到 5%
+    # → 每天必 FAIL → 这条告警会被无视。**永远报警的检查等于没有检查。**
+    #
+    # 新判据只守一条不变式：**任一权威源有真名时，库里不许还是占位**。
+    # 量尺是 nfo_src_audit.py（TMDB 中文优先/英文补/自动翻译 + TODB 兜底），
+    # 结果落 .nfo_src_audit.json；actionable>0 才算我们的错。
+    # 缓存超过 NFO_AUDIT_TTL_H（默认 20h）才重算，日常调用不重复打外部接口。
     try:
-        import urllib.parse as _up
-        import urllib.request as _ur
-        from embytg_conf import cfg as _cfg
-        _b = _cfg("emby_url").rstrip("/")
-        _tk = _cfg("emby_token")
-        _q = _up.urlencode({"Recursive": "true", "IncludeItemTypes": "Episode",
-                            "Fields": "Overview", "Limit": "20000"})
-        with _ur.urlopen("%s/Items?%s&api_key=%s" % (_b, _q, _tk), timeout=180) as _f:
-            _items = (json.loads(_f.read()) or {}).get("Items") or []
-        _noph = 0
-        _ph = 0
-        _top = {}
-        for _it in _items:
-            _nm = (_it.get("Name") or "").strip()
-            _ov = (_it.get("Overview") or "").strip()
-            if not _ov:
-                _noph += 1
-            if re.match(r"^第\s*\d+\s*集$", _nm):
-                _ph += 1
-                _top[_it.get("SeriesName") or "?"] = _top.get(_it.get("SeriesName") or "?", 0) + 1
-        _tot = max(1, len(_items))
-        _pct = 100.0 * _ph / _tot
-        _worst = ",".join("%s=%d" % kv for kv in
-                          sorted(_top.items(), key=lambda x: -x[1])[:3])
-        line(_pct <= 5.0, "NFO 内容完整性",
-             "占位标题 %d/%d（%.1f%%）｜无简介 %d 集｜最差：%s"
-             % (_ph, _tot, _pct, _noph, _worst or "无"))
-    except Exception as e:                                          # noqa: BLE001
+        _aud_p = os.path.join(HERE, ".nfo_src_audit.json")
+        _ttl = float(os.environ.get("NFO_AUDIT_TTL_H") or 20) * 3600
+        _aud = {}
+        try:
+            _aud = json.load(open(_aud_p, encoding="utf-8"))
+        except Exception:                                          # noqa: BLE001
+            _aud = {}
+        if (not _aud) or (time.time() - float(_aud.get("ts") or 0) > _ttl):
+            _r = subprocess.run([sys.executable, os.path.join(HERE, "nfo_src_audit.py"), "--json"],
+                                capture_output=True, text=True, timeout=1800)
+            try:
+                _aud = json.load(open(_aud_p, encoding="utf-8"))
+            except Exception:                                      # noqa: BLE001
+                _aud = {}
+            if not _aud:
+                raise RuntimeError("audit 未产出结果：%s" % (str(_r.stderr or _r.stdout)[-80:]))
+        _act = int(_aud.get("actionable") or 0)
+        _ph = int(_aud.get("placeholder") or 0)
+        _tot = max(1, int(_aud.get("episodes") or 0))
+        _noph = int(_aud.get("no_plot") or 0)
+        _pg = int(_aud.get("plot_gain") or 0)
+        _age = (time.time() - float(_aud.get("ts") or 0)) / 3600.0
+        line(_act == 0 and _age <= 36, "NFO 内容完整性",
+             "可修复占位 %d（源有真名而库里没有）｜占位 %d/%d（%.1f%%，其余源无数据）"
+             "｜无简介 %d（可补 %d）｜审计 %.1fh 前"
+             % (_act, _ph, _tot, 100.0 * _ph / _tot, _noph, _pg, _age))
+        if _act:
+            line(False, "可修复占位明细",
+                 "先 nfo_src_audit.py --apply 写 NFO，再 nfo_name_to_emby.py --apply --series-dir <目录>")
+    except Exception as e:                                         # noqa: BLE001
         line(None, "NFO 内容完整性", str(e)[:60])
 
     # 4.8) 阈值自适应（磁盘按 7 天斜率重算；claim 阈值固定并写明原因）
