@@ -254,6 +254,12 @@ def candidate_verdict(c, item=None, line="admit"):
             dur = 0
     if not dur:
         dur = estimated_duration(item.get("lib") if item else None)
+    # 2026-11-20：单位护栏。Emby 的 RunTimeTicks 是 100ns（1e7/秒），
+    # 一旦上游把原始 ticks 当秒传进来，码率会算出 0.00 → 真 4K 被
+    # 「假 4K 一票否决」。单集/单部电影不可能超过 24 小时，
+    # 所以 >86400 只可能是「不是秒」，按 ticks 换算。
+    if dur > 86400:
+        dur = dur / 10000000.0
     return judge_candidate(c.get("size") or 0, w, h, dur, line=line)
 
 

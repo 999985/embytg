@@ -414,10 +414,18 @@ def quality_of(episode):
     width = int(video.get("Width") or 0)
     height = int(video.get("Height") or 0)
     size = int(ms.get("Size") or episode.get("Size") or 0)
-    runtime = int(episode.get("RunTimeTicks") or ms.get("RunTimeTicks") or 0)
+    # 2026-11-20 根因修复：Emby 的 RunTimeTicks 是 **100ns 单位**（1e7/秒），
+    # 不是秒。以前把原始 ticks 直接写进 quality["runtime"]，下游
+    # quality_gate.candidate_verdict 把它当秒算码率 →
+    # 3.4GB 的 2160p 单集算出 0.00 Mbps → 判 fake_4k 一票否决。
+    # 实测今日 1792 条候选被误杀（全部 dur=ticks、mbps=0.0），
+    # 单集请求数从 3.14 涨到 20.07，源日配额 06:40 就烧光。
+    # 这里统一换成秒，并保留 runtime_ticks 供需要原始单位的调用方使用。
+    runtime_ticks = int(episode.get("RunTimeTicks") or ms.get("RunTimeTicks") or 0)
+    runtime = int(round(runtime_ticks / 10000000.0)) if runtime_ticks else 0
     bitrate = int(video.get("BitRate") or ms.get("Bitrate") or 0)
-    if not bitrate and size and runtime:
-        bitrate = int(size * 8 / (runtime / 10000000.0))
+    if not bitrate and size and runtime_ticks:
+        bitrate = int(size * 8 / (runtime_ticks / 10000000.0))
     name = "%s %s" % (episode.get("Name") or "", ms.get("Path") or ms.get("Name") or "")
     label, rank = "sd", 0
     if height >= 1800 or width >= 3000:
@@ -443,7 +451,8 @@ def quality_of(episode):
     return {
         "label": label, "rank": rank, "width": width, "height": height,
         "bitrate": bitrate, "codec": codec, "hdr": hdr,
-        "size": size, "runtime": runtime, "codec_pref": codec_pref,
+        "size": size, "runtime": runtime, "runtime_ticks": runtime_ticks,
+        "codec_pref": codec_pref,
         "score": (rank, bitrate, hdr, codec_pref),
     }
 

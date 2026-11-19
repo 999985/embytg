@@ -193,11 +193,30 @@ def gha_claimed(key):
 
 
 def state_key_exists(key):
+    """state_key 命中 = 已有这一集？**只有带落地锚点的键才算。**
+
+    2026-11-20（早班根因）：tgpipe 的频道清点也往 state_key 写同名键
+    （值形如 `{"ch": "AE9527x", "msg": 777, "name": "剧名"}`，没有 file_id/src/ts），
+    于是「只在某个频道里见过」被当成「已入库」：
+      · fill/new 判 duplicate 直接跳过，盘上其实没有这个文件；
+      · 实测 21970 个 tv 键里 6362 个（267 部剧）是这种幽灵键，
+        重启之极海听雷 24 集永远补不进来，每天还刷 20+ 条 duplicate 白烧日志。
+    判据：val 里有 file_id（已登记到 teldrive）或 src（入库来源）才算真落地。
+    """
     con = sqlite3.connect("file:%s?mode=ro" % TGDB, uri=True, timeout=30)
     try:
-        return con.execute("select 1 from state_key where k=?", (key,)).fetchone() is not None
+        row = con.execute("select val from state_key where k=?", (key,)).fetchone()
     finally:
         con.close()
+    if not row:
+        return False
+    try:
+        d = json.loads(row[0]) if row[0] else {}
+    except Exception:                                          # noqa: BLE001
+        d = {}
+    if not isinstance(d, dict):
+        return False
+    return bool(d.get("file_id") or d.get("src"))
 
 
 def resource_has_episode(item, ep, qual):

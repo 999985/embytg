@@ -745,9 +745,18 @@ def episode_anywhere(item, season, ep):
         # 改用范围查询（k >= prefix AND k < prefix_upper），稳定走主键索引：
         # 20 万行实测 0.01ms/次，与位置无关。
         hi = prefix[:-1] + chr(ord(prefix[-1]) + 1)
-        if con.execute("select 1 from state_key where k>=? and k<? limit 1",
-                       (prefix, hi)).fetchone():
-            hits.append("state_key")
+        # 2026-11-20：命中要带**落地锚点**才作数。tgpipe 的频道清点键
+        # 形状相同但没有 file_id/src（"只在频道里见过"），把它当已入库
+        # 会让 6362 集永远补不进来（267 部剧），还每天刷 duplicate。
+        for (val,) in con.execute(
+                "select val from state_key where k>=? and k<? limit 8", (prefix, hi)):
+            try:
+                d = json.loads(val) if val else {}
+            except Exception:                              # noqa: BLE001
+                d = {}
+            if isinstance(d, dict) and (d.get("file_id") or d.get("src")):
+                hits.append("state_key")
+                break
         # 2026-11-13 可扩展性：原来对「本剧所有 rel」逐条正则匹配，超长剧是 O(N²)。
         # 改成先按剧目录建一次索引（_ep_index_for），再 O(1) 查表。
         root_prefix = "TV/%s/%s/Season %02d/" % (

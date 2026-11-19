@@ -43,7 +43,13 @@ from telethon import TelegramClient                        # noqa: E402
 from telethon.sessions import StringSession                # noqa: E402
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest  # noqa: E402
 
-TAG = "ysdq-auto"
+TAG = "ysdq_auto.py"
+# 2026-11-20：TAG 必须**等于脚本文件名**。gs.slot_lease/_run_is_alive 用
+# 「ps 里某个 argv 元素 == run_id 或 run_id+".py"」判活；写 "ysdq-auto"
+# 时永远匹配不到（argv 是 python + ysdq_auto.py），后果是双向的：
+#   · 活着的进程被判成死 → 上传 lane 抢走同一 TG 号 → AuthKeyDuplicated 风险；
+#   · 被 TimeoutStartSec 杀掉后没有任何证据能回收 → 该 slot 白锁到 TTL 到期。
+# 实测 06:30 起的 slot3.lock 就这么挂着（run_id=ysdq-auto，ttl=3600）。
 _slot_of = {"n": 1}
 SEEN = "/opt/embytg/pipeline/.ysdq_seen.json"
 PAGE_DELAY = 2.5
@@ -513,16 +519,28 @@ def real_hint(first):
 
 async def run(keyword, pages, slots, dry, cap, payloads=None, only_4k=False):
     # 号是上传 lane 与机器人补片**共用**的排他资源：上传 job 期间拿不到。
-    # --wait-slot 给一个等待窗口，等上传 job 结束再抢（否则一到点就空跑一轮）。
+    # 2026-11-20 根因修复：**只轮询永远抢不到**（lane 交完一集立刻领下一集，
+    # slot_release → slot_lease 之间只有亚秒级间隙）。改为预约制：
+    # 先给要用的 slot 立旗 → lane 交完当前这集就不再领这个号 → 我们自然拿到。
+    # 此前实测：每轮等满 YSDQ_WAIT_SLOT=900s，再撞上 TimeoutStartSec=20min 被杀，
+    # 日志 11 小时零输出（stdout 块缓冲，被 SIGTERM 杀掉时缓冲区全丢）。
     import os as _os
     _wait = int(_os.environ.get("YSDQ_WAIT_SLOT", "0") or 0)
     _deadline = time.time() + _wait
+    _want = list(range(1, slots + 1))
+    for _n in _want:
+        GS.slot_reserve(_n, TAG, ttl=max(600, _wait + 600))
     leased = []
-    while True:
-        leased = [n for n in range(1, slots + 1) if GS.slot_lease(n, TAG, ttl=3600)]
-        if leased or time.time() >= _deadline:
-            break
-        await asyncio.sleep(60)
+    try:
+        while True:
+            leased = [n for n in _want if GS.slot_lease(n, TAG, ttl=3600)]
+            if leased or time.time() >= _deadline:
+                break
+            await asyncio.sleep(30)
+    finally:
+        # 拿到/超时后立刻撤旗：旗只用于「排队等号」，不能变成第二把锁
+        for _n in _want:
+            GS.slot_unreserve(_n, TAG)
     # 冷却中的号（FloodWait）不能当扫描器，否则整轮空转
     pace = _pace_load()
     now = time.time()
@@ -575,6 +593,14 @@ async def run(keyword, pages, slots, dry, cap, payloads=None, only_4k=False):
 
 
 def main():
+    # 2026-11-20：标准输出改行缓冲。systemd 是 append 到文件（块缓冲 4-8KB），
+    # 一轮日志往往不到一个块，进程被 TimeoutStartSec 杀掉时**整段丢失**
+    # —— 实测日志 11 小时一行没有，看起来像"没运行"，实际每 30 分钟都在跑。
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # type: ignore[attr-defined]
+        sys.stderr.reconfigure(line_buffering=True)   # type: ignore[attr-defined]
+    except Exception:                                          # noqa: BLE001
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--keyword", default="4K")
     ap.add_argument("--pages", type=int, default=2)

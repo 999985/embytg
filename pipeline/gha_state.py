@@ -1032,8 +1032,16 @@ def slot_lease(n, run_id, ttl=SLOT_TTL):
     os.makedirs(SLOT_DIR, exist_ok=True)
     # 预约优先（见 slot_reserve）：旗有效期内，非 tgpipe 的调用方直接让位。
     # tgpipe 自己的 run_id 形如 `tgpipe-<pid>`，不受此限。
+    # 2026-11-20：**立旗的人自己必须能领到**。原来只放行 tgpipe，
+    # 别的持有人（如 ysdq-auto）立旗后会被自己的旗挡住 → 等满窗口一场空。
     if not str(run_id).startswith("tgpipe") and _reserve_active(n):
-        return False
+        try:
+            with open(_slot_reserve_path(n), encoding="utf-8") as _f:
+                _holder = str((json.load(_f) or {}).get("holder") or "")
+        except Exception:                                  # noqa: BLE001
+            _holder = ""
+        if _holder != str(run_id):
+            return False
     pth = _slot_path(n)
     payload = json.dumps({"run_id": str(run_id), "ts": int(time.time()),
                           "ttl": int(ttl)}, ensure_ascii=False)

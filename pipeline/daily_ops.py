@@ -407,20 +407,28 @@ def main():
         line(False, "低码率假高清", str(e)[:50])
     # 4.55) 机器人自动补片是否在跑（2026-11-20 新增，每 6 小时一轮）
     try:
-        _ylog = "/opt/embytg/logs/ysdq_auto.log"
-        if not os.path.exists(_ylog):
-            line(True, "机器人补片", "尚未运行（定时器 03/09/15/21:25）")
+        # 2026-11-20：日志真源是 systemd 的 append 文件 ysdq_auto_run.log。
+        # 旧检查读 ysdq_auto.log，那是一个早已没人写的文件（11-19 13:00 停更），
+        # 于是「18 小时未更新」每天都在报，而真正在跑的那一份没人看。
+        _cands = ["/opt/embytg/logs/ysdq_auto_run.log",
+                  "/opt/embytg/logs/ysdq_auto.log"]
+        _cands = [p for p in _cands if os.path.exists(p)]
+        if not _cands:
+            line(True, "机器人补片", "尚未运行（定时器每 30 分钟一轮）")
         else:
+            _ylog = max(_cands, key=os.path.getmtime)
             _age = (time.time() - os.path.getmtime(_ylog)) / 3600.0
-            _tail = open(_ylog, encoding="utf-8", errors="replace").read()[-3000:]
+            _tail = open(_ylog, encoding="utf-8", errors="replace").read()[-4000:]
             _last = ""
             for _ln in _tail.splitlines():
-                if _ln.startswith("  完成 成功="):
+                if _ln.startswith("  完成 成功=") or _ln.startswith("  完成 入库="):
                     _last = _ln.strip()
-            if _age > 13:
-                line(False, "机器人补片", "日志 %.0f 小时未更新，定时器可能失效" % _age)
+            if _age > 2.5:
+                line(False, "机器人补片", "%s %.1f 小时未更新，定时器可能失效"
+                     % (os.path.basename(_ylog), _age))
             else:
-                line(True, "机器人补片", "%s（%.0f 小时前）" % (_last or "有日志无小结", _age))
+                line(True, "机器人补片", "%s｜%s（%.1f 小时前）"
+                     % (_last or "有日志无小结", os.path.basename(_ylog), _age))
     except Exception as e:                                          # noqa: BLE001
         line(False, "机器人补片", str(e)[:50])
 
