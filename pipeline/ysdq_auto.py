@@ -360,13 +360,39 @@ async def item_worker(slot, q, results, dry, cap):
             await asyncio.sleep(1.5)
             continue
         try:
-            doc, desc = await Y.fetch_item(c, payload, wait=25.0)
+            try:
+                doc, desc = await Y.fetch_item(
+                    c, payload, wait=25.0,
+                    send=lambda txt: pace_send(c, ent, slot, txt))
+            except Exception as _ex:                           # noqa: BLE001
+                if "FloodWait" in type(_ex).__name__ or "A wait of" in str(_ex):
+                    _secs = 0
+                    try:
+                        import re as _re
+                        _secs = int(_re.search(r"wait of (\d+) seconds", str(_ex)).group(1))
+                    except Exception:                          # noqa: BLE001
+                        _secs = 3600
+                    _d = _pace_load()
+                    _d[str(slot)] = {"last_at": time.time(), "next_at": time.time() + _secs + 10,
+                                     "hist": (_d.get(str(slot), {}).get("hist") or [])}
+                    _pace_save(_d)
+                    print("  [slot%d] FloodWait %d 秒 → 本号退出本轮" % (slot, _secs))
+                    break
+                raise
             await asyncio.sleep(ITEM_DELAY)
             if not doc:
+                # 发送被限速/冷却挡下时不要继续空转，直接退出本轮该号
+                _p = _pace_load().get(str(slot)) or {}
+                if float(_p.get("next_at") or 0) > time.time():
+                    print("  [slot%d] 发送受限，本号退出本轮" % slot)
+                    break
                 results["miss"] += 1
                 continue
             title, year, qual_label, first = parse_header(desc)
             qual = real_qual(doc, qual_label)          # 以文件属性为准，不信文字标签
+            if results.get("only_4k") and qual != "2160p":
+                results["miss"] += 1
+                continue                               # 只要 2160p，实际不是就跳过
             if Y.is_cam(first):
                 results["cam"] += 1
                 continue
@@ -384,6 +410,25 @@ async def item_worker(slot, q, results, dry, cap):
             lib = Y.pick_dir(gm.group(1) if gm else "")
             folder = "%s/%s (%s)%s" % (lib, t, year, anchor)
             name = "%s (%s)%s - %s.mkv" % (t, year, anchor, qual)
+            # 画质闸门：分辨率达标但码率过低的不入（谷雨 2160p/400MB 事故）
+            _dur = 0
+            try:
+                for _a in (doc.document.attributes or []):
+                    if hasattr(_a, "duration"):
+                        _dur = int(getattr(_a, "duration", 0) or 0)
+                        break
+            except Exception:                                  # noqa: BLE001
+                pass
+            try:
+                import quality_gate as QG
+                _bad, _m = QG.too_low(int(doc.document.size or 0), _dur, qual)
+                if _bad:
+                    QG.log_reject("ysdq", name, int(doc.document.size or 0), _dur, qual, _m)
+                    print("  [slot%d] %s → 码率 %.1fMbps 过低，跳过" % (slot, name[:40], _m))
+                    results["lowq"] = results.get("lowq", 0) + 1
+                    continue
+            except Exception:                                  # noqa: BLE001
+                pass
             gb = (doc.document.size or 0) / 1e9
             if dry:
                 print("  [dry][slot%d] %s  %.2fGB" % (slot, name[:54], gb))
@@ -425,7 +470,39 @@ async def item_worker(slot, q, results, dry, cap):
     GS.slot_release(slot, TAG)
 
 
-async def run(keyword, pages, slots, dry, cap):
+POOL = "/opt/embytg/pipeline/.ysdq_pool.json"
+
+
+def pool_payloads(only_4k=False):
+    """从分类爬取池里挑出库里没有的片（payload 列表）。
+
+    池是 ysdq_crawl.py 按 28 个分类爬的（实测 8010 条 / 3499 部唯一）。
+    这里只做「缺哪些」的判断，真正取片仍走 worker（会再核一次库）。
+    """
+    try:
+        with open(POOL, encoding="utf-8") as f:
+            pool = json.load(f)
+    except Exception:                                          # noqa: BLE001
+        return []
+    out = []
+    for cat, v in (pool.get("cats") or {}).items():
+        for it in v.get("items") or []:
+            t, y, q, first = parse_header(it.get("text") or "")
+            if not t:
+                continue
+            if only_4k and "4K" not in (first or ""):
+                continue
+            if in_library(t, y, real_hint(first)):
+                continue
+            out.append(it["payload"])
+    return out
+
+
+def real_hint(first):
+    return "2160p" if ("4K" in (first or "") or "2160" in (first or "")) else "1080p"
+
+
+async def run(keyword, pages, slots, dry, cap, payloads=None, only_4k=False):
     leased = [n for n in range(1, slots + 1) if GS.slot_lease(n, TAG, ttl=3600)]
     # 冷却中的号（FloodWait）不能当扫描器，否则整轮空转
     pace = _pace_load()
@@ -440,8 +517,20 @@ async def run(keyword, pages, slots, dry, cap):
         print("  所有号都在 FloodWait 冷却中，本轮跳过")
         return 0
     results = {"ok": 0, "fail": 0, "miss": 0, "dup": 0, "cam": 0, "by_slot": {},
-               "scan_done": False}
+               "scan_done": True, "only_4k": only_4k}
     q = asyncio.Queue()
+    if payloads is not None:
+        for pl in payloads:
+            q.put_nowait(pl)
+        print("  池模式：队列 %d 条（不需扫描，全部号做消费者）" % q.qsize())
+        await asyncio.gather(*[item_worker(n, q, results, dry, cap) for n in free])
+        print("  完成 入库=%d 重复=%d 抢先版=%d 低码率=%d 未取到=%d 失败=%d"
+              % (results["ok"], results["dup"], results["cam"], results.get("lowq", 0),
+                 results["miss"], results["fail"]))
+        if results["by_slot"]:
+            print("  各号产出: %s" % ", ".join("slot%d=%d" % (k, v)
+                                            for k, v in sorted(results["by_slot"].items())))
+        return 0
     scanner = free[0]
     consumers = [n for n in free if n != scanner]
     if not consumers:
@@ -457,8 +546,9 @@ async def run(keyword, pages, slots, dry, cap):
         results["scan_done"] = True
         await asyncio.gather(*cs)
         GS.slot_release(scanner, TAG)
-    print("  完成 入库=%d 重复=%d 抢先版=%d 未取到=%d 失败=%d"
-          % (results["ok"], results["dup"], results["cam"], results["miss"], results["fail"]))
+    print("  完成 入库=%d 重复=%d 抢先版=%d 低码率=%d 未取到=%d 失败=%d"
+          % (results["ok"], results["dup"], results["cam"], results.get("lowq", 0),
+             results["miss"], results["fail"]))
     if results["by_slot"]:
         print("  各号产出: %s" % ", ".join("slot%d=%d" % (k, v)
                                         for k, v in sorted(results["by_slot"].items())))
@@ -473,6 +563,8 @@ def main():
     ap.add_argument("--per-page", type=int, default=0, help="(弃用) 见 --limit")
     ap.add_argument("--limit", type=int, default=0, help="本轮最多入库几部，0=号数×3")
     ap.add_argument("--slots", type=int, default=4)
+    ap.add_argument("--from-pool", action="store_true", help="从分类爬取池里补缺")
+    ap.add_argument("--4k-only", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     seen = (load_seen().get(a.keyword) or {})
@@ -480,6 +572,13 @@ def main():
     pages = list(range(start, start + a.pages))
     print("  关键词 %s：断点页 %d → 本轮 %s" % (a.keyword, start, pages))
     cap = a.limit or max(2, a.slots * 3)
+    if a.from_pool:
+        pl = pool_payloads(a.__dict__.get("4k_only", False))
+        print("  池内缺片 %d 个 payload，本轮上限 %d" % (len(pl), cap))
+        if not pl:
+            return 0
+        return asyncio.run(run(a.keyword, pages, a.slots, a.dry_run, cap, payloads=pl,
+                               only_4k=a.__dict__.get("4k_only", False)))
     return asyncio.run(run(a.keyword, pages, a.slots, a.dry_run, cap))
 
 

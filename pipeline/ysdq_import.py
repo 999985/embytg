@@ -169,7 +169,7 @@ async def bot_search(c, keyword, wait=35.0, start=False):
     return res
 
 
-async def fetch_item(c, payload, wait=18.0):
+async def fetch_item(c, payload, wait=18.0, send=None):
     """发 /start <payload>，返回带文件的消息；同时返回简介文本。"""
     from telethon import events
     box = {}
@@ -186,7 +186,11 @@ async def fetch_item(c, payload, wait=18.0):
         if e.message.raw_text and (not box.get("txt") or e.message.document):
             box["txt"] = e.message.raw_text
 
-    await c.send_message(BOT, "/start " + payload)
+    if send is not None:
+        if not await send("/start " + payload):
+            return None, ""
+    else:
+        await c.send_message(BOT, "/start " + payload)
     deadline = asyncio.get_event_loop().time() + wait
     while asyncio.get_event_loop().time() < deadline and "doc" not in box:
         await asyncio.sleep(0.5)

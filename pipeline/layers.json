@@ -118,6 +118,7 @@
   "probe_sidesvc.sh",
   "probe_source_servers.py",
   "purge_dups.py",
+  "quality_gate.py",
   "quota_history.py",
   "r2_backup.py",
   "refetch_meta_from_nfo.py",
@@ -150,6 +151,7 @@
   "web_lookup.py",
   "ysdq_auto.py",
   "ysdq_batch.py",
+  "ysdq_crawl.py",
   "ysdq_import.py"
  ]
 }

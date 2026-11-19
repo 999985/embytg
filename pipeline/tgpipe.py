@@ -1141,6 +1141,21 @@ def _real_qual(it):
     return it["qual"]
 
 
+def too_low_quality(it):
+    """画质闸门：分辨率达标但码率低到不能看的一律不落地（谷雨 2160p/400MB 事故）。"""
+    try:
+        import quality_gate as QG
+        real = _real_qual(it)
+        bad, m = QG.too_low(it.get("size") or 0, it.get("dur") or 0, real)
+        if bad:
+            QG.log_reject("tgpipe", it.get("name") or it.get("title") or "",
+                          it.get("size") or 0, it.get("dur") or 0, real, m,
+                          "ch=%s" % it.get("ch", ""))
+        return bad
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
 def file_name(it):
     """中文规范名 + TMDB ID 锚点；剧集 ID 写在文件夹名（Emby 精确识别 Series），文件名按 SxxExx。"""
     _real_qual(it)
@@ -1202,6 +1217,10 @@ async def apply(items, state, dry=False, c=None, dst=None):
     ents, done = {}, []
     for it in items:
         try:
+            if too_low_quality(it):
+                print(f'  - 画质不达标跳过 {it.get("title")} m{it.get("msg")}'
+                      f'（{it.get("qual")} 但码率过低）', flush=True)
+                continue
             folder, fname = file_name(it)
             parts = it.get("parts") or [it["msg"]]
             lib = it.get("lib") or ("其他片" if it["kind"] == "movie" else "国产剧")

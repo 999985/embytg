@@ -313,6 +313,43 @@ def main():
         line(False, "同片同画质重复", str(e)[:50])
 
 
+    # 4.56) 低码率假高清（2026-11-19 谷雨事故：标 2160p 单集 345-435MB，实为 1.0-1.3Mbps）
+    # 必须用**真实时长**算码率：只看体积会把 20 分钟的国漫误杀。
+    # 时长取 Emby 的 RunTimeTicks（resource_state.dur_sec 目前是空的）。
+    try:
+        import urllib.parse as _up2
+        _since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+        _q2 = _up2.urlencode({"Recursive": "true", "IncludeItemTypes": "Episode,Movie",
+                              "MinDateCreated": _since,
+                              "Fields": "Path,MediaSources,RunTimeTicks", "Limit": "3000"})
+        _d2 = json.loads(urllib.request.urlopen(
+            EMBY + "/Items?" + _q2 + "&api_key=" + TOKEN, timeout=60).read())
+        _low, _fresh = [], []
+        for _it in _d2.get("Items") or []:
+            _ms = (_it.get("MediaSources") or [{}])[0]
+            _dur = (_it.get("RunTimeTicks") or 0) / 1e7
+            _sz = _ms.get("Size") or 0
+            if not _dur or not _sz:
+                continue
+            _m = _sz * 8 / _dur / 1e6
+            _nm = (_it.get("Path") or "").split("/")[-1]
+            _floor = 3.5 if "2160p" in _nm else 1.0 if "1080p" in _nm else 0.5
+            if _m < _floor:
+                _low.append("%s(%.1fMbps/%.0fMB)" % (_nm[:24], _m, _sz / 1e6))
+                # 闸门上线后仍进来的才算回归；历史存量只报数不算失败
+                _ticks = _it.get("DateCreated") or ""
+                try:
+                    _age_h = (time.time() - time.mktime(time.strptime(_ticks[:19], "%Y-%m-%dT%H:%M:%S"))) / 3600
+                except Exception:                                # noqa: BLE001
+                    _age_h = 999
+                if _age_h <= 6:
+                    _fresh.append("%s(%.1fMbps)" % (_nm[:24], _m))
+        line(not _fresh, "低码率假高清",
+             "近6h 新增 %d 条：%s｜近24h 共 %d 条（含历史）"
+             % (len(_fresh), "; ".join(_fresh[:3]), len(_low)) if _fresh
+             else "近6h 无新增｜近24h 存量 %d 条（闸门已拦截新片）" % len(_low))
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "低码率假高清", str(e)[:50])
     # 4.55) 机器人自动补片是否在跑（2026-11-20 新增，每 6 小时一轮）
     try:
         _ylog = "/opt/embytg/logs/ysdq_auto.log"
