@@ -393,7 +393,7 @@ def _safe_write(path, text, timeout=None):
     return box["ok"]
 
 
-def iter_series(lib=None, tid=None):
+def iter_series(lib=None, tid=None, name=None):
     tv = os.path.join(MNT, "TV")
     for l in _safe_listdir(tv):
         lp = os.path.join(tv, l)
@@ -407,6 +407,10 @@ def iter_series(lib=None, tid=None):
             if not m:
                 continue
             if tid and m.group(1) != str(tid):
+                continue
+            # 2026-11-19：原来 todb_resolve 把 --series 的值当 tid 传进来，
+            # 「谷雨」和数字比永远不等 → 整库扫出「涉及剧 0 部」，TODB 补全形同关闭。
+            if name and name not in s:
                 continue
             yield l, sp, int(m.group(1))
 

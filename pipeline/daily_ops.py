@@ -736,6 +736,41 @@ def main():
     except Exception as e:                                          # noqa: BLE001
         line(None, "Series NFO", str(e)[:60])
 
+    # 4.75) NFO 内容完整性（2026-11-19 谷雨 E11 之后刮削异常沉淀）
+    # 原来只查「有没有 tvshow.nfo」，不查里面有没有内容 —— 于是
+    # 2089 集缺简介、1045 集标题是「第 N 集」占位，一直没人报。
+    # 判据：plot 为空 或 标题形如「第 N 集」；>5% 判 FAIL。
+    try:
+        import urllib.parse as _up
+        import urllib.request as _ur
+        from embytg_conf import cfg as _cfg
+        _b = _cfg("emby_url").rstrip("/")
+        _tk = _cfg("emby_token")
+        _q = _up.urlencode({"Recursive": "true", "IncludeItemTypes": "Episode",
+                            "Fields": "Overview", "Limit": "20000"})
+        with _ur.urlopen("%s/Items?%s&api_key=%s" % (_b, _q, _tk), timeout=180) as _f:
+            _items = (json.loads(_f.read()) or {}).get("Items") or []
+        _noph = 0
+        _ph = 0
+        _top = {}
+        for _it in _items:
+            _nm = (_it.get("Name") or "").strip()
+            _ov = (_it.get("Overview") or "").strip()
+            if not _ov:
+                _noph += 1
+            if re.match(r"^第\s*\d+\s*集$", _nm):
+                _ph += 1
+                _top[_it.get("SeriesName") or "?"] = _top.get(_it.get("SeriesName") or "?", 0) + 1
+        _tot = max(1, len(_items))
+        _pct = 100.0 * _ph / _tot
+        _worst = ",".join("%s=%d" % kv for kv in
+                          sorted(_top.items(), key=lambda x: -x[1])[:3])
+        line(_pct <= 5.0, "NFO 内容完整性",
+             "占位标题 %d/%d（%.1f%%）｜无简介 %d 集｜最差：%s"
+             % (_ph, _tot, _pct, _noph, _worst or "无"))
+    except Exception as e:                                          # noqa: BLE001
+        line(None, "NFO 内容完整性", str(e)[:60])
+
     # 4.8) 阈值自适应（磁盘按 7 天斜率重算；claim 阈值固定并写明原因）
     sec("4.8) 阈值自适应")
     try:

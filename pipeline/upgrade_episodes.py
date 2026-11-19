@@ -169,12 +169,15 @@ async def main():
                 print("     已登记 %s" % fid[:8])
             d = os.path.join(Y.MNT, a.dir)
             try:
-                os.makedirs(d, exist_ok=True)
-                with open(os.path.join(d, os.path.splitext(name)[0] + ".nfo"), "w",
-                          encoding="utf-8") as f:
-                    f.write('<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
-                            '<episodedetails>\n  <title>第 %d 集</title>\n  <season>1</season>\n'
-                            '  <episode>%d</episode>\n</episodedetails>\n' % (n, n))
+                # 同 fill_by_ids：NFO 只走 nfo_std，不手拼 XML。
+                import re as _re3
+                import nfo_std
+                _m = _re3.search(r"\{tmdb=(\d+)\}", a.dir)
+                _tmdb = int(_m.group(1)) if _m else 0
+                _sm = _re3.search(r"S(\d+)E\d+", name)
+                _season = int(_sm.group(1)) if _sm else 1
+                if _tmdb:
+                    nfo_std.write_episode_nfo(os.path.join(d, name), _tmdb, _season, n)
             except Exception:                                  # noqa: BLE001
                 pass
             try:

@@ -111,12 +111,16 @@ async def main():
                 continue
             d = os.path.join(Y.MNT, a.dir)
             try:
-                os.makedirs(d, exist_ok=True)
-                with open(os.path.join(d, os.path.splitext(name)[0] + ".nfo"), "w",
-                          encoding="utf-8") as f:
-                    f.write('<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
-                            '<episodedetails>\n  <title>第 %d 集</title>\n  <season>1</season>\n'
-                            '  <episode>%d</episode>\n</episodedetails>\n' % (ep, ep))
+                # NFO 一律走 nfo_std（title/plot/premiered/aired/runtime），
+                # 不许在这里手拼 XML —— 手写会和存量条目的刮削结果不一致。
+                import re as _re2
+                import nfo_std
+                _m = _re2.search(r"\{tmdb=(\d+)\}", a.dir)
+                _tmdb = int(_m.group(1)) if _m else 0
+                _sm = _re2.search(r"S(\d+)E\d+", name)
+                _season = int(_sm.group(1)) if _sm else 1
+                if _tmdb:
+                    nfo_std.write_episode_nfo(os.path.join(d, name), _tmdb, _season, ep)
             except Exception:                                  # noqa: BLE001
                 pass
             try:

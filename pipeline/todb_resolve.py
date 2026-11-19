@@ -285,10 +285,29 @@ def xml_esc(s):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+_PLACEHOLDER = re.compile(r"^第\s*\d+\s*集$")
+
+
+def _existing_title(nfo):
+    try:
+        with open(nfo, encoding="utf-8") as f:
+            m = re.search(r"<title>([^<]*)</title>", f.read())
+        return (m.group(1).strip() if m else "")
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
 def write_nfo(path, s, e, info, overwrite=False):
     nfo = os.path.splitext(path)[0] + ".nfo"
     if os.path.exists(nfo) and not overwrite:
         return "skip_exists"
+    # 2026-11-19：TODB 对不少剧只给「第 N 集」占位，--rewrite 会用它盖掉
+    # TMDB 已经有的真实集名（谷雨 E20 就这样从「严平安接受调查」变成「第 20 集」）。
+    # 占位不得覆盖真名：新的是占位、旧的是真名 → 不写。
+    _new_t = (info.get("t") or "").strip()
+    _old_t = _existing_title(nfo)
+    if _PLACEHOLDER.match(_new_t) and _old_t and not _PLACEHOLDER.match(_old_t):
+        return "skip_placeholder"
     rows = ['<?xml version="1.0" encoding="utf-8" standalone="yes"?>', "<episodedetails>",
             "  <title>%s</title>" % xml_esc(info["t"]),
             "  <season>%d</season>" % s, "  <episode>%d</episode>" % e]
@@ -318,7 +337,9 @@ def main():
     vc = json.load(open(TT.__dict__.get("CACHE", "/opt/embytg/pipeline/.todb_title_cache.json")))
     report, stats = [], {}
     t0 = time.time()
-    for l, sp, sid in TT.iter_series(a.lib, a.series):
+    _tid = a.series if (a.series or "").isdigit() else None
+    _name = None if _tid or not a.series else a.series
+    for l, sp, sid in TT.iter_series(a.lib, _tid, _name):
         pairs = disk_pairs(sp)
         if not pairs:
             continue
