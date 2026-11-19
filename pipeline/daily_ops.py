@@ -244,9 +244,40 @@ def main():
             _q = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "tgpipe.log")
         except Exception:                                            # noqa: BLE001
             _q = ""
-        line(n24 <= 10, "转存画质虚标", (detail + "｜占比 " + ", ".join(
-            "%s=%.0f%%" % (k, 100.0 * v / max(n24, 1)) for k, v in per.items())) if n24
-            else "无（标签与实际一致）")
+        # 真正该 FAIL 的是「名字标的画质与实测不符」——源站虚标由 tgpipe 落地前订正，
+        # 只要订正成功就不算故障，只作参考信息（占比高 = 该频道 4K 不可信）。
+        try:
+            _c2 = sqlite3.connect("file:%s?mode=ro" % os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "tg.db"), uri=True, timeout=10)
+            _rows = _c2.execute("select rel, width, height from resource_state "
+                                "where landed_at>=? and width is not null", (int(time.time()) - 86400,)).fetchall()
+            _c2.close()
+        except Exception:                                            # noqa: BLE001
+            _rows = []
+
+        def _real(w, h):
+            w, h = w or 0, h or 0
+            if w >= 3000 or h >= 1800:
+                return "2160p"
+            if w >= 1700 or h >= 1000:
+                return "1080p"
+            if w >= 1200 or h >= 700:
+                return "720p"
+            return "SD"
+
+        _bad = []
+        for _rel, _w, _h in _rows:
+            if not (_w or _h):
+                continue                     # 还没探测到分辨率，不参与判定
+            _nm = _rel.split("/")[-1]
+            _tag = ("2160p" if "2160p" in _nm else "1080p" if "1080p" in _nm
+                    else "720p" if "720p" in _nm else None)
+            if _tag and _tag != _real(_w, _h):
+                _bad.append("%s(标%s实%s)" % (_nm[:20], _tag, _real(_w, _h)))
+        _info = ("源站虚标 %d 条" % n24) if n24 else "源站无虚标"
+        line(not _bad, "落地画质与实测一致",
+             "%d 条不符：%s｜%s" % (len(_bad), "; ".join(_bad[:3]), _info) if _bad
+             else "近24h %d 条已探测全部一致｜%s" % (len(_rows), _info))
     except Exception as e:                                          # noqa: BLE001
         line(False, "转存画质虚标", str(e)[:50])
 

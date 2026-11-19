@@ -232,6 +232,29 @@ async def click_next(c, ent, msg):
     return await c.get_messages(ent, ids=msg.id)
 
 
+def real_qual(doc, fallback="1080p"):
+    """用文件自带的视频属性判真实画质 —— 机器人文字标签不可信。
+
+    实测：标「4K高清」的 6 部里，实际是 1920x1080 / 2560x1080 / 1920x800。
+    DocumentAttributeVideo 里带 w/h，按宽度优先（宽>=3000 才 2160p）判定，
+    与 tgpipe.parse_quality 同一口径。
+    """
+    try:
+        for a in (getattr(doc, "document", None).attributes or []):
+            if hasattr(a, "w") and hasattr(a, "h"):
+                w, h = int(getattr(a, "w", 0) or 0), int(getattr(a, "h", 0) or 0)
+                if w >= 3000 or h >= 1800:
+                    return "2160p"
+                if w >= 1700 or h >= 1000:
+                    return "1080p"
+                if w >= 1200 or h >= 700:
+                    return "720p"
+                return "SD"
+    except Exception:                                          # noqa: BLE001
+        pass
+    return fallback
+
+
 def clean_title(t):
     """落库用的干净片名：去版本词、去零宽字符、收空格。"""
     s = (t or "")
@@ -342,7 +365,8 @@ async def item_worker(slot, q, results, dry, cap):
             if not doc:
                 results["miss"] += 1
                 continue
-            title, year, qual, first = parse_header(desc)
+            title, year, qual_label, first = parse_header(desc)
+            qual = real_qual(doc, qual_label)          # 以文件属性为准，不信文字标签
             if Y.is_cam(first):
                 results["cam"] += 1
                 continue

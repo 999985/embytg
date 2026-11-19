@@ -316,6 +316,19 @@ async def main():
 
     title = safe_name(item.get("title") or "未命名")
     year = item.get("year") or 0
+    try:
+        for _a in (doc.document.attributes or []):
+            if type(_a).__name__ == "DocumentAttributeVideo":
+                _w, _h = int(getattr(_a, "w", 0) or 0), int(getattr(_a, "h", 0) or 0)
+                if _w >= 3000 or _h >= 1800:
+                    qual = "2160p"
+                elif _w >= 1700 or _h >= 1000:
+                    qual = "1080p"
+                elif _w >= 1200 or _h >= 700:
+                    qual = "720p"
+                break
+    except Exception:                                          # noqa: BLE001
+        pass
     _y, _tid = tmdb_lookup(title)
     if not year and _y:
         year = _y
