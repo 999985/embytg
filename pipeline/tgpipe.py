@@ -108,7 +108,6 @@ PENDING = cfg("pending_file")  # 全量待上片队列（一次 scan 生成，�
 SNAPSHOT = cfg("snapshot_file")  # 频道解析结果快照（重跑免再拉 TG 全历史）
 ALLOW_MULTIPART = False
 # 禁止转发的频道（ChatForwardsRestrictedError）：无法引用式转发，直接标记 done 跳过
-BLOCKED_CHANNELS = set(cfg("blocked_channels", ["AE9527x"]))
 
 # 双源凭证 / 端点
 TMDB_TK = cfg("tmdb_token")
@@ -137,7 +136,6 @@ CHANNELS = [
     ("DYPD_3", 3, "movie_angle"),     # 1080 电影，老片库
     ("tengxun4k", 4, "tv_hash"),      # 剧集，同集 4K + 1080
     ("luolimeimei", 5, "tv_book"),    # 剧集，单集带剧名
-    ("AE9527x", 6, "tv_album"),       # 剧集，相册打包 E21-30
     ("yingshi9999", 7, "tv_album"),   # 剧集，相册 + 独立标题
 ]
 
@@ -1082,6 +1080,15 @@ def dedupe(items, state, idx=None):
             _best[_k] = (_sc, _it)
         else:
             _it["skip"] = "同集低画质"
+    # 2026-11-19：跨批次、跨画质的同集保护。
+    # 原来判重把 qual 拼进 key，于是库里已有 2160p 时再来一份 1080p 会**另建一条**，
+    # Emby 里同一集出现两个条目。现在：只要库里/台账里有比它更高的画质，就跳过；
+    # 高画质补进低画质的集（用户策略：低画质不删，高画质另存）仍然允许。
+    _st_best = {}
+    for (_a, _s, _e, _q) in st_ep:
+        _r = _qr.get(str(_q).lower(), 0)
+        if _r > _st_best.get((_a, _s, _e), -1):
+            _st_best[(_a, _s, _e)] = _r
     kept, seen = [], set()
     for it in items:
         if it.get("skip"):
@@ -1100,6 +1107,18 @@ def dedupe(items, state, idx=None):
         if _has(cur, anchors, qual, tail) or _has(st_cur, anchors, qual, tail):
             it["skip"] = "库内已有同画质"
             continue
+        if tail:
+            _mine = _qr.get(qual, 0)
+            for _a in anchors:
+                _best_rank = _st_best.get((_a, tail[0], tail[1]), -1)
+                for _hi_q in [q for q in _qr if _qr[q] > _mine]:
+                    if _has(cur, [_a], _hi_q, tail):
+                        _best_rank = max(_best_rank, _qr[_hi_q])
+                if _best_rank > _mine:
+                    it["skip"] = "库里已有更高画质"
+                    break
+            if it.get("skip"):
+                continue
         seen.add(key)
         kept.append(it)
     return kept
@@ -1156,11 +1175,64 @@ def too_low_quality(it):
         return False
 
 
+_TMDB_CACHE_P = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tgpipe_tmdb.json")
+_TMDB_CACHE = {}
+
+
+def _tmdb_mid(name, year, kind="tv"):
+    """按片名+年份查 TMDB id，带进程内 + 落盘缓存。
+
+    2026-11-19 根因：频道扫到的条目 `src != "tmdb"` 时，file_name 不加锚点，
+    目录落成 `多喜一家人 (2026)` 而不是 `多喜一家人 (2026) {tmdb=xxx}` ——
+    后续 tmdb 为 None、Series NFO 生成不出来、缺口统计也认不出这部剧。
+    锚点必须在落地**之前**补齐，不能等事后修。
+    """
+    if not _TMDB_CACHE:
+        try:
+            _TMDB_CACHE.update(json.load(open(_TMDB_CACHE_P, encoding="utf-8")))
+        except Exception:                                    # noqa: BLE001
+            pass
+    key = "%s|%s|%s" % (kind, name, year)
+    if key in _TMDB_CACHE:
+        return _TMDB_CACHE[key] or 0
+    mid = 0
+    try:
+        import urllib.parse as _up
+        import urllib.request as _ur
+        try:
+            from embytg_conf import cfg as _cfg
+            _api = _cfg("tmdb_api").rstrip("/")
+            _tok = _cfg("tmdb_token")
+        except Exception:                                    # noqa: BLE001
+            _api, _tok = "https://api.themoviedb.org/3", os.environ.get("TMDB_TOKEN", "")
+        _q = _up.urlencode({"query": name, "language": "zh-CN",
+                            **({"year": year} if str(year).isdigit() and str(year) != "0000" else {})})
+        _u = "%s/search/%s?%s" % (_api, "movie" if kind == "movie" else "tv", _q)
+        _rq = _ur.Request(_u, headers={"Authorization": "Bearer %s" % _tok,
+                                       "accept": "application/json"})
+        with _ur.urlopen(_rq, timeout=15) as _f:
+            _res = (json.loads(_f.read()) or {}).get("results") or []
+        if _res:
+            mid = int(_res[0].get("id") or 0)
+    except Exception:                                        # noqa: BLE001
+        mid = 0
+    _TMDB_CACHE[key] = mid
+    try:
+        json.dump(_TMDB_CACHE, open(_TMDB_CACHE_P, "w", encoding="utf-8"), ensure_ascii=False)
+    except Exception:                                        # noqa: BLE001
+        pass
+    return mid
+
+
 def file_name(it):
     """中文规范名 + TMDB ID 锚点；剧集 ID 写在文件夹名（Emby 精确识别 Series），文件名按 SxxExx。"""
     _real_qual(it)
     name = it.get("meta_name") or it["title"]
     year = it.get("year") or "0000"
+    if not (it.get("src") == "tmdb" and it.get("mid")):
+        _m = _tmdb_mid(name, year, "movie" if it.get("kind") == "movie" else "tv")
+        if _m:
+            it["mid"], it["src"] = _m, "tmdb"
     anchor = f' {{tmdb={it["mid"]}}}' if (it.get("src") == "tmdb" and it.get("mid")) else ""
     if it["kind"] == "movie":
         base = f"{name} ({year}){anchor}"

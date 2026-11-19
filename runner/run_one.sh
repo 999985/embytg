@@ -293,6 +293,15 @@ fi
 
 if [ "$MODE" = "auto" ]; then
   LANES_ORDER="$("$VENV" "$POLICY" next 2>/dev/null || echo new)"
+  # 2026-11-19（E183）：policy.next 返回的是**全局**推荐窗口（当前固定两格 new/fill），
+  # 四条 lane 拿到同一份候选 → 前两条被别人 claim 走后，剩下的一律 LANE_BUSY → IDLE_NO_JOB。
+  # 实测 slot2 连续 1389 次重启全是 `LANE_BUSY lane=new/fill` 后 exit 0，
+  # 而同一时刻 upgrade 队列压着 2000 集没人干。
+  # 修法：保留 policy 的优先级顺序，把没列进去的 lane 追加到尾部兜底
+  # （优先级不变，只是不再「没被推荐就绝不碰」）。
+  for _L in upgrade new fill; do
+    case " $LANES_ORDER " in *" $_L "*) ;; *) LANES_ORDER="$LANES_ORDER $_L" ;; esac
+  done
 else
   # 2026-11-17（E163）：**固定车道的 runner 在 NOJOB 之后必须能换道，不能空转。**
   #

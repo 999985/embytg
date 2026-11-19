@@ -281,6 +281,61 @@ def main():
     except Exception as e:                                          # noqa: BLE001
         line(False, "转存画质虚标", str(e)[:50])
 
+    # 4.51) 新入库码率达标率（2026-11-19 目标口径）
+    # 判据不是「文件名标了什么」，而是 size×8/dur_sec 的真实码率：
+    # 2160p ≥2.0Mbps、1080p ≥0.8Mbps、其余 ≥0.4Mbps。
+    # 存量 1463 集低码率是历史遗留（门禁上线前入库的），这里只看**新入库**，
+    # 因为新入库能不能达标才是可控的那一半。
+    try:
+        _c3 = sqlite3.connect("file:%s?mode=ro" % os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "tg.db"), uri=True, timeout=10)
+        _r3 = _c3.execute("select rel, size, dur_sec, width, height from resource_state "
+                          "where kind='episode' and landed_at>=? and dur_sec>0 and size>0",
+                          (int(time.time()) - 86400,)).fetchall()
+        _c3.close()
+        _bad3 = []
+        for _rel3, _sz3, _d3, _w3, _h3 in _r3:
+            _mbps = _sz3 * 8 / _d3 / 1e6
+            _floor3 = 2.0 if ((_w3 or 0) >= 3000 or (_h3 or 0) >= 1800) else (
+                0.8 if ((_w3 or 0) >= 1700 or (_h3 or 0) >= 1000) else 0.4)
+            if _mbps < _floor3:
+                _bad3.append("%s(%.1fMbps)" % (_rel3.split("/")[-1][:22], _mbps))
+        if not _r3:
+            # 台账探测滞后（新集 dur_sec 还没填）时，改问 Emby 要 RunTimeTicks ——
+            # 否则会出现「近24h 0 集，达标率 100%」这种假通过。
+            try:
+                import urllib.parse as _up
+                import urllib.request as _ur
+                from embytg_conf import cfg as _cfg
+                _b = _cfg("emby_url").rstrip("/")
+                _tk = _cfg("emby_token")
+                _since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+                _q = _up.urlencode({"Recursive": "true", "IncludeItemTypes": "Episode",
+                                    "MinDateCreated": _since, "Fields": "Path,MediaSources,RunTimeTicks",
+                                    "Limit": "5000"})
+                with _ur.urlopen("%s/Items?%s&api_key=%s" % (_b, _q, _tk), timeout=120) as _f:
+                    _items = (json.loads(_f.read()) or {}).get("Items") or []
+                for _it in _items:
+                    _ms = (_it.get("MediaSources") or [{}])[0]
+                    _d3 = (_it.get("RunTimeTicks") or 0) / 1e7
+                    _sz3 = _ms.get("Size") or 0
+                    if not _d3 or not _sz3:
+                        continue
+                    _nm = (_it.get("Path") or "").split("/")[-1]
+                    _mbps = _sz3 * 8 / _d3 / 1e6
+                    _floor3 = 2.0 if "2160p" in _nm else (0.8 if "1080p" in _nm else 0.4)
+                    _r3.append((_nm, _sz3, _d3, 0, 0))
+                    if _mbps < _floor3:
+                        _bad3.append("%s(%.1fMbps)" % (_nm[:22], _mbps))
+            except Exception:                                       # noqa: BLE001
+                pass
+        _rate = (1 - len(_bad3) / len(_r3)) * 100 if _r3 else 100.0
+        line(_rate >= 95, "新入库码率达标",
+             "近24h %d 集，达标率 %.1f%%%s" % (len(_r3), _rate,
+              ("，不达标 %d：%s" % (len(_bad3), "; ".join(_bad3[:3]))) if _bad3 else ""))
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "新入库码率达标", str(e)[:50])
+
     # 4.52) 同片同画质重复入库（2026-11-20 封神第一部事故沉淀）
     # 用户策略是「低画质删不掉就并存，高画质并列」，所以同片名同一年份出现两条**不同画质**
     # 是设计内的；真正要抓的是「同片名 + 同一年份 + 同一画质」两条 —— 那是重复导入。

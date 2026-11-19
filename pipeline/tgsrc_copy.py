@@ -3,8 +3,6 @@
 
 ## 为什么需要它（2026-11-18 实测）
 
-@AE9527x / @liwu12138 都是 `noforwards=True`（禁止转发），tgpipe 原来直接把
-AE9527x 拉黑跳过。实测结论：
 
     noforwards=True     但成员可以 get_messages
     也能 iter_download  实测两个频道各拉 512KB 成功（2.4GB / 3.9GB 的文件）
@@ -17,9 +15,7 @@ AE9527x 拉黑跳过。实测结论：
 
 ## 用法
 
-    python3 tgsrc_copy.py --channel AE9527x --msg 9229 \
         --dir "电影/测试" --name "测试.mp4" --dry     # 只看，不动
-    python3 tgsrc_copy.py --channel AE9527x --msg 9229 \
         --dir "电影/测试" --name "测试.mp4"           # 真搬
 """
 import argparse

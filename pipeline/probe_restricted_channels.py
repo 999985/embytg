@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """probe_restricted_channels.py —— 探测「禁止转发」频道到底禁到哪一步。
 
-背景（2026-11-18）：@AE9527x 与 @liwu12138 两个频道内容好，但 tgpipe 目前把
-AE9527x 直接拉黑（`ChatForwardsRestrictedError`）。需要先分清三种限制：
 
   1. noforwards（保护内容）→ 转发被拒，但**下载通常仍然允许**；
   2. 频道禁止保存/复制 → 同上，API 侧一般不断；
@@ -23,7 +21,6 @@ from telethon import TelegramClient                       # noqa: E402
 from telethon.sessions import StringSession               # noqa: E402
 
 ENV = "/opt/embytg-runner/runner.env"
-TARGETS = ["AE9527x", "liwu12138"]
 
 
 def load_env(path=ENV):
