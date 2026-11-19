@@ -224,7 +224,10 @@ def main():
                 print("  E%s 无直链，跳过" % it.get("IndexNumber")); continue
             q, w, h = quality_of(ms)
             name = "%s S01E%02d - %s.mkv" % (a.series, int(it.get("IndexNumber") or 0), q)
-            dest = os.path.join("/opt/embytg-runner", "media.slot%d" % slot, name)
+            # 2026-11-19 事故：上传 lane 的 run_one.sh 结束时会 rm -rf media.slotN，
+            # 我们下载到 media.slotN 的文件会被它顺手删掉，表现为
+            # 「下载完成 → 上传 FileNotFoundError」。改用独占目录，谁也别动。
+            dest = os.path.join("/opt/embytg-runner", "media.emos", name)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             print("  下载 E%s %s %.2fGB → %s" % (it.get("IndexNumber"), q,
                                               (ms.get("Size") or 0)/1e9, name), flush=True)
