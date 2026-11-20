@@ -144,6 +144,13 @@ def cache_stats():
                 "SELECT count(*) FROM ep_cache WHERE k LIKE '!err%'").fetchone()[0])
         except Exception:                                        # noqa: BLE001
             pass
+        # 2026-11-20：源能力记忆必须可观测（学没学到决定还烧不烧配额）。
+        try:
+            for label, sb, lim in c.execute(
+                    "SELECT label, shows_bad, limit_ok FROM src_caps ORDER BY label"):
+                out["cap:%s" % label] = "shows_bad=%d limit=%d" % (1 if sb else 0, int(lim or 0))
+        except Exception:                                        # noqa: BLE001
+            pass
         c.close()
     except Exception:                                            # noqa: BLE001
         pass
@@ -244,6 +251,71 @@ def _ep_err_put(k, msg):
             pass
 
 
+# ---- 源能力记忆（2026-11-20）----
+# 症状：lite.cn2gias.uk 每天 73 次 400（7 天 501 次），全是同一个**已知事实**的重复发现——
+# 它没实现 `/Shows/{id}/Episodes`，且 `Limit>500` 必 400。代码里这条事实只写在 docstring，
+# 没有记忆，于是每次列集都要从「错端点 + 错上限」重新试 4~6 次才落到能用的组合：
+#   00:37:02 /Shows/233000/Episodes?...&Limit=10000 -> 400
+#   00:37:04 同上 Limit=500 -> 400
+#   00:37:05 同上 Limit=200 -> 400
+#   00:37:07 同上 Limit=100 -> 400
+#   00:37:09 /Items?SeriesId=233000...&Limit=10000   -> 400
+#   00:37:15 /Items?SeriesId=233000...&Limit=500     -> 200  ← 6 次请求换来 1 次可用
+# 按源记一次能力（端点是否可用 / 最大可用 Limit），下次**第一次**就打对的组合。
+# 量级：14 行常量级，O(1) 读写，与 20 万集无关；TTL 7 天，到期重新探测（源站升级后能自愈）。
+_CAP_TTL = int(float(os.getenv("EMBYTG_SRC_CAP_TTL", str(7 * 86400))))
+
+
+def _cap_get(label, now):
+    """返回 {'shows_bad': bool, 'limit_ok': int}；过期/不存在返回 None。"""
+    try:
+        c = _l2_conn()
+        c.execute("CREATE TABLE IF NOT EXISTS src_caps("
+                  "label TEXT PRIMARY KEY, ts REAL, shows_bad INT, limit_ok INT)")
+        row = c.execute("SELECT ts, shows_bad, limit_ok FROM src_caps WHERE label=?",
+                        (label,)).fetchone()
+        c.close()
+        if not row:
+            return None
+        ts, shows_bad, limit_ok = row
+        if now - float(ts or 0) >= _CAP_TTL:
+            return None
+        return {"shows_bad": bool(shows_bad), "limit_ok": int(limit_ok or 0)}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _cap_put(label, shows_bad=None, limit_ok=None):
+    """只更新传入的字段，其余保留（读-改-写，一行，O(1)）。"""
+    try:
+        c = _l2_conn()
+        c.execute("CREATE TABLE IF NOT EXISTS src_caps("
+                  "label TEXT PRIMARY KEY, ts REAL, shows_bad INT, limit_ok INT)")
+        old = c.execute("SELECT shows_bad, limit_ok FROM src_caps WHERE label=?",
+                        (label,)).fetchone() or (0, 0)
+        sb = old[0] if shows_bad is None else shows_bad
+        lim = old[1] if limit_ok is None else limit_ok
+        c.execute("INSERT OR REPLACE INTO src_caps VALUES(?,?,?,?)",
+                  (label, time.time(), int(bool(sb)), int(lim or 0)))
+        c.commit()
+        c.close()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _cap_learn(label, original, used):
+    """一次成功调用后固化「端点 + 上限」。只在成功路径上调用，失败不写（失败另有负缓存）。"""
+    kw = {}
+    m = _LIMIT_RE.search(used or "")
+    if m:
+        kw["limit_ok"] = int(m.group(2))
+    if _SHOWS_EP_RE.match(original or ""):
+        # 原始要的是 /Shows，最终用 /Items 成功 = 该源没有 Shows 前缀；反之则确认可用。
+        kw["shows_bad"] = 0 if _SHOWS_EP_RE.match(used or "") else 1
+    if kw:
+        _cap_put(label, **kw)
+
+
 def _ep_get(g, st, path):
     """带缓存的 Episodes 请求。缓存异常一律退回直接请求（缓存不能成为故障源）。
 
@@ -274,20 +346,35 @@ def _ep_get(g, st, path):
     if err is not None:
         raise RuntimeError("源 %s 列集近 %ds 内失败过（负缓存）：%s"
                            % (key[0], _EP_ERR_TTL, err))
+    # 2026-11-20：用「已知能力」把起点直接修正到可用组合。
+    # lite 的实测链路是 /Shows(Limit=10000)→400→500→200→100→全 400，
+    # 再换 /Items(Limit=10000)→400→500→200，6 次请求才拿到数据；
+    # 记住后第一次就是 `/Items?SeriesId=...&Limit=500`，1 次命中。
+    base = path
+    cap = _cap_get(key[0], now)
+    if cap:
+        if cap.get("shows_bad") and _SHOWS_EP_RE.match(base):
+            base = _shows_to_items_path(base) or base
+        if cap.get("limit_ok"):
+            base = _rewrite_limit(base, cap["limit_ok"]) or base
     data = None
     try:
-        data = g.get(st, path)
+        data = g.get(st, base)
+        _cap_learn(key[0], path, base)
     except Exception as e:                                          # noqa: BLE001
         if not any(s in str(e) for s in ("400", "404")):
             _ep_err_put(k, e)
             raise
+        # 只从「成功路径」学习（_cap_learn）。不因一次 404 就把源判成没实现 Shows：
+        # 404 也可能是这一部剧在该源不存在，那是 per-show 事实，不是 per-source 能力。
         # ① Limit 降级：同一路径换成后端能接受的分页大小
         for lim in ("500", "200", "100"):
-            p2 = _rewrite_limit(path, lim)
+            p2 = _rewrite_limit(base, lim)
             if p2 is None:
                 break
             try:
                 data = g.get(st, p2)
+                _cap_learn(key[0], path, p2)
                 break
             except Exception as e2:                                 # noqa: BLE001
                 if not any(s in str(e2) for s in ("400", "404")):
@@ -295,7 +382,7 @@ def _ep_get(g, st, path):
                     raise
         # ② 端点改写：没实现 /Shows/{id}/Episodes 的源走 /Items?SeriesId=
         if data is None:
-            alt = _shows_to_items_path(path)
+            alt = _shows_to_items_path(base)
             if alt is None:
                 raise
             last = None
@@ -305,6 +392,7 @@ def _ep_get(g, st, path):
                     continue
                 try:
                     data = g.get(st, p3)
+                    _cap_learn(key[0], path, p3)
                     break
                 except Exception as e3:                             # noqa: BLE001
                     last = e3
@@ -1080,8 +1168,14 @@ if __name__ == "__main__":
               % (st.get("ep_rows", "?"), st.get("ep_err_rows", "?"),
                  sum(v for k, v in st.items() if k.startswith("ep_put_err:")),
                  st.get("ep_purge_bulk", 0)))
+        caps = {k[4:]: v for k, v in st.items() if k.startswith("cap:")}
+        if caps:
+            print("  源能力记忆 %d 个：" % len(caps))
+            for label in sorted(caps):
+                print("    %-24s %s" % (label, caps[label]))
         for k in sorted(st):
-            if not k.startswith("ep_") and k not in ("ep_rows", "ep_err_rows"):
+            if not k.startswith("ep_") and not k.startswith("cap:") \
+                    and k not in ("ep_rows", "ep_err_rows"):
                 print("  %s: %d" % (k, st[k]))
         sys.exit(0)
     sys.exit(main())

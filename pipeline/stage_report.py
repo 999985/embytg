@@ -3,7 +3,7 @@
 
 输出字段（与用户验收清单一一对应）：
   1. 五账对账摘要（差异值）
-  2. 本轮 P0 新增：达标 / 无高画质源兜底 / 拦截假 4K
+  2. P0 近 24h 新增（滚动窗口，不是自然日）：达标 / 无高画质源兜底 / 拦截假 4K
   3. 本轮 P1 洗版：成功 / 剩余存量（相对 1467 的净变化）
   4. 4 个 TG session 状态（正常 / 退避剩余）
 
@@ -143,7 +143,7 @@ def main():
 
     items, ok, bad, mbps = scan_quality(1)
     rate = (100.0 * len(ok) / len(items)) if items else 0.0
-    print("P0 当日入库：%d 集（达标 %d / 无高画质源兜底 %d，达标率 %.1f%%）"
+    print("P0 近24h入库：%d 集（达标 %d / 无高画质源兜底 %d，达标率 %.1f%%）"
           % (len(items), len(ok), len(bad), rate))
     if bad:
         for s, nm, m in bad[:5]:

@@ -51,6 +51,12 @@ SLOW_PROGRESS_MIN = 15        # 远端 download.log 15min 内有写入 = 慢但�
 NO_FINISH_HOURS = 3           # 3 小时没有任何完成 → 告警
 THROUGHPUT_RATIO = 0.30       # 近 3h 产能低于「过去 24h 均值」的 30% → 产能塌陷（2026-11-13）
 ORPHAN_CLAIM_MIN = 90         # 同 lane 有更新 claim 且旧记录超过 90min → 疑似孤儿候选
+# 2026-11-20（巡检 08:45）：**产能判据必须看供给侧。**
+#   实测当日 08:45：每源日额度 6 个源已打满，只剩 bangumi 111 次 + aaa 39 次 ≈ 150 次请求，
+#   按 5.5 次/集折合约 27 集上界；而 24h 均值是 17.8 集/h（3h 要 53 集），
+#   物理上不可能达成 —— 这不是产能塌陷，是源站请求预算见底（NOJOB 正常）。
+#   以前只比条数 → 每天额度用完后必假红，和 E160「预算允许量当物理产能」是同一类错。
+REQ_PER_EP = float(os.environ.get("TG_REQ_PER_EP") or 5.5)   # 实测每集约 5.5 次源请求
 
 
 def emby_episodes():
@@ -269,7 +275,7 @@ def gate_blocked_window(window_sec=None):
     return gate_history.blocked_window(window_sec)
 
 
-def throughput_verdict(done_3h, rate_24h_per_h, bb, blocked=None):
+def throughput_verdict(done_3h, rate_24h_per_h, bb, blocked=None, supply=None):
     """产能判据：预算视角优先（见 byte_budget 的说明）。
 
     没有预算视图时才回落到「近 3h vs 过去 24h 均值」的老判据。
@@ -286,6 +292,10 @@ def throughput_verdict(done_3h, rate_24h_per_h, bb, blocked=None):
     """
     if isinstance(bb, dict) and (bb.get("gate_holding") or bb.get("exhausted")):
         return True
+    # 供给侧优先：源码/源站请求额度见底时，「近 3h 达不到 24h 均速」是物理必然。
+    # 只降级产能判据，不放宽「近 3h 零登记」——那条在上游单独判（done_3h == 0）。
+    if isinstance(supply, dict) and supply.get("supply_bound"):
+        return True
     # 窗口里跨了硬停、且刚放开不到 90 分钟：恢复期不给产能定罪（E160）。
     # 下一轮窗口不再含硬停时判据自行恢复，最多跳过一次。
     if isinstance(blocked, dict) and blocked.get("secs") \
@@ -301,6 +311,87 @@ def throughput_verdict(done_3h, rate_24h_per_h, bb, blocked=None):
     if needs and done_3h < min(needs):
         return False
     return True
+
+
+def _req_per_ep_recent(now=None, window_h=24):
+    """近 24h 实测「每集消耗多少次源站请求」。
+
+    供给侧判据必须用实测比值，不能用想当然的常数：实测 11-19 是 3.14 次/集
+    （源站连着给整季），11-20 上午是 16.8 次/集（缺集要逐个探）。差 5 倍，
+    用固定常数会把「其实还有额度」判成见底，或者反过来。
+    """
+    now = now or time.time()
+    eps = 0
+    try:
+        _c = sqlite3.connect("file:%s?mode=ro" % os.path.join(HERE, "tg.db"),
+                             uri=True, timeout=20)
+        eps = int(_c.execute("select count(*) from resource_state where landed_at>=?",
+                             (now - window_h * 3600,)).fetchone()[0] or 0)
+        _c.close()
+    except Exception:                                          # noqa: BLE001
+        pass
+    req = 0
+    try:
+        for ln in open(os.path.join(HERE, "logs", "source_requests.log"),
+                       encoding="utf-8", errors="ignore"):
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                r = json.loads(ln)
+                t = r.get("ts")
+                try:
+                    t = float(t)
+                except (TypeError, ValueError):
+                    t = time.mktime(time.strptime(str(t), "%Y-%m-%d %H:%M:%S"))
+            except Exception:                                  # noqa: BLE001
+                continue
+            if t >= now - window_h * 3600:
+                req += 1
+    except Exception:                                          # noqa: BLE001
+        return REQ_PER_EP
+    if not eps or not req:
+        return REQ_PER_EP
+    return max(1.0, min(20.0, req / float(eps)))
+
+
+def source_supply(rate_24h_per_h=0.0, hours=None, req_per_ep=None):
+    """源站**请求额度**视图（每源 daily_cap − day）—— 供给侧能不能支撑 24h 均速。
+
+    为什么必须有这一项（2026-11-20 巡检）：
+      `throughput_verdict` 只比「近 3h 条数 vs 24h 均值」。但 discovery 的硬顶是
+      **每源日请求额度**：额度用完后 runner 会诚实地 NOJOB source_budget（正常，
+      不是故障）。此时继续按条数判产能 = 要求它用 0 次请求产出 53 集。
+      实测 08:45：10 个源里 8 个已打满，剩 bangumi 111 + aaa 39 = 150 次请求，
+      按 5.5 次/集 ≈ 27 集上界；而 24h 均值要 3h 出 53 集 → 物理不可能。
+    判据只读额度，不猜源好坏；`disabled` 源不计入余额。
+    """
+    hours = float(hours if hours is not None else NO_FINISH_HOURS)
+    rpe = float(req_per_ep if req_per_ep is not None else _req_per_ep_recent())
+    b = load(".gha_src_budget.json", {})
+    limits = b.get("limits") or {}
+    daily = int(limits.get("daily") or 300)
+    rows, remaining, usable = {}, 0, 0
+    for label, rec in (b.get("sources") or {}).items():
+        if not isinstance(rec, dict) or rec.get("disabled"):
+            continue
+        cap = rec.get("daily_cap")
+        cap = daily if cap in (None, 0, "0") else int(cap)
+        day = int(rec.get("day") or 0)
+        left = max(0, cap - day)
+        rows[str(label)] = {"cap": cap, "day": day, "left": left}
+        remaining += left
+        if left > 0:
+            usable += 1
+    need = float(rate_24h_per_h or 0.0) * hours * rpe
+    return {"remaining": remaining,
+            "usable_sources": usable,
+            "total_sources": len(rows),
+            "req_per_ep": round(rpe, 2),
+            "max_eps_3h": round(remaining / rpe, 1),
+            "need_requests": round(need),
+            "supply_bound": bool(need > 0 and remaining < need),
+            "detail": rows}
 
 
 def _gate_eval(lane="new"):
@@ -484,8 +575,10 @@ def main():
     _bb = byte_budget()
     rep["byte_budget"] = _bb
     rep["gate_blocked_3h"] = gate_blocked_window()
+    _supply = source_supply(rep["rate_24h_per_h"])
+    rep["source_supply"] = _supply
     rep["throughput_ok"] = throughput_verdict(rep["done_3h"], rep["rate_24h_per_h"],
-                                              _bb, rep["gate_blocked_3h"])
+                                              _bb, rep["gate_blocked_3h"], _supply)
 
     # 2) 队列
     q = {}
@@ -605,6 +698,14 @@ def main():
                             "不是预算不足，是闸门口径或闸门本身卡住"
                             % (_bb.get("remaining_gb") or 0, _bb.get("daily_gb") or 0,
                                _bb.get("pace_gb_h") or 0))
+    if isinstance(_supply, dict) and _supply.get("supply_bound"):
+        # 供给侧的「没活」不是故障：额度用尽后 runner 会 NOJOB source_budget。
+        # 这条 note 必须带数字，否则下一个人只能看到「产能低」却不知道为什么。
+        notes.append("源站请求额度见底：今日剩余 %d 次（%d/%d 源有余额，按近24h实测 %.2f 次/集 ≈ 上限 %.0f 集），"
+                     "维持 24h 均速需 %d 次 → 低产出是供给受限，不是管线停摆"
+                     % (_supply.get("remaining") or 0, _supply.get("usable_sources") or 0,
+                        _supply.get("total_sources") or 0, _supply.get("req_per_ep") or REQ_PER_EP,
+                        _supply.get("max_eps_3h") or 0, _supply.get("need_requests") or 0))
     _gb = rep.get("gate_blocked_3h")
     _gb = _gb if isinstance(_gb, dict) else {}
     if _gb.get("secs", 0) >= 0.2 * NO_FINISH_HOURS * 3600 \
@@ -698,8 +799,11 @@ def main():
           % (NO_FINISH_HOURS, rep["rate_3h_per_h"], rep["rate_24h_per_h"], dup_3h, dup_n,
              ("（今日最多 %s）" % ", ".join("%s×%d" % (s, n) for s, n in dup_top)) if dup_top else ""))
     print("  Emby 集数 %d（较上次快照 %s）" % (ep, ("%+d" % rep["emby_delta"]) if rep["emby_delta"] is not None else "n/a"))
-    print("  源配额：上限 %s/天；已用 %s" % (rep["budget"]["daily_limit"],
-                                             ", ".join("%s=%d" % kv for kv in list(used.items())[:4]) or "-"))
+    print("  源配额：上限 %s/天；已用 %s；请求余额 %s 次（%s 源可用）"
+          % (rep["budget"]["daily_limit"],
+             ", ".join("%s=%d" % kv for kv in list(used.items())[:4]) or "-",
+             (_supply or {}).get("remaining", "?"),
+             (_supply or {}).get("usable_sources", "?")))
     if rep["stale_claims"]:
         print("  待核对 claim（不可仅凭年龄清理）：%s" % ", ".join("%s/%s(%.0fmin)" % (c["file"], c["lane"] or "unknown", c["age_min"]) for c in rep["stale_claims"][:5]))
     if rep.get("slow_claims"):
