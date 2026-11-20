@@ -24,6 +24,8 @@ import datetime
 import json
 import os
 import re
+import sqlite3
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -35,6 +37,7 @@ import tgsrc_copy as TC                                    # noqa: E402  (upload
 
 BASE = "https://emos.enic65.eu.org"
 UA = "Hills Windows/1.5.1 (windows; 19041.vb_release.191206-1406)"
+HERE = os.path.dirname(os.path.abspath(__file__))
 USER, PW = "enic", "enic"
 
 
@@ -108,18 +111,149 @@ class Emos:
 
 
 def quality_of(ms):
+    """源站 PlaybackInfo 自报的画质：只当线索，**入库命名必须用实测分辨率**。
+
+    2026-11-21 事故：源站把 720x576 的 DVD 花絮标成「720p」，旧代码照抄标签，
+    于是 `武林外传 S01E01 - 720p.mkv` 实际是 SD，daily_ops 判「标720p实SD」。
+    """
     for s in ms.get("MediaStreams") or []:
         if s.get("Type") == "Video" and s.get("Height"):
             h, w = s["Height"], s.get("Width") or 0
-            if w >= 3000 or h >= 1800:
-                return "2160p", w, h
-            if w >= 1700 or h >= 1000:
-                return "1080p", w, h
-            return "720p", w, h
+            return quality_from_dims(w, h), w, h
     return "SD", 0, 0
 
 
-def write_nfo(dir_path, name, item):
+Q_ORDER = {"sd": 0, "720p": 1, "1080p": 2, "2160p": 3}
+TGDB = os.path.join(HERE, "tg.db")
+
+
+def quality_from_dims(w, h):
+    w, h = int(w or 0), int(h or 0)
+    if w >= 3000 or h >= 1800:
+        return "2160p"
+    if w >= 1700 or h >= 1000:
+        return "1080p"
+    if w >= 1200 or h >= 700:
+        return "720p"
+    return "SD"
+
+
+def q_rank(q):
+    return Q_ORDER.get(str(q or "").lower(), 0)
+
+
+def probe_dims(path):
+    """ffprobe 实测下载文件的分辨率；读不出来返回 (0,0)。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "json", path],
+            capture_output=True, text=True, timeout=120)
+        st = (json.loads(r.stdout or "{}").get("streams") or [{}])[0]
+        return int(st.get("width") or 0), int(st.get("height") or 0)
+    except Exception:                                          # noqa: BLE001
+        return 0, 0
+
+
+def _fold_rel_dir(dirname):
+    """目录名去掉年份与 {tmdb=} 锚点后的剧名。"""
+    d = re.sub(r"\s*\{tmdb=\d+\}\s*$", "", dirname, flags=re.I)
+    d = re.sub(r"\s*\(\d{4}\)\s*$", "", d)
+    return d.strip()
+
+
+def resolve_series_dir(name, tmdb=0):
+    """从台账里找已存在的 **带 {tmdb=} 锚点** 的剧目录。
+
+    为什么必须从台账反查（2026-11-21）：默认写到 `TV/国漫/<剧名>` 是无锚点、
+    无 Season 目录的野目录 —— Emby 会另建一个同名剧，五账里 teldrive 有、state_key 没有，
+    用户搜索看到两部「武林外传」。找不到锚点目录就拒绝入库，宁缺毋错。
+    返回 (TV/lib/dir, tmdb, lib) 或 (None, 0, "")。
+    """
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % TGDB, uri=True, timeout=20)
+        try:
+            rows = con.execute(
+                "select rel from resource_state where kind='episode' and rel like 'TV/%'"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None, 0, ""
+    cand = {}
+    for (rel,) in rows:
+        parts = (rel or "").split("/")
+        if len(parts) < 4:
+            continue
+        m = re.search(r"\{tmdb=(\d+)\}", parts[2])
+        if not m:
+            continue
+        if tmdb and int(m.group(1)) != int(tmdb):
+            continue
+        if _fold_rel_dir(parts[2]) != name and name not in _fold_rel_dir(parts[2]):
+            continue
+        key = "/".join(parts[:3])
+        cand[key] = cand.get(key, 0) + 1
+    if not cand:
+        return None, 0, ""
+    best = max(cand.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    m = re.search(r"\{tmdb=(\d+)\}", best)
+    return best, (int(m.group(1)) if m else 0), best.split("/")[1]
+
+
+def existing_best(tmdb, season, ep):
+    """该集已有文件的最高画质（台账口径）。"""
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % TGDB, uri=True, timeout=20)
+        try:
+            rows = con.execute(
+                "select rel,width,height from resource_state where kind='episode' and tmdb=?",
+                (int(tmdb),)).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return "SD"
+    best = "SD"
+    want = re.compile(r"S%02dE%02d" % (int(season), int(ep)), re.I)
+    for rel, w, h in rows:
+        if not want.search(rel or ""):
+            continue
+        q = quality_from_dims(w, h) if (w or h) else "SD"
+        if q_rank(q) > q_rank(best):
+            best = q
+    return best
+
+
+def register_tgdb(folders, fid, name, parts, tmdb, lib, ch="emos"):
+    """上传+PG 登记之后补写 tg.db（state_key/resource_state 的锚点）。
+
+    2026-11-21：旧代码只写 teldrive，state_key 里没有这条 → 五账对不上、
+    fill 判不出「已有」、每日对账也发现不了（它只比总数）。
+    """
+    from embytg_conf import store_channel as _store_channel
+    ch_id = 0
+    try:
+        ch_id = int(_store_channel())
+    except Exception:                                          # noqa: BLE001
+        ch_id = 0
+    mani = {"name": name, "mime_type": "video/x-matroska", "channel_id": ch_id,
+            "parts": [{"part_no": i, "channel_id": ch_id, "message_id": int(mid),
+                       "plain_size": int(sz), "stored_size": int(sz)}
+                      for i, (mid, sz) in enumerate(parts, 1)]}
+    cmd = [sys.executable, os.path.join(HERE, "pc_register.py"), "--folders", folders,
+           "--file-id", fid, "--tgdb", "--ch", ch, "--tmdb", str(int(tmdb)), "--lib", lib]
+    try:
+        r = subprocess.run(cmd, input=json.dumps(mani, ensure_ascii=False),
+                           capture_output=True, text=True, timeout=180)
+        out = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        print("  tg.db 登记: %s" % (out[-1][:120] if out else "rc=%d" % r.returncode), flush=True)
+        return r.returncode == 0
+    except Exception as ex:                                    # noqa: BLE001
+        print("  tg.db 登记失败: %s" % str(ex)[:80], flush=True)
+        return False
+
+
+def write_nfo(dir_path, name, item, season=None):
     """写 NFO：标题用源站中文集名（别让 Emby 显示文件名里的英文画质标签）。"""
     import xml.sax.saxutils as su
     title = (item.get("Name") or "").strip()
@@ -132,7 +266,7 @@ def write_nfo(dir_path, name, item):
             f.write('<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
                     '<episodedetails>\n  <title>%s</title>\n  <season>%s</season>\n'
                     '  <episode>%s</episode>\n  <plot>%s</plot>\n</episodedetails>\n'
-                    % (su.escape(title), item.get("ParentIndexNumber") or 1,
+                    % (su.escape(title), season or item.get("ParentIndexNumber") or 1,
                        item.get("IndexNumber") or 0, su.escape(title)))
     except Exception as ex:
         print("  NFO 写入失败（不影响入库）: %s" % str(ex)[:60], flush=True)
@@ -215,8 +349,10 @@ def main():
     ap.add_argument("--series", required=True)
     ap.add_argument("--year", type=int, default=0)
     ap.add_argument("--eps", default="", help="绝对集号，如 2-5,9")
-    ap.add_argument("--target-dir", default="", help="teldrive 目录；缺省按 TMDB 锚点生成")
+    ap.add_argument("--target-dir", default="", help="teldrive 目录；缺省按台账里的 {tmdb=} 锚点目录解析")
     ap.add_argument("--tmdb", type=int, default=0)
+    ap.add_argument("--season", type=int, default=1)
+    ap.add_argument("--min-quality", default="720p", help="实测画质低于此档不导入（默认 720p）")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--limit", type=int, default=3)
@@ -261,6 +397,25 @@ def main():
         return 0
 
     run_id = "emos-%d" % os.getpid()
+    # 目标目录：只允许落在**台账里已存在的、带 {tmdb=} 锚点**的剧目录。
+    # 旧代码缺省写到 `TV/国漫/<剧名>`，于是 Emby 另建同名剧、state_key 缺失（2026-11-21 事故）。
+    if a.target_dir:
+        tdir = a.target_dir.strip("/")
+        m = re.search(r"\{tmdb=(\d+)\}", tdir)
+        if not m or not re.search(r"/Season\s*\d+$", tdir):
+            print("  拒绝：--target-dir 必须形如 TV/<库>/<剧 (年) {tmdb=N}>/Season NN：%s" % tdir)
+            return 2
+        tmdb = a.tmdb or int(m.group(1))
+        lib = tdir.split("/")[1]
+    else:
+        base, tmdb0, lib = resolve_series_dir(a.series, a.tmdb)
+        if not base:
+            print("  拒绝：台账里找不到带 {tmdb=} 锚点的《%s》目录 —— 不允许写到无锚点野目录"
+                  "（会造成同名剧/五账不平，宁缺毋错）" % a.series)
+            return 2
+        tmdb = a.tmdb or tmdb0
+        tdir = "%s/Season %02d" % (base, a.season)
+    print("  目标目录: %s（tmdb=%s lib=%s）" % (tdir, tmdb, lib), flush=True)
     jobs = int(os.environ.get("TG_UPLOAD_JOBS", "8") or 8)
     slot = acquire_slot(run_id, jobs)
     if not slot:
@@ -272,26 +427,49 @@ def main():
             url, ms = e.direct_url(it["Id"])
             if not url:
                 print("  E%s 无直链，跳过" % it.get("IndexNumber")); continue
+            ep = int(it.get("IndexNumber") or 0)
+            title = (it.get("Name") or "").strip()
+            if re.search(r"(花絮|预告|特典|制作特辑|Making|Trailer|NCOP|NCED)", title, re.I):
+                print("  E%s 是花絮/预告（%s），不当作正片导入" % (ep, title[:24])); continue
             q, w, h = quality_of(ms)
-            name = "%s S01E%02d - %s.mkv" % (a.series, int(it.get("IndexNumber") or 0), q)
+            # 源站自报的画质只当线索：低于下限不下载，已有同档/更高档也不算升级。
+            if q_rank(q) < q_rank(a.min_quality):
+                print("  E%s 源侧 %s（%sx%s）低于 %s，跳过" % (ep, q, w, h, a.min_quality)); continue
+            have = existing_best(tmdb, a.season, ep)
+            if q_rank(have) >= q_rank(q):
+                print("  E%s 已有 %s ≥ 源侧 %s，不算升级，跳过" % (ep, have, q)); continue
             # 2026-11-19 事故：上传 lane 的 run_one.sh 结束时会 rm -rf media.slotN，
             # 我们下载到 media.slotN 的文件会被它顺手删掉，表现为
             # 「下载完成 → 上传 FileNotFoundError」。改用独占目录，谁也别动。
-            dest = os.path.join("/opt/embytg-runner", "media.emos", name)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            print("  下载 E%s %s %.2fGB → %s" % (it.get("IndexNumber"), q,
-                                              (ms.get("Size") or 0)/1e9, name), flush=True)
+            tmp = os.path.join("/opt/embytg-runner", "media.emos",
+                               "emos_%s_S%02dE%02d.download" % (a.series, a.season, ep))
+            os.makedirs(os.path.dirname(tmp), exist_ok=True)
+            print("  下载 E%s 源侧 %s %.2fGB" % (ep, q, (ms.get("Size") or 0)/1e9), flush=True)
             t0 = time.time()
             req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=600) as r, open(dest, "wb") as f:
+            with urllib.request.urlopen(req, timeout=600) as r, open(tmp, "wb") as f:
                 while True:
                     chunk = r.read(4 * 1024 * 1024)
                     if not chunk:
                         break
                     f.write(chunk)
             el = max(time.time() - t0, 0.001)
-            print("  下载完成 %.2fGB %.1f MB/s" % (os.path.getsize(dest)/1e9,
-                                                os.path.getsize(dest)/el/1e6), flush=True)
+            print("  下载完成 %.2fGB %.1f MB/s" % (os.path.getsize(tmp)/1e9,
+                                                os.path.getsize(tmp)/el/1e6), flush=True)
+            # 命名/入库一律按 **ffprobe 实测**，不照抄源站标签（2026-11-21 假 720p 事故）。
+            rw, rh = probe_dims(tmp)
+            real_q = quality_from_dims(rw, rh) if (rw or rh) else q
+            if (rw or rh) and real_q != q:
+                print("  E%s 源站标 %s，实测 %s（%sx%s），按实测处理" % (ep, q, real_q, rw, rh), flush=True)
+            if q_rank(real_q) < q_rank(a.min_quality):
+                print("  E%s 实测 %sx%s = %s 低于 %s，丢弃（源站虚标）" % (ep, rw, rh, real_q, a.min_quality))
+                os.remove(tmp); continue
+            if q_rank(real_q) <= q_rank(have):
+                print("  E%s 实测 %s 不优于已有 %s，丢弃" % (ep, real_q, have))
+                os.remove(tmp); continue
+            name = "%s S%02dE%02d - %s.mkv" % (a.series, a.season, ep, real_q)
+            dest = os.path.join("/opt/embytg-runner", "media.emos", name)
+            os.replace(tmp, dest)
             parts = None
             # 快的号先试；超时要换号续传（manifest 认已完成区段），不能一失败就丢集
             for try_slot in [slot] + [x for x in order if x != slot]:
@@ -310,9 +488,11 @@ def main():
             if not parts:
                 print("  全部 slot 上传失败，保留文件: %s" % dest, flush=True)
                 continue
-            tdir = a.target_dir or ("TV/国漫/%s" % a.series)
-            TC.register(tdir, name, parts)
-            write_nfo(os.path.join("/opt/embytg/mnt/embytg", tdir), name, it)
+            fid = TC.register(tdir, name, parts)
+            # 旧代码只写 teldrive；不写 tg.db 就是「五账里少一本」，对账只比总数发现不了。
+            if tmdb and not register_tgdb(tdir, fid, name, parts, tmdb, lib):
+                print("  tg.db 登记失败：本条留在 teldrive 但不计入台账，需人工复核", flush=True)
+            write_nfo(os.path.join("/opt/embytg/mnt/embytg", tdir), name, it, season=a.season)
             scan_one(os.path.join("/mnt/embytg", tdir, name))
             os.remove(dest)
         return 0

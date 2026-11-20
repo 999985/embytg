@@ -35,6 +35,7 @@
   "autoingest.py",
   "autoops.py",
   "build_new_queue_from_sources.py",
+  "claim_quarantine.py",
   "claim_reap.py",
   "emby_scan.py",
   "embytg_conf.py",
@@ -62,8 +63,8 @@
   "src_guard.py",
   "stall_watch.py",
   "tdprobe.py",
-  "upload_health.py",
-  "tg_common.py"
+  "tg_common.py",
+  "upload_health.py"
  ],
  "rule": "prod=systemd/timer/run_one 可达；cron=Hermes cron 点名；tool=有 CLI 入口；legacy=无入口也无人调用",
  "tool": [
@@ -144,6 +145,7 @@
   "restore_fetchers.py",
   "restore_to_new_host.sh",
   "scan_watch.py",
+  "sched_status.py",
   "seed_fill_from_gap.py",
   "source_yield.py",
   "src_budget_rebalance.py",
@@ -165,7 +167,6 @@
   "todb_watch.py",
   "upgrade_episodes.py",
   "upgrade_from_channels.py",
-  "web_lookup.py",
-  "sched_status.py"
+  "web_lookup.py"
  ]
 }

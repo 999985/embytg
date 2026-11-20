@@ -254,7 +254,11 @@ if [ "$SLOT" = "1" ]; then
     if [ "$RESUME_CYCLES" -gt "$MAX_RESUME_CYCLES" ]; then
       QDIR=/opt/embytg/pipeline/.gha_claims_quarantine
       log "RESUME_GIVE_UP $CLAIM_RUN cycles=$RESUME_CYCLES > $MAX_RESUME_CYCLES; quarantining claim"
-      ssh_o "mkdir -p $QDIR && if [ -f /opt/embytg/pipeline/.gha_claims/$CLAIM_LANE.json ]; then mv /opt/embytg/pipeline/.gha_claims/$CLAIM_LANE.json $QDIR/$CLAIM_RUN.json; fi" >/dev/null 2>&1 || true
+      # 2026-11-21：claim 自 11-20 起按 run 分文件（<lane>.<run_id>.json）。
+      # 旧的按 lane 拼文件名的 mv 永远找不到源、失败又被 || true 吞掉，
+      # 于是「隔离」是空操作：claim 留在活跃集，slot1 每 15 秒重选一次，
+      # .resume_cycles 从 5 涨到 260+，每轮一条 P1。必须按 run_id 搬。
+      ssh_o "cd /opt/embytg/pipeline && python3 claim_quarantine.py --run-id '$CLAIM_RUN'" >/dev/null 2>&1 || true
       ssh_o "cd /opt/embytg/pipeline && python3 alert.py --level P1 --code resume_give_up --msg \"claim $CLAIM_RUN 连续 $RESUME_CYCLES 轮收尾失败，已隔离（工作目录 $BASE/work/$CLAIM_RUN/resume.log）；lane $CLAIM_LANE 已释放\"" >/dev/null 2>&1 || true
       policy note --lane "$(policy_lane "$CLAIM_LANE")" --result failed
       CLAIM_ACTIVE=0

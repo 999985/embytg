@@ -5,6 +5,10 @@
 fill_by_ids / repair_lowq / upgrade_episodes / upgrade_from_channels / drop_old。
 把纯工具抽出来，机器人相关代码（BOT/fetch_item/parse_results/best_match）一起删掉。
 """
+import json
+import os
+import re
+
 STORE_CH = -1004413117262
 MNT = '/opt/embytg/mnt/embytg'
 GENRE_DIR = [('动画', 'Movies/动画片'), ('喜剧', 'Movies/喜剧片'), ('爱情', 'Movies/剧情片'), ('动作', 'Movies/动作片'), ('惊悚', 'Movies/惊悚片'), ('恐怖', 'Movies/惊悚片'), ('犯罪', 'Movies/犯罪片'), ('科幻', 'Movies/科幻片'), ('战争', 'Movies/战争片'), ('纪录', 'Movies/纪录片'), ('剧情', 'Movies/剧情片')]
