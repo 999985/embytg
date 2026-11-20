@@ -33,6 +33,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 
@@ -47,6 +48,25 @@ TOKEN = CFG["emby_token"]
 PLACEHOLDER = re.compile(r"^第\s*\d+\s*[集期]$|^Episode\s*\d+$", re.I)
 EP_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})")
 SERIES_LOCK_FIELDS = ["Name", "Overview", "SortName", "OriginalTitle"]
+
+
+def _fold_sort(s):
+    """把标题折成 Emby 的排序键形态：去变音符号 + casefold + 压空白。
+
+    Emby 生成 SortName 时会做 Unicode 兼容分解并丢掉组合字符
+    （`Shōgun` → `Shogun`、`Amélie` → `Amelie`），而 NFO `<title>` 是真源、
+    保留原字母。直接拿两者比字符串会把**正确的库判成失败**：
+    2026-11-21 实测 `Shōgun (2024)` 五轮收尾全部 FAIL 后 claim 被隔离，
+    原因就是 `emby_sort='Shogun' != nfo_title='Shōgun'`。
+    """
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return " ".join(s.casefold().split())
+
+
+def _sort_eq(emby_sort, title):
+    """Emby SortName 与 NFO title 是否等价（只差变音折叠就算等价）。"""
+    return _fold_sort(emby_sort) == _fold_sort(title)
 
 
 def emby(path, method="GET", body=None, timeout=120):
@@ -279,7 +299,7 @@ def repair_series_metadata(series_list):
         if (got_tmdb == want_tmdb and
                 (not want_name or
                  (got_name == want_name and got_name_raw == want_name
-                  and got_sort == want_name))):
+                  and _sort_eq(got_sort, want_name)))):
             continue
         try:
             full = emby("/Users/%s/Items/%s" % (CFG["emby_user_uid"], hit["Id"]))
@@ -318,7 +338,7 @@ def repair_series_metadata(series_list):
             ok_tmdb = str((chk.get("ProviderIds") or {}).get("Tmdb") or "") == want_tmdb
             ok_name = (not want_name or
                        ((chk.get("Name") or "") == want_name
-                        and (chk.get("SortName") or "").strip() == want_name))
+                        and _sort_eq(chk.get("SortName"), want_name)))
             if ok_tmdb and ok_name:
                 fixed += 1
             else:
@@ -675,7 +695,7 @@ def series_identity(series_list):
         elif (hit.get("Name") or "") != meta["title"]:
             bad.append("%s: emby_name=%r nfo_title=%r"
                        % (sdir[:28], hit.get("Name"), meta["title"]))
-        elif (hit.get("SortName") or "") != meta["title"]:
+        elif not _sort_eq(hit.get("SortName"), meta["title"]):
             bad.append("%s: emby_sort=%r nfo_title=%r"
                        % (sdir[:28], hit.get("SortName"), meta["title"]))
     return bad
