@@ -146,9 +146,10 @@ def cache_stats():
             pass
         # 2026-11-20：源能力记忆必须可观测（学没学到决定还烧不烧配额）。
         try:
-            for label, sb, lim in c.execute(
-                    "SELECT label, shows_bad, limit_ok FROM src_caps ORDER BY label"):
-                out["cap:%s" % label] = "shows_bad=%d limit=%d" % (1 if sb else 0, int(lim or 0))
+            for label, sb, lim, sok in c.execute(
+                    "SELECT label, shows_bad, limit_ok, series_ok FROM src_caps ORDER BY label"):
+                out["cap:%s" % label] = "shows_bad=%d limit=%d series_ok=%s" % (
+                    1 if sb else 0, int(lim or 0), int(sok if sok is not None else -1))
         except Exception:                                        # noqa: BLE001
             pass
         c.close()
@@ -264,43 +265,77 @@ def _ep_err_put(k, msg):
 # 按源记一次能力（端点是否可用 / 最大可用 Limit），下次**第一次**就打对的组合。
 # 量级：14 行常量级，O(1) 读写，与 20 万集无关；TTL 7 天，到期重新探测（源站升级后能自愈）。
 _CAP_TTL = int(float(os.getenv("EMBYTG_SRC_CAP_TTL", str(7 * 86400))))
+_CAP_MEM = {}          # label -> (ts, dict|None)；60s 进程内 memo，_cap_put 主动失效
 
 
 def _cap_get(label, now):
-    """返回 {'shows_bad': bool, 'limit_ok': int}；过期/不存在返回 None。"""
+    """返回 {'shows_bad', 'limit_ok', 'series_ok'}；过期/不存在返回 None。
+
+    进程内 memo 60s：`_ordered_sources()` 每轮对每个源调一次，14 个源不该开 14 次连接。
+    `_cap_put()` 会主动失效，所以「刚学到」立刻可见（测试与生产都是同一语义）。
+    """
+    memo = _CAP_MEM.get(label)
+    if memo and now - memo[0] < 60:
+        return memo[1]
     try:
         c = _l2_conn()
         c.execute("CREATE TABLE IF NOT EXISTS src_caps("
-                  "label TEXT PRIMARY KEY, ts REAL, shows_bad INT, limit_ok INT)")
-        row = c.execute("SELECT ts, shows_bad, limit_ok FROM src_caps WHERE label=?",
+                  "label TEXT PRIMARY KEY, ts REAL, shows_bad INT, limit_ok INT, "
+                  "series_ok INT DEFAULT -1)")
+        row = c.execute("SELECT ts, shows_bad, limit_ok, series_ok FROM src_caps WHERE label=?",
                         (label,)).fetchone()
         c.close()
         if not row:
+            _CAP_MEM[label] = (now, None)
             return None
-        ts, shows_bad, limit_ok = row
+        ts, shows_bad, limit_ok, series_ok = row
         if now - float(ts or 0) >= _CAP_TTL:
             return None
-        return {"shows_bad": bool(shows_bad), "limit_ok": int(limit_ok or 0)}
+        out = {"shows_bad": bool(shows_bad), "limit_ok": int(limit_ok or 0),
+               "series_ok": -1 if series_ok is None else int(series_ok)}
+        _CAP_MEM[label] = (now, out)
+        return out
     except Exception:                                            # noqa: BLE001
         return None
 
 
-def _cap_put(label, shows_bad=None, limit_ok=None):
+def _cap_put(label, shows_bad=None, limit_ok=None, series_ok=None):
     """只更新传入的字段，其余保留（读-改-写，一行，O(1)）。"""
+    _CAP_MEM.pop(label, None)          # 刚学到的事实必须立刻可见
     try:
         c = _l2_conn()
         c.execute("CREATE TABLE IF NOT EXISTS src_caps("
-                  "label TEXT PRIMARY KEY, ts REAL, shows_bad INT, limit_ok INT)")
-        old = c.execute("SELECT shows_bad, limit_ok FROM src_caps WHERE label=?",
-                        (label,)).fetchone() or (0, 0)
+                  "label TEXT PRIMARY KEY, ts REAL, shows_bad INT, limit_ok INT, "
+                  "series_ok INT DEFAULT -1)")
+        old = c.execute("SELECT shows_bad, limit_ok, series_ok FROM src_caps WHERE label=?",
+                        (label,)).fetchone() or (0, 0, -1)
         sb = old[0] if shows_bad is None else shows_bad
         lim = old[1] if limit_ok is None else limit_ok
-        c.execute("INSERT OR REPLACE INTO src_caps VALUES(?,?,?,?)",
-                  (label, time.time(), int(bool(sb)), int(lim or 0)))
+        sok = old[2] if series_ok is None else series_ok
+        c.execute("INSERT OR REPLACE INTO src_caps VALUES(?,?,?,?,?)",
+                  (label, time.time(), int(bool(sb)), int(lim or 0), int(sok)))
         c.commit()
         c.close()
     except Exception:                                            # noqa: BLE001
         pass
+
+
+def _items_match_series(data, sid):
+    """`/Items?SeriesId=` 的返回是否真的属于这部剧。
+
+    2026-11-20 实测 lite.cn2gias.uk **完全忽略 SeriesId 过滤**：
+      /Items?SeriesId=265683&IncludeItemTypes=Episode&Limit=5
+      → 「少女☆歌剧」(256268)、「团子大家族」(256421)、「蓝猫淘气三千问」(256621)…
+        TotalRecordCount=345357（整个库的集数，不是这部剧的）
+    而 resolve_series_season 只按 IndexNumber 建表，**不看返回项的 SeriesId** ——
+    照收就会把别的剧的「第 N 集」挂到目标剧上，下载到错的片，入库即数据错乱。
+    源不返回 SeriesId 时无法判定，保持原行为（接受）。
+    """
+    items = (data or {}).get("Items") or [] if isinstance(data, dict) else []
+    seen = [it.get("SeriesId") for it in items if isinstance(it, dict) and it.get("SeriesId")]
+    if not seen:
+        return True
+    return all(str(s) == str(sid) for s in seen)
 
 
 def _cap_learn(label, original, used):
@@ -353,6 +388,11 @@ def _ep_get(g, st, path):
     base = path
     cap = _cap_get(key[0], now)
     if cap:
+        # /Shows 不存在 **且** /Items 忽略 SeriesId 过滤 = 这个源根本没有可用的列集能力。
+        # 再试只是烧配额（lite 7 天 935 次请求、0 集产出）。TTL 到期会重新探测。
+        if cap.get("shows_bad") and cap.get("series_ok") == 0:
+            raise RuntimeError("源 %s 列集能力不可用（/Shows 400，/Items 忽略 SeriesId），"
+                               "跳过（能力记忆 %dd）" % (key[0], _CAP_TTL // 86400))
         if cap.get("shows_bad") and _SHOWS_EP_RE.match(base):
             base = _shows_to_items_path(base) or base
         if cap.get("limit_ok"):
@@ -365,8 +405,11 @@ def _ep_get(g, st, path):
         if not any(s in str(e) for s in ("400", "404")):
             _ep_err_put(k, e)
             raise
-        # 只从「成功路径」学习（_cap_learn）。不因一次 404 就把源判成没实现 Shows：
-        # 404 也可能是这一部剧在该源不存在，那是 per-show 事实，不是 per-source 能力。
+        # 只从「成功路径」学习端点能力（_cap_learn）；但 400 是**端点级**事实
+        # （这个源没实现 /Shows 前缀），当场记下，不必等改写成功。
+        # 404 不记：那可能只是这一部剧在该源不存在，是 per-show 事实。
+        if "400" in str(e) and _SHOWS_EP_RE.match(base or ""):
+            _cap_put(key[0], shows_bad=1)
         # ① Limit 降级：同一路径换成后端能接受的分页大小
         for lim in ("500", "200", "100"):
             p2 = _rewrite_limit(base, lim)
@@ -391,14 +434,26 @@ def _ep_get(g, st, path):
                 if p3 is None:
                     continue
                 try:
-                    data = g.get(st, p3)
-                    _cap_learn(key[0], path, p3)
-                    break
+                    d3 = g.get(st, p3)
                 except Exception as e3:                             # noqa: BLE001
                     last = e3
                     if not any(s in str(e3) for s in ("400", "404")):
                         _ep_err_put(k, e3)
                         raise
+                    continue
+                # 2026-11-20：改写端点后必须校验 SeriesId，不能「200 就收」。
+                # lite 实测忽略 SeriesId 返回全库集（TotalRecordCount=345357），
+                # 上层只按 IndexNumber 建表 → 会把别的剧的集挂到目标剧上。
+                m_sid = _SHOWS_EP_RE.match(path or "") or _SHOWS_EP_RE.match(base or "")
+                sid = m_sid.group(1) if m_sid else ""
+                if sid and not _items_match_series(d3, sid):
+                    _cap_put(key[0], series_ok=0)
+                    raise RuntimeError("源 %s 的 /Items 忽略 SeriesId 过滤（返回他剧），拒收"
+                                       % st.label)
+                data = d3
+                _cap_put(key[0], series_ok=1)
+                _cap_learn(key[0], path, p3)
+                break
             if data is None:
                 if last is not None:
                     _ep_err_put(k, last)
@@ -459,6 +514,16 @@ def _prefer_cached(order, series):
     return hot + cold
 
 
+def _cap_dead(label, now):
+    """这个源是否已被判定「列集能力不可用」（/Shows 400 且 /Items 忽略 SeriesId）。
+
+    被判定后连搜索都不该再派给它：搜到了也列不出集，只是多烧一次配额
+    （lite 7 天 935 次请求、0 集产出）。TTL 到期自动重新探测。
+    """
+    cap = _cap_get(label, now)
+    return bool(cap and cap.get("shows_bad") and cap.get("series_ok") == 0)
+
+
 def _ordered_sources(g, exclude=None, max_hosts=0, order_labels=None, host_pref=None,
                      series=""):
     """Return a bounded source order.
@@ -468,8 +533,10 @@ def _ordered_sources(g, exclude=None, max_hosts=0, order_labels=None, host_pref=
     back to all sources".
     """
     exclude = set(exclude or ())
+    _now = time.time()
     order = [s for s in g.order()
              if s.label not in exclude
+             and not _cap_dead(s.label, _now)
              and (not host_pref or s.label.startswith(host_pref))]
     if order_labels is not None:
         rank = {label: i for i, label in enumerate(order_labels)}
