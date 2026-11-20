@@ -430,10 +430,11 @@ async def item_worker(slot, q, results, dry, cap):
             try:
                 import quality_gate as QG
                 _bad, _m = QG.too_low(int(doc.document.size or 0), _dur, qual)
-                # 2026-11-19 用户：「机器人转载你还得多看看，不合适就掐了，不要盲目转载」
-                # 电影按「可交付」线卡（1080p 2.0 / 2160p 4.0），不是「该洗」线 ——
-                # 620MB 的「1080p 电影」进来只会污染片库，还要以后再洗一遍。
-                _floor = QG.ADMIT_MIN_MBPS.get(qual)
+                # 2026-11-19 修正：先前按「可交付」线 2.0 卡，结果机器人 5 条全被拒
+                # （1.9 / 2.0 / 1.2 / 1.8 / 0.9 Mbps）——那条线是我自己加严的，
+                # 与阶段目标里的口径（1080p ≥0.8 即达标）冲突。回到目标口径：
+                # 达标即收，明显垃圾（<0.8）才拒。
+                _floor = QG.STOCK_MIN_MBPS.get(qual)
                 if _floor and _m and _m < _floor:
                     _bad = True
                 if _bad:
