@@ -168,7 +168,11 @@ def pool_rows():
 
 def slot_order(rows):
     """按实测吞吐从快到慢；冷却中的排最后（仍可兜底尝试）。"""
-    return sorted((1, 2, 3, 4),
+    # 2026-11-20：池表里的吞吐可能过期（slot1 记着 1.18，实际 0.14）。
+    # 支持 EMOS_SLOTS 白名单：只在这些号里挑，避开长期被限速的号。
+    allow = [int(x) for x in (os.environ.get("EMOS_SLOTS") or "").replace(" ", "").split(",")
+             if x.isdigit()] or [1, 2, 3, 4]
+    return sorted([n for n in allow],
                   key=lambda n: (1 if rows.get(n, (0.0, False))[1] else 0,
                                  -rows.get(n, (0.0, False))[0], n))
 
