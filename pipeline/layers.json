@@ -168,6 +168,7 @@
   "ysdq_auto.py",
   "ysdq_batch.py",
   "ysdq_crawl.py",
-  "ysdq_import.py"
+  "ysdq_import.py",
+  "sched_status.py"
  ]
 }

@@ -1883,10 +1883,19 @@ def series_has_active_claim(tmdb, active):
     """
     if not tmdb:
         return False
+    # 2026-11-20：**从「整部串行」放宽到可配置的每剧并行度。**
+    # 原来一部剧同时只能有一条 claim —— 队列集中在少数几部剧时，
+    # 加机器也不会加吞吐（这是继 lane 锁、ingest 闸门之后的第三处串行点）。
+    # 默认仍是 1（保护源站配额、避免整部重扫），但可以通过
+    # EMBYTG_SERIES_PARALLEL 调高，配合 series_scan_cache 复用扫描结果。
+    _limit = int(os.environ.get("EMBYTG_SERIES_PARALLEL") or 1)
+    _seen = 0
     for other in active or []:
         try:
             if str(other.get("tmdb")) == str(tmdb):
-                return True
+                _seen += 1
+                if _seen >= _limit:
+                    return True
         except Exception:                                  # noqa: BLE001
             continue
     return False
@@ -1974,7 +1983,12 @@ def main():
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
 
-    fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    # 2026-11-20：**锁按 lane 分，不再全进程独占。**
+    # 原来是单文件 .gha_next.lock，谁抢到谁独占整个「选片+扫描」过程——
+    # 5 台机器排队等一把锁，加机器等于没加。lane 之间没有共享可变状态
+    # （候选来源不同、落 claim 靠条目 lease 互斥），没必要互相等。
+    _lane_lock = LOCK.replace(".lock", ".%s.lock" % a.lane)
+    fd = os.open(_lane_lock, os.O_CREAT | os.O_RDWR, 0o600)
     deadline = time.time() + max(0, a.lock_wait)
     while True:
         try:
@@ -2039,14 +2053,59 @@ def main():
     # 加账号 → 自动多一条并发；减账号 → 自动收敛。人工传的
     # --max-active 只作为**上限的天花板**（可以调低保护，不能突破池子容量）。
     _pool_cap = max(1, _session_count() - len(reserved_slots()))
-    _cap = min(int(a.max_active or _pool_cap), _pool_cap)
+    # 2026-11-20：外部 worker（PC）自带 session，不能因为本机 4 个号全忙就被挡住。
+    # 用户口径：多一台 PC 就该多一份产量。这里把 scale.json 里声明的外部 session
+    # 计入总容量；外部 worker 的活跃 claim 已经算进 active，不会重复放宽。
+    # 2026-11-20 二次修订：**加机器不需要报备**。
+    # 容量外部部分取三者最大：scale.json 声明数、当前活跃 claim 里出现的外部 worker 数、
+    # 以及 1 格「新机器预留位」。新机器第一次来就能领到活（预留位），领到之后
+    # 它出现在 active 里，容量自动增长；下线后 active 消失，容量自动回落。
+    _ext_declared = 0
+    _sc = {}
+    try:
+        _sc = json.load(open(os.path.join(os.path.dirname(HERE), "config", "scale.json"),
+                             encoding="utf-8"))
+        _ext_declared = sum(int(w.get("sessions") or 1) for w in (_sc.get("external_workers") or [])
+                            if w.get("enabled", True))
+    except Exception:                                          # noqa: BLE001
+        _ext_declared = 0
+    _local_names = {"slot1", "slot2", "slot3", "slot4", "local"}
+    _ext_seen = set()
+    for _c in active:
+        _w = str(_c.get("worker") or "")
+        _rid = str(_c.get("run_id") or "")
+        for _tok in list(_local_names) + ["slot5", "slot6", "slot7", "slot8"]:
+            if _tok and _tok != "local" and (_tok in _rid or _w.startswith(_tok)):
+                if _tok not in _local_names:
+                    _ext_seen.add(_tok)
+    # +1 是「下一台新机器」的位置：否则当外部 worker 已满员时，
+    # 新机器第一次来就撞 cap，还是得报备。（第二轮自查发现）
+    # 坏节点不该稀释产能：连续失败/成功率过低的 worker 从有效容量里剔除，
+    # 但保留 1 格预留位，让新机器和「已经恢复的旧机器」都能重新进场。
+    _sc_health = _sc if isinstance(_sc, dict) else {}   # _sc 在 try 里可能未绑定
+    _health = GS.worker_health(
+        min_rate=float(_sc_health.get("min_success_rate") or 0.5),
+        consec_limit=int(_sc_health.get("consecutive_fail_limit") or 3))
+    _unhealthy = {w for w, h in _health.items() if not h.get("healthy", True)}
+    _ext_ok = {w for w in _ext_seen if w not in _unhealthy
+               or os.environ.get("EMBYTG_IGNORE_HEALTH") == "1"}
+    _ext_cap = max(_ext_declared, len(_ext_ok) + 1, 1)
+    _total_cap = _pool_cap + _ext_cap
+    _cap = min(int(a.max_active or _total_cap), _total_cap)
     if len(active) >= _cap and not a.force:
         emit({"ok": False, "reason": "max_active", "active": len(active),
               "cap": _cap, "pool_cap": _pool_cap})
         return 0
+    # 2026-11-20：ingest_busy 原本是全局闸门 —— 只要 autoingest 在跑，
+    # 所有 worker 一律领不到活，等于把并发压回 1。
+    # 改成本机首次并发限制：允许 1 个继续，其余等（默认关闭，可用
+    # EMBYTG_INGEST_GATE=1 恢复旧行为）。
     if ingest_busy() and not a.force:
-        emit({"ok": False, "reason": "autoingest_busy"})
-        return 0
+        _gate = os.environ.get("EMBYTG_INGEST_GATE", "0") == "1"
+        if _gate or len(active) >= 1:
+            emit({"ok": False, "reason": "autoingest_busy",
+                  "active": len(active)})
+            return 0
 
     if LQ.is_done(a.lane) and not a.force:
         emit({"ok": False, "reason": "lane_done", "lane": a.lane})
@@ -2219,11 +2278,22 @@ def main():
     # 硬领只会让两台机器用同一个 TG 账号从不同 IP 上传 → AuthKeyDuplicatedError
     # → TG 作废授权（要人工重新登录才能恢复）。宁可空转等，也不能撞。
     _rid = getattr(a, "run_id", None) or ("next3-%d" % os.getpid())
-    slot = session_slot(active, run_id=_rid)
-    if not slot:
-        emit({"ok": False, "reason": "no_session",
-              "detail": "所有 TG session 均被占用（租约未释放或 TTL 未到）"})
-        return 0
+    # 2026-11-20：**外部 worker 用自己的 session，不租本机的 1-4 号。**
+    # 之前只加了容量计算，领任务仍要 session_slot —— 本机四号全忙时 PC 照样 no_session，
+    # "多一台机器多一份产量"就是句空话。判据：EMBYTG_EXTERNAL=1 或 run_id 含 slot5+。
+    import re as _re_x
+    _is_ext = (os.environ.get("EMBYTG_EXTERNAL") == "1"
+               or bool(_re_x.search(r"slot([5-9])", str(_rid))))
+    if _is_ext:
+        slot = 0          # 0 = 用调用方自己的账号，不占本机租约
+        print("  外部 worker（%s）：跳过本机 session 租约，使用自带 session"
+              % _rid, file=sys.stderr)
+    else:
+        slot = session_slot(active, run_id=_rid)
+        if not slot:
+            emit({"ok": False, "reason": "no_session",
+                  "detail": "所有 TG session 均被占用（租约未释放或 TTL 未到）"})
+            return 0
     # E174：慢号不许领「它算不完」的大文件。
     # 单会话模式下每条 lane 绑定一个账号，0.06MB/s 的号领到 3.5–5.4GB 的集
     # 就必然撞 timeout（E171：11 小时白烧 + 11 集源站配额）。
@@ -2418,8 +2488,7 @@ def main():
             continue
         # 条目级 claim：同一集只能被一个节点领走，不同节点领不同集。
         # 没有这一层，多节点只是排队（claim 文件按 lane 分，同 lane 只能一个）。
-        _wkey = "%s|S%sE%s" % (job.get("key") or job.get("target_rel") or "",
-                               int(job.get("season") or 0), int(job.get("ep") or 0))
+        _wkey = GS.item_key(job)      # 去画质后缀，同集不同画质也算同一个 item
         # worker 身份：优先环境变量，其次从 run_id 里的 slotN 推断。
         # PC 的远程调用不会传 EMBYTG_WORKER，但它的 run_id 一定含 slot5，
         # 这样不依赖对方改脚本也能正确归属（用户 2026-11-20 反馈）。

@@ -757,7 +757,17 @@ def main():
                     GS.slot_release(int(_slot), job.get("run_id"))
             except Exception:                       # noqa: BLE001
                 pass
+            # 成功样本：喂给 worker 健康度（连续失败会让节点退出有效产能）
+            try:
+                GS.record_outcome(job.get("run_id"), ok=True)
+            except Exception:                                 # noqa: BLE001
+                pass
             GS.release_claim(claim_path)
+            try:
+                _wk = GS.item_key(job)
+                GS.release_item(_wk)
+            except Exception:                                 # noqa: BLE001
+                pass
             log_agent("done", "完成[%s] %s S%02dE%02d；file_id=%s；state_key=%s；"
                       "stage=%s；NFO=%s%s" % (
                           job.get("lane"), job["series"][:20], job["season"],

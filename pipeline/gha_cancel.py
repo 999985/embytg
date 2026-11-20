@@ -150,7 +150,19 @@ def main():
                 GS.slot_release(int(_slot), a.run_id)
         except Exception:                             # noqa: BLE001
             pass
+        # 失败样本：按原因归因（源站无资源/风控不算 worker 的错）
+        try:
+            _j = job or {}
+            GS.record_outcome(_j.get("run_id") or a.run_id, ok=False,
+                              reason=_j.get("reason") or a.reason)
+        except Exception:                                     # noqa: BLE001
+            pass
         GS.release_claim(path)
+        try:
+            _wk = GS.item_key(job)
+            GS.release_item(_wk)
+        except Exception:                                     # noqa: BLE001
+            pass
     except Exception as e:                                # noqa: BLE001
         print(json.dumps({"ok": False, "error": str(e)[:300]},
                          ensure_ascii=False))

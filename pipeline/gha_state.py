@@ -155,6 +155,111 @@ def _claim_db():
     return con
 
 
+# ── worker 健康度（2026-11-20）───────────────────────────────────────────
+# 失败要归因，不能一律算到 worker 头上：
+#   源站没资源/404  → 供给问题，不影响 worker 评价
+#   FloodWait/鉴权  → session 问题，换号即可，不是机器坏
+#   超时/网络/中断   → worker 问题，连续出现就该退出有效产能
+
+_SOURCE_ERRS = ("no_resource", "not_found", "404", "source_down", "no_candidate",
+                "no_hd", "empty", "gap")
+_AUTH_ERRS = ("flood", "authkey", "unauthorized", "session", "banned", "deleted")
+
+
+def classify_failure(reason):
+    r = str(reason or "").lower()
+    if any(k in r for k in _AUTH_ERRS):
+        return "auth"
+    if any(k in r for k in _SOURCE_ERRS):
+        return "source"
+    return "worker"
+
+
+def worker_id(run_id=None, explicit=None):
+    import re as _re
+    if explicit:
+        return str(explicit)
+    m = _re.search(r"slot(\d+)", str(run_id or ""))
+    return "slot%s" % m.group(1) if m else "local"
+
+
+def record_outcome(run_id, ok=True, reason=None, explicit=None):
+    """记一次结果。异常绝不外抛——统计不能影响主链路。"""
+    try:
+        w = worker_id(run_id, explicit)
+        kind = "ok" if ok else classify_failure(reason)
+        con = _claim_db()
+        con.execute("create table if not exists worker_stat("
+                    "worker text primary key, ok integer default 0, "
+                    "fail_worker integer default 0, fail_source integer default 0, "
+                    "fail_auth integer default 0, consec_fail integer default 0, "
+                    "last_ts integer, last_reason text)")
+        con.execute("insert or ignore into worker_stat(worker) values(?)", (w,))
+        if kind == "ok":
+            con.execute("update worker_stat set ok=ok+1, consec_fail=0, "
+                        "last_ts=?, last_reason='' where worker=?", (int(time.time()), w))
+        else:
+            # 只有 worker 类失败累计「连续失败」；源站无资源/风控不连坐，
+            # 否则一个坏源就能把健康机器踢出产能。
+            _consec = "consec_fail=consec_fail+1, " if kind == "worker" else ""
+            con.execute("update worker_stat set fail_%s=fail_%s+1, %slast_ts=?, "
+                        "last_reason=? where worker=?" % (kind, kind, _consec),
+                        (int(time.time()), str(reason)[:80], w))
+        con.commit()
+        return kind
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def worker_health(min_rate=0.5, consec_limit=3, min_samples=3):
+    """返回 {worker: {rate, consec, healthy, ...}}。
+
+    min_samples 之前一律视为健康（乐观启动）——新机器不该因为样本少被判死。
+    只有 worker 类失败计入成功率；source/auth 失败不拉低评价。
+    """
+    out = {}
+    try:
+        con = _claim_db()
+        con.execute("create table if not exists worker_stat("
+                    "worker text primary key, ok integer default 0, "
+                    "fail_worker integer default 0, fail_source integer default 0, "
+                    "fail_auth integer default 0, consec_fail integer default 0, "
+                    "last_ts integer, last_reason text)")
+        rows = con.execute("select worker, ok, fail_worker, fail_source, fail_auth, "
+                           "consec_fail, last_ts, last_reason from worker_stat").fetchall()
+        con.commit()
+        con.close()
+    except Exception:                                          # noqa: BLE001
+        return out
+    for w, ok, fw, fs, fa, cf, ts, why in rows:
+        judged = int(ok or 0) + int(fw or 0)
+        rate = (int(ok or 0) / judged) if judged else 1.0
+        healthy = True
+        if judged >= min_samples and rate < min_rate:
+            healthy = False
+        if int(cf or 0) >= consec_limit:
+            healthy = False
+        out[w] = {"ok": int(ok or 0), "fail_worker": int(fw or 0),
+                  "fail_source": int(fs or 0), "fail_auth": int(fa or 0),
+                  "rate": round(rate, 3), "consec": int(cf or 0),
+                  "healthy": healthy, "last_reason": why or "", "last_ts": ts}
+    return out
+
+
+def item_key(job):
+    """条目级 claim 的唯一 key = 剧集身份（不含画质）。
+
+    2026-11-20：原来直接拿 job["key"]（state key，形如
+    `tv|id:248086|(1, 8)|1080p`）当 claim key —— 画质不同就是不同 key，
+    两个 worker 可能同时下载同一集的 1080p 和 2160p，白烧两份配额。
+    """
+    raw = str(job.get("key") or job.get("target_rel") or "")
+    parts = raw.split("|")
+    if len(parts) >= 4:                     # tv|id:xxx|(S, E)|quality
+        raw = "|".join(parts[:3])
+    return "%s|S%sE%s" % (raw, int(job.get("season") or 0), int(job.get("ep") or 0))
+
+
 def claim_item(key, worker, ttl=None):
     """抢一集。返回 True 表示抢到；别人已抢且未过期返回 False。"""
     if not key:
