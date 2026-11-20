@@ -953,19 +953,39 @@ EP_FAIL_OURS_MAX_H = float(os.environ.get("EP_FAIL_OURS_MAX_H") or 6.0)
 # 我方失败重试到第 8 次仍不好 → 已经不是「抖动」而是坏件/永久拒绝，交回长退避。
 # 没有这一档就变成另一种浪费：一集永远传不上去，却每 6 小时重下一次（≈4GB/天/集）。
 EP_FAIL_OURS_HARD = int(os.environ.get("EP_FAIL_OURS_HARD") or 8)
+# 2026-11-21（自省）：**「源站慢」不是「源站缺片」。** 实测 20 条在冷却的集里
+# 10 条是 `source_too_slow`（下载 0.4~0.8MB/s 被速度闸掐断，文件明明在），
+# 却被 `_EP_SRC_KEYS` 的 "source" 前缀命中 → 走 1/2/4/8/16/30 天长阶梯：
+# 一集只因为**当时那个源慢**就被冻结最多 5.7 天（实测 fails=6 → 8251 分钟）。
+# 缺片（`source_download_failed` / `no_valid_source`）才该长退避；
+# 慢源该罚的是**源**（`record_source_failure` 已在做：download_fails 降额 +
+# 10 分钟冷却），集本身换个源就能下。所以单列一档 `slow`：短阶梯 + 6h 封顶；
+# 连续 EP_FAIL_SLOW_HARD 次都是慢，才算这份文件在所有源上都拿不到，交回长阶梯。
+EP_FAIL_SLOW_BASE_MIN = float(os.environ.get("EP_FAIL_SLOW_BASE_MIN") or 60.0)
+EP_FAIL_SLOW_HARD = int(os.environ.get("EP_FAIL_SLOW_HARD") or 6)
+_EP_SLOW_KEYS = ("too_slow", "slow_download", "download_slow")
 _EP_SRC_KEYS = ("source", "quality", "bad_source", "no_valid_source")
 _EP_OURS_KEYS = ("upload", "manifest", "resume_scan", "claim", "slot", "session", "tg_", "emby")
 
 
 def ep_fail_class(reason):
-    """把失败原因分成 `src`（源站侧，长退避）与 `ours`（我方临时故障，短退避）。
+    """把失败原因分成三类，决定退避时长：
 
+    - `src`  （源站侧、**能证明文件不在**）：长阶梯 1→2→4→8→16→30 天，少撞省配额。
+    - `slow` （源站慢：文件在，只是这个源当下给不动）：短阶梯 1h→2h→4h（6h 封顶），
+              换个源就能下；连续 EP_FAIL_SLOW_HARD 次才转回长阶梯。
+    - `ours` （我方临时故障：上传/租约/会话/runner 退出）：15min 起翻倍，6h 封顶，
+              连续 EP_FAIL_OURS_HARD 次仍不好才转回长阶梯。
+
+    `slow` 必须排在 `src` 前面判：`source_too_slow` 同时含 "source" 与 "too_slow"。
     未知原因一律按 `src` 处理：宁可多等，也不要在原因不明时进入分钟级热循环。
     """
     r = str(reason or "").strip().lower()
+    if any(k in r for k in _EP_SLOW_KEYS):
+        return "slow"
     if r.startswith(_EP_SRC_KEYS) or any(k in r for k in _EP_SRC_KEYS):
         return "src"
-    if any(k in r for k in _EP_OURS_KEYS):
+    if r.startswith("runner") or any(k in r for k in _EP_OURS_KEYS):
         return "ours"
     return "src"
 
@@ -974,11 +994,21 @@ def ep_cool_seconds(n, reason=""):
     """第 n 次失败该冷却多少**秒**（按原因类别分档）。
 
     src  ：沿用 ep_cool_days 的指数阶梯（1/2/4/8/16/30 天）——源站真缺片，少撞省配额。
+    slow ：60min 起、每次翻倍、封顶 6h —— 源站在、只是慢，换个源就能下；
+           连续 EP_FAIL_SLOW_HARD 次仍下不动，说明所有源都拿不到这份文件，转回长阶梯。
     ours ：15min 起、每次翻倍、封顶 6h —— 我方失败重试就能好，长期封禁是纯损失；
            但连续 EP_FAIL_OURS_HARD 次仍失败说明是坏件/永久拒绝，转回长阶梯。
     """
     n = int(n or 1)
-    if ep_fail_class(reason) == "src" or n >= EP_FAIL_OURS_HARD:
+    cls = ep_fail_class(reason)
+    if cls == "slow":
+        # 连续 N 次都是「慢」→ 已经不是某个源慢，而是这份文件在哪儿都拿不到。
+        # 交回长阶梯时从它的**基准档**起算（1 天），避免 4h 直接跳 8 天。
+        if n >= EP_FAIL_SLOW_HARD:
+            return ep_cool_days(EP_FAIL_TRIP + (n - EP_FAIL_SLOW_HARD)) * 86400
+        k = max(0, n - EP_FAIL_TRIP)
+        return min(EP_FAIL_SLOW_BASE_MIN * 60 * (2 ** k), EP_FAIL_OURS_MAX_H * 3600)
+    if cls == "src" or n >= EP_FAIL_OURS_HARD:
         return ep_cool_days(n) * 86400
     k = max(0, n - EP_FAIL_TRIP)
     return min(EP_FAIL_OURS_BASE_MIN * 60 * (2 ** k), EP_FAIL_OURS_MAX_H * 3600)

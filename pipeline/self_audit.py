@@ -233,10 +233,14 @@ def main():
     # 2026-11-19：冷却条目必须按类别拆开报。原来一律写成「源站长期缺片」，
     # 而实测 48/81 条是 upload_failed —— 报表把人指向「换源/标 DEAD」，
     # 真问题（TG 上传通道）反而看不见。类别判定与 gha_state.ep_fail_class 同一实现。
+    # 2026-11-21：再加一档 slow（源站慢、文件在）—— 它既不是缺片也不是我方故障，
+    # 混进任何一边都会让清单指错方向（实测 20 条在冷却里 10 条是它）。
     import gha_state as _GS
-    _cool_src = [k for k in _cooling
-                 if (_GS.ep_fail_class((ep_fail.get(k) or {}).get("reason")) == "src")]
-    _cool_ours = [k for k in _cooling if k not in set(_cool_src)]
+    _cls_of = {k: _GS.ep_fail_class((ep_fail.get(k) or {}).get("reason")) for k in _cooling}
+    _cool_src = [k for k in _cooling if _cls_of.get(k) == "src"]
+    _cool_slow = [k for k in _cooling if _cls_of.get(k) == "slow"]
+    _cool_ours = [k for k in _cooling
+                  if k not in set(_cool_src) and k not in set(_cool_slow)]
     _today_fail = [k for k, v in ep_fail.items()
                    if isinstance(v, dict)
                    and time.strftime("%Y-%m-%d", time.localtime(float(v.get("last") or 0))) == _today]
@@ -248,7 +252,8 @@ def main():
         pass
     rep["ep_fail"] = {
         "total": len(ep_fail), "cooling": len(_cooling), "today": len(_today_fail),
-        "cooling_src": len(_cool_src), "cooling_ours": len(_cool_ours),
+        "cooling_src": len(_cool_src), "cooling_slow": len(_cool_slow),
+        "cooling_ours": len(_cool_ours),
         "by_reason": collections.Counter(
             str(v.get("reason") or "?")[:40] for v in ep_fail.values()
             if isinstance(v, dict)).most_common(5),
@@ -285,6 +290,16 @@ def main():
         bl.append({"p": 1, "item": "%d 集在**源站缺片**退避里" % rep["ep_fail"]["cooling_src"],
                    "why": "源站侧反复失败，已按指数退避冷却；冷却期满还会再撞，除非换源或标 DEAD",
                    "fix": "缺口报告里标 DEAD（60 天不再尝试）+ 对这批剧换源站；原因分布见 §4",
+                   "cost": "小"})
+    if rep["ep_fail"].get("cooling_slow", 0) >= 3:
+        _n_slow = rep["ep_fail"]["cooling_slow"]
+        bl.append({"p": 1 if _n_slow >= 10 else 2,
+                   "item": "%d 集因**源站太慢**退避（文件在，不是缺片）" % _n_slow,
+                   "why": "下载速度低于 TG_MIN_DOWNLOAD_MBPS 被速度闸掐断；罚的应该是源"
+                          "（download_fails 降额 + 10min 冷却），集本身换个源就能下",
+                   "fix": "已按 slow 档 1h→2h→4h（6h 封顶）重试；同一集连续慢 "
+                          "EP_FAIL_SLOW_HARD 次才转长退避。反复出现就看 runner 日志 "
+                          "SOURCE_TOO_SLOW 的源名分布（多半是夜间带宽或某个慢源被反复选中）",
                    "cost": "小"})
     if rep["ep_fail"].get("cooling_ours", 0) >= 10:
         bl.append({"p": 1, "item": "%d 集在**我方失败**退避里（上传/会话，不是源站缺片）"
