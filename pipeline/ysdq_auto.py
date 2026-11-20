@@ -528,13 +528,16 @@ async def run(keyword, pages, slots, dry, cap, payloads=None, only_4k=False):
     import os as _os
     _wait = int(_os.environ.get("YSDQ_WAIT_SLOT", "0") or 0)
     _deadline = time.time() + _wait
-    _want = list(range(1, slots + 1))
+    # 2026-11-20：原来按 slots 把 1..4 全租下来，机器人补片一跑就占满 3-4 个号，
+    # 上传 lane 全被饿住（实测 18:00 时 slot2/3/4 的锁 owner 都是 ysdq_auto.py，
+    # 同期入库掉到 10 分钟 1 条）。机器人是零上行的轻活，最多占 2 个号。
+    _want = list(range(1, min(slots, 2) + 1))
     for _n in _want:
         GS.slot_reserve(_n, TAG, ttl=max(600, _wait + 600))
     leased = []
     try:
         while True:
-            leased = [n for n in _want if GS.slot_lease(n, TAG, ttl=3600)]
+            leased = [n for n in _want if GS.slot_lease(n, TAG, ttl=900)]
             if leased or time.time() >= _deadline:
                 break
             await asyncio.sleep(30)
