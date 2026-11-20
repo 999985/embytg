@@ -23,12 +23,12 @@ import sys
 sys.path.insert(0, "/opt/embytg/pipeline")
 import gha_state as GS                                     # noqa: E402
 import tgsrc_copy as TC                                    # noqa: E402
-import ysdq_import as Y                                    # noqa: E402
+import tg_common as Y                                    # noqa: E402
 
 from telethon import TelegramClient                        # noqa: E402
 from telethon.sessions import StringSession                # noqa: E402
 
-TAG = "repair-lowq"
+TAG = "repair_lowq.py"
 LOW = "/opt/embytg/pipeline/.lowq_library.json"
 
 

@@ -62,7 +62,8 @@
   "src_guard.py",
   "stall_watch.py",
   "tdprobe.py",
-  "upload_health.py"
+  "upload_health.py",
+  "tg_common.py"
  ],
  "rule": "prod=systemd/timer/run_one 可达；cron=Hermes cron 点名；tool=有 CLI 入口；legacy=无入口也无人调用",
  "tool": [
@@ -165,10 +166,6 @@
   "upgrade_episodes.py",
   "upgrade_from_channels.py",
   "web_lookup.py",
-  "ysdq_auto.py",
-  "ysdq_batch.py",
-  "ysdq_crawl.py",
-  "ysdq_import.py",
   "sched_status.py"
  ]
 }

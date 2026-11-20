@@ -95,7 +95,7 @@ def main():
         try:
             import asyncio
             import gha_state as GS
-            import ysdq_import as Y
+            import tg_common as Y
             from telethon import TelegramClient
             from telethon.sessions import StringSession
             env = Y.load_env()
