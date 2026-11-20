@@ -555,7 +555,12 @@ async def run(keyword, pages, slots, dry, cap, payloads=None, only_4k=False):
     print("  可用号 %s（冷落 %s）；关键词 %s 翻页 %s；本轮上限 %d 部"
           % (free or "无", [n for n in leased if n not in free], keyword, pages, cap))
     if not free:
-        print("  所有号都在 FloodWait 冷却中，本轮跳过")
+        # 2026-11-20：区分「租不到号」和「号在风控冷却」——原来两种情况都报
+        # FloodWait，害得排查方向跑偏（实际是主流水线把 4 个号全占着）。
+        if not leased:
+            print("  一个号都租不到（被主流水线占用），本轮跳过")
+        else:
+            print("  所有号都在 FloodWait 冷却中，本轮跳过")
         return 0
     results = {"ok": 0, "fail": 0, "miss": 0, "dup": 0, "cam": 0, "by_slot": {},
                "scan_done": True, "only_4k": only_4k}

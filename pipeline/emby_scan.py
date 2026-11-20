@@ -107,7 +107,12 @@ _SCAN_DEDUP_SEC = float(os.environ.get("EMBY_SCAN_DEDUP_SEC", "150"))
 
 
 def _scan_guard(paths):
-    """返回 (allowed, skipped)。同路径在去重窗内已扫过就跳过。"""
+    """返回 (allowed, skipped)。同路径在去重窗内已扫过就跳过。
+
+    E115 根治（2026-11-20 日终）：原来是「读 ts → 判断 → 写 ts」的 read-modify-write，
+    两条 lane 并发时都读到旧值 → 都放行 → 插件同秒建两条同 Path 条目（实测 18 组
+    全在同秒创建、ItemId 连号）。改成 flock 串行化同一路径的判定，判据放在锁内。
+    """
     try:
         os.makedirs(_SCAN_GUARD_DIR, exist_ok=True)
     except Exception:                                       # noqa: BLE001
@@ -117,18 +122,34 @@ def _scan_guard(paths):
     for p in paths:
         key = hashlib.sha1(p.encode("utf-8")).hexdigest()[:16]
         f = os.path.join(_SCAN_GUARD_DIR, key + ".t")
+        lk = None
         try:
-            ts = float(open(f).read().strip() or 0)
+            import fcntl
+            lk = open(f + ".lock", "a+")
+            fcntl.flock(lk.fileno(), fcntl.LOCK_EX)         # 同路径判定互斥
         except Exception:                                   # noqa: BLE001
-            ts = 0.0
-        if now - ts < _SCAN_DEDUP_SEC:
-            skipped.append(p)
-            continue
+            lk = None
         try:
-            open(f, "w").write("%.3f" % now)
-        except Exception:                                   # noqa: BLE001
-            pass
-        allowed.append(p)
+            try:
+                ts = float(open(f).read().strip() or 0)
+            except Exception:                               # noqa: BLE001
+                ts = 0.0
+            if now - ts < _SCAN_DEDUP_SEC:
+                skipped.append(p)
+                continue
+            try:
+                open(f, "w").write("%.3f" % now)
+            except Exception:                               # noqa: BLE001
+                pass
+            allowed.append(p)
+        finally:
+            if lk is not None:
+                try:
+                    import fcntl
+                    fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
+                    lk.close()
+                except Exception:                           # noqa: BLE001
+                    pass
     # 顺手清过期文件，避免目录无限增长
     try:
         for fn in os.listdir(_SCAN_GUARD_DIR):
