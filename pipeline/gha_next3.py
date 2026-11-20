@@ -2022,12 +2022,11 @@ def main():
         return 0
 
     active = read_claims()
-    mine = read_claim(a.lane)
-    if mine and not a.force:
-        emit({"ok": False, "reason": "claimed", "job_id": mine.get("job_id"),
-              "run_id": mine.get("run_id")})
-        return 0
-    active = [x for x in active if x.get("lane") != a.lane]
+    # 2026-11-20：删掉「同 lane 已有 claim 就不许再领」的串行门闩。
+    # 用户口径：worker/机器增加，吞吐应按可用 worker、session 和源供给扩展，
+    # 领任务不该成为机器数量的串行瓶颈。互斥改由 tg.db.job_claim 的「按集」lease
+    # 保证：两个 worker 可以同跑一个 lane，但同一集只会被一个抢到。
+    _ = a.lane
     # 2026-11-15（E105）：**并发上限由池子决定，不由人工调参。**
     #
     # 用户原话：「不用总是调上限吧，不是有池子的概念吗，
@@ -2421,8 +2420,15 @@ def main():
         # 没有这一层，多节点只是排队（claim 文件按 lane 分，同 lane 只能一个）。
         _wkey = "%s|S%sE%s" % (job.get("key") or job.get("target_rel") or "",
                                int(job.get("season") or 0), int(job.get("ep") or 0))
-        _worker = "%s:%s" % (os.environ.get("EMBYTG_WORKER") or "local",
-                             os.environ.get("EMBYTG_RUN_SLOT") or a.lane)
+        # worker 身份：优先环境变量，其次从 run_id 里的 slotN 推断。
+        # PC 的远程调用不会传 EMBYTG_WORKER，但它的 run_id 一定含 slot5，
+        # 这样不依赖对方改脚本也能正确归属（用户 2026-11-20 反馈）。
+        import re as _re_w
+        _slot_m = _re_w.search(r"slot(\d+)", str(job.get("run_id") or a.run_id or ""))
+        _worker = os.environ.get("EMBYTG_WORKER") or (
+            "slot%s" % _slot_m.group(1) if _slot_m else "local")
+        if os.environ.get("EMBYTG_HOST"):
+            _worker = "%s:%s" % (os.environ["EMBYTG_HOST"], _worker)
         if not GS.claim_item(_wkey, _worker):
             skip_reasons["claim_taken"] = skip_reasons.get("claim_taken", 0) + 1
             attempts += 1

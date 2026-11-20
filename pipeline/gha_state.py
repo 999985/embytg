@@ -218,13 +218,19 @@ def read_claim(lane):
 
 
 def read_claims(include_legacy=True):
-    """Return active lane claims, plus the legacy single-claim file if present."""
+    """返回所有活跃 claim（多 worker 并行时会有多个文件）。
+
+    2026-11-20：原来按 LANES 逐个 read_claim(lane)，只认 <lane>.json，
+    改成 cap 文件后一个新文件都看不到 —— 这里必须 glob 全部。
+    """
+    import glob as _glob
     out = []
     seen = set()
-    for lane in LANES:
-        d = read_claim(lane)
+    for path in sorted(_glob.glob(os.path.join(CLAIM_DIR, "*.json"))):
+        d = active_claim(path)
         if not d:
             continue
+        lane = os.path.basename(path).split(".")[0]
         key = (lane, d.get("job_id") or d.get("run_id") or id(d))
         if key not in seen:
             out.append(d)
@@ -245,7 +251,9 @@ def find_claim(run_id, include_failed=False):
     transient registration/scraping error.  Keep the default active-only
     behaviour for every other caller.
     """
-    paths = [claim_path(lane) for lane in LANES] + [LEGACY_CLAIM]
+    # 2026-11-20：claim 已按 run 分文件，必须 glob 全部，否则新文件找不到。
+    import glob as _glob
+    paths = sorted(_glob.glob(os.path.join(CLAIM_DIR, "*.json"))) + [LEGACY_CLAIM]
     now = time.time()
     for path in paths:
         d = _read_json(path, None)
@@ -262,9 +270,20 @@ def find_claim(run_id, include_failed=False):
     return None, None
 
 
+def claim_path_for(lane, job):
+    """每 run 一个 claim 文件：<lane>.<run_id>.json
+
+    2026-11-20：原来 <lane>.json 一个 lane 只有一个文件，两个 worker 同跑同 lane
+    会互相覆盖，gha_finish 按 run_id 找 claim 时会串到别人的任务上。
+    """
+    rid = str(job.get("run_id") or job.get("job_id") or "anon")
+    rid = "".join(ch for ch in rid if ch.isalnum() or ch in "-_")[:48]
+    return os.path.join(CLAIM_DIR, "%s.%s.json" % (lane, rid))
+
+
 def write_claim(lane, job):
     os.makedirs(CLAIM_DIR, mode=0o700, exist_ok=True)
-    _write_json_atomic(claim_path(lane), job)
+    _write_json_atomic(claim_path_for(lane, job), job)
 
 
 def save_claim(path, job):
