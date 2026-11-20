@@ -641,7 +641,12 @@ def eligible_sources(labels, leased=None, load=None):
                 _r = _source_record(d, _l, now)
                 _cap = _eff_cap_of(_r, limits, now)
                 _head += max(0, _cap - int(_r.get("day") or 0))
-            remain = min(max(0, total_cap - used), _head)
+            # 2026-11-20：**只算逐源正余量之和，不能再被 min(total_cap-used) 夹住。**
+            # 超额源（cap=20 用了 53）在 total_cap-used 里贡献负数，把好源的余量吃掉：
+            # 实测 6 源 used=445 / total_cap=447 → remain=2 → allowed_rate=0.13/h
+            # → 两个还有余量的源（aaa 48、bangumi 115）也被全停，两条 lane 空转 5 小时。
+            # 这正是第十二版注释里写的「只需算还有多少可用的余量」，但 min() 没删掉。
+            remain = _head
             if _head <= 0:
                 labels_sorted = []
             elif labels_sorted:
@@ -943,6 +948,19 @@ def _run_is_alive(run_id):
     rid = str(run_id or "")
     if not rid:
         return True
+    # 2026-11-20：`<名字>-<pid>` 形式的 run_id（emos-3416254 / tgsrc-123）直接按 pid 判活。
+    # 这类进程的 argv 里没有 run_id 字样（它是 emos_import.py --series ...），
+    # 只靠下面的 argv 匹配永远查不到 → 被判孤儿 → 别的 lane 抢走同一个 TG 账号。
+    # 实测：emos 领到 slot1 后 slot1.lock 凭空消失，同一账号上出现两条上传通道。
+    _head, _sep, _pid = rid.rpartition("-")
+    if _sep and _pid.isdigit() and _head.replace("_", "").isalnum():
+        try:
+            os.kill(int(_pid), 0)
+            return True
+        except ProcessLookupError:
+            return False                               # pid 真没了 = 孤儿
+        except Exception:                              # noqa: BLE001
+            return True                                # 权限/其他：保守当活着
     try:
         import subprocess as _sp
         out = _sp.run(["ps", "-eo", "pid=,comm=,args="],

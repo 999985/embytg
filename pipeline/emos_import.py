@@ -20,6 +20,7 @@
 """
 import argparse
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -159,6 +160,52 @@ def parse_eps(spec):
     return out
 
 
+def pool_rows():
+    """{slot: (实测单 worker MB/s, 是否冷却)}，直接读上传池，不猜速度。"""
+    return {int(r["slot"]): (float(r.get("mbps") or 0), bool(r.get("cooling")))
+            for r in TC.pool_snapshot()}
+
+
+def slot_order(rows):
+    """按实测吞吐从快到慢；冷却中的排最后（仍可兜底尝试）。"""
+    return sorted((1, 2, 3, 4),
+                  key=lambda n: (1 if rows.get(n, (0.0, False))[1] else 0,
+                                 -rows.get(n, (0.0, False))[0], n))
+
+
+def acquire_slot(run_id, jobs):
+    """领一个「够快」的空闲号。
+
+    先按实测吞吐从快到慢试租约，领到后再用**这个号**的实测值过闸，不够快立刻还回去。
+    否则会出现「闸门看到 slot1 很快（但它被 lane 占着），实际只领到 0.23MB/s 的 slot3」
+    这种自欺 —— 昨夜 7 集白烧就是这么发生的：先领号，后看速度。
+    """
+    floor = float(os.environ.get("EMOS_MIN_OVERALL_MBPS", "2.5"))
+    dl = os.environ.get("EMOS_WAIT_DEADLINE", "07:30")
+    hh, mm = [int(x) for x in dl.split(":")]
+    deadline = datetime.datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+    while True:
+        rows = pool_rows()
+        for n in slot_order(rows):
+            if not GS.slot_lease(n, run_id, ttl=7200):
+                continue
+            mb = rows.get(n, (0.0, False))[0] or 1.5      # 无实测按中性 1.5
+            est = mb * max(1, jobs)
+            if est >= floor:
+                print("  领到 slot%d（实测 %.2fMB/s×%d≈%.1fMB/s）"
+                      % (n, mb, jobs, est), flush=True)
+                return n
+            GS.slot_release(n, run_id)
+            print("  slot%d 实测 %.2fMB/s×%d≈%.1f < %.1f，不占它"
+                  % (n, mb, jobs, est, floor), flush=True)
+        if datetime.datetime.now() >= deadline:
+            print("  没有够快的空闲 slot：全线 < %.1fMB/s，已过 %s，本轮不起跑"
+                  % (floor, dl), flush=True)
+            return 0
+        print("  没有够快的空闲 slot，等 10 分钟再试", flush=True)
+        time.sleep(600)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--series", required=True)
@@ -209,13 +256,12 @@ def main():
             print("   [dry] E%s %s %s %.2fGB" % (it.get("IndexNumber"), q, h, (ms.get("Size") or 0)/1e9))
         return 0
 
-    slot = 0
-    for n in (1, 2, 3, 4):
-        if GS.slot_lease(n, "emos-%d" % os.getpid(), ttl=7200):
-            slot = n
-            break
+    run_id = "emos-%d" % os.getpid()
+    jobs = int(os.environ.get("TG_UPLOAD_JOBS", "8") or 8)
+    slot = acquire_slot(run_id, jobs)
     if not slot:
-        print("  没有空闲 slot"); return 3
+        return 2
+    order = slot_order(pool_rows())
     try:
         env = TC.load_env()
         for it in todo:
@@ -243,16 +289,20 @@ def main():
             print("  下载完成 %.2fGB %.1f MB/s" % (os.path.getsize(dest)/1e9,
                                                 os.path.getsize(dest)/el/1e6), flush=True)
             parts = None
-            for try_slot in [slot] + [x for x in (1, 2, 3, 4) if x != slot]:
-                if try_slot != slot and not GS.slot_lease(try_slot, "emos-%d" % os.getpid(), ttl=7200):
+            # 快的号先试；超时要换号续传（manifest 认已完成区段），不能一失败就丢集
+            for try_slot in [slot] + [x for x in order if x != slot]:
+                if try_slot != slot and not GS.slot_lease(try_slot, run_id, ttl=7200):
                     continue
                 try:
                     parts = TC.upload(env, try_slot, dest)
-                    break
-                except Exception as ex:
-                    print("  slot%d 上传失败: %s" % (try_slot, str(ex)[:80]), flush=True)
+                except (Exception, SystemExit) as ex:
+                    print("  slot%d 上传失败: %s" % (try_slot, str(ex)[:100]), flush=True)
                     if try_slot != slot:
-                        GS.slot_release(try_slot, "emos-%d" % os.getpid())
+                        GS.slot_release(try_slot, run_id)
+                    continue
+                if try_slot != slot:
+                    GS.slot_release(try_slot, run_id)   # 借来的号用完立刻还，别占 2h
+                break
             if not parts:
                 print("  全部 slot 上传失败，保留文件: %s" % dest, flush=True)
                 continue
@@ -263,7 +313,7 @@ def main():
             os.remove(dest)
         return 0
     finally:
-        GS.slot_release(slot, "emos-%d" % os.getpid())
+        GS.slot_release(slot, run_id)
 
 
 if __name__ == "__main__":

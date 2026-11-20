@@ -34,6 +34,66 @@ RUNNER = "/opt/embytg-runner"
 ENV = os.path.join(RUNNER, "runner.env")
 
 
+# 2026-11-20：上传超时必须是可被上层判定的失败，不能是 SystemExit。
+# emos_import 的换号重试用的是 `except Exception`，而 SystemExit 继承 BaseException
+# → 超时直接掀掉整个进程，换号/续传一次都没跑到（昨夜 8 个尝试里 7 个这样废掉）。
+class UploadTimeout(RuntimeError):
+    pass
+
+
+def _ensure_session_env():
+    """tg_pool.discover_sessions() 只认环境变量，而调用方通常只有 runner.env 的键值，
+    并没有 export。不补这一步，池子永远是空的（实测 snapshot() → []）。"""
+    if any(k.startswith("TG_SESSION_STRING") and v for k, v in os.environ.items()):
+        return
+    try:
+        for k, v in load_env().items():
+            if k.startswith("TG_SESSION_STRING") and v:
+                os.environ[k] = v
+    except Exception as _e:                                        # noqa: BLE001
+        print("  ! 读 runner.env 失败: %s" % str(_e)[:80], flush=True)
+
+
+def pool_snapshot():
+    """上传池快照（线程/进程内直接可用；槽位号即 TG_SESSION_STRING_N 的 N）。"""
+    _ensure_session_env()
+    try:
+        if RUNNER not in sys.path:
+            sys.path.insert(0, RUNNER)
+        import tg_pool as _pool                                    # noqa: WPS433
+        return _pool.snapshot()
+    except Exception as _e:                                        # noqa: BLE001
+        print("  ! 读上传池失败（预算按默认吞吐估算）: %s" % str(_e)[:80], flush=True)
+        return []
+
+
+def slot_mbps(slot):
+    """该 slot 单 worker 实测吞吐（MB/s）。0 = 池里还没有数据。"""
+    for r in pool_snapshot():
+        if int(r.get("slot") or 0) == int(slot or 0):
+            return float(r.get("mbps") or 0)
+    return 0.0
+
+
+def upload_budget(size_bytes, mbps, jobs):
+    """上传总预算：按「实测单 worker × 并发 × 0.6 折」推算，不再假设 8MB/s。
+
+    昨夜实测 0.14-0.23MB/s（8 并发 → 整体约 1.1-1.8MB/s），1.3GB 在 1200s 里
+    连一个 512MiB 区段都传不完：8 个尝试 7 个被杀，manifest 0 个区段。
+    """
+    try:
+        jobs = max(1, int(jobs))
+    except (TypeError, ValueError):
+        jobs = 8
+    try:
+        mbps = float(mbps or 0)
+    except (TypeError, ValueError):
+        mbps = 0.0
+    overall = mbps * jobs if mbps > 0 else 8.0
+    budget = int(float(size_bytes) / (max(0.3, overall * 0.6) * 1e6) + 240)
+    return max(900, min(3600, budget))
+
+
 def load_env(path=ENV):
     d = {}
     for line in open(path, encoding="utf-8"):
@@ -93,7 +153,8 @@ def upload(env, slot, path):
         _sz = os.path.getsize(path)
     except OSError:
         _sz = 0
-    _budget = max(1200, int(_sz / (8 * 1e6)) + 600)
+    _jobs = int(os.environ.get("TG_UPLOAD_JOBS", "8") or 8)
+    _budget = upload_budget(_sz, slot_mbps(slot), _jobs)
     try:
         r = subprocess.run(cmd, env=env2, capture_output=True, text=True, timeout=_budget)
     except subprocess.TimeoutExpired as _te:
@@ -101,7 +162,7 @@ def upload(env, slot, path):
         if isinstance(_tail, bytes):
             _tail = _tail.decode("utf-8", "ignore")
         print("  上传超时（%ds，%.2fGB）：%s" % (_budget, _sz / 1e9, str(_tail)[-300:]), flush=True)
-        raise SystemExit("上传超时")
+        raise UploadTimeout("上传超时（%ds，%.2fGB，slot%s）" % (_budget, _sz / 1e9, slot))
     out = (r.stdout or "") + (r.stderr or "")
     mani = ""
     for line in out.splitlines():
@@ -158,7 +219,11 @@ def main():
             return 0
         dest = os.path.join(RUNNER, "media.slot%d" % slot, a.name)
         fetch_one_sync = asyncio.run(fetch_one(env, slot, a.channel, a.msg, dest))
-        parts = upload(env, slot, fetch_one_sync)
+        try:
+            parts = upload(env, slot, fetch_one_sync)
+        except UploadTimeout as _ex:
+            print("  %s" % _ex, flush=True)
+            return 1
         register(a.dir, a.name, parts)
         try:
             os.remove(fetch_one_sync)
