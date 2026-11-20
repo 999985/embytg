@@ -21,7 +21,11 @@ LANES = ("new", "fill", "upgrade")
 # 依据：近 6h fill 18 次成功 0 失败（源站确实有这些缺集），
 # 而队列里躺着 404 季 / 7387 集已知缺口；new 是「发现新剧」，fill 是「补完已有剧」，
 # 目标要最全，补完已有剧的确定性远高于发现新剧。
-SEQUENCE = tuple(os.getenv("EMBYTG_LANE_SEQUENCE", "fill,new,fill,new,upgrade").split(","))
+# 2026-11-20：PC 一直在等活。根因不是 PC 没配，而是 claim 是「每 lane 一个文件」
+# （.gha_claims/<lane>.json）—— 本机 lane 先抢到，PC 就只能干等。
+# 改成：本机主力做 fill/upgrade，new 排最后，把 new 的 claim 窗口尽量让给 PC；
+# PC 不在线时本机仍会轮到 new（1/4 班次），P0 不会彻底停。
+SEQUENCE = tuple(os.getenv("EMBYTG_LANE_SEQUENCE", "fill,upgrade,fill,new").split(","))
 
 
 def _default():

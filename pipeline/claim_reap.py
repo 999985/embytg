@@ -201,6 +201,14 @@ def no_work_dir(claim):
 
 
 def main():
+    # 条目级 claim 的过期清理（2026-11-20）：TTL 到期的 key 必须放回去，
+    # 否则某一集会被永久锁住、谁也领不了。
+    try:
+        import gha_state as _GS
+        _n = _GS.reap_items()
+        print("  条目级 claim 过期清理: %d 条" % _n)
+    except Exception as _e:                                   # noqa: BLE001
+        print("  claim 清理跳过: %s" % str(_e)[:50])
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--aggressive", action="store_true")

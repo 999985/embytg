@@ -2417,6 +2417,16 @@ def main():
                 pass
             attempts += 1
             continue
+        # 条目级 claim：同一集只能被一个节点领走，不同节点领不同集。
+        # 没有这一层，多节点只是排队（claim 文件按 lane 分，同 lane 只能一个）。
+        _wkey = "%s|S%sE%s" % (job.get("key") or job.get("target_rel") or "",
+                               int(job.get("season") or 0), int(job.get("ep") or 0))
+        _worker = "%s:%s" % (os.environ.get("EMBYTG_WORKER") or "local",
+                             os.environ.get("EMBYTG_RUN_SLOT") or a.lane)
+        if not GS.claim_item(_wkey, _worker):
+            skip_reasons["claim_taken"] = skip_reasons.get("claim_taken", 0) + 1
+            attempts += 1
+            continue
         write_claim(a.lane, job)
         mode = "洗版" if job.get("upgrade") else ("补缺" if a.lane == "fill" else "新增")
         broadcast("三线领取[%s/%s]：%s S%02dE%02d，画质=%s，源=%s，频道=%s，会话=%s；"

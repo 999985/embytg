@@ -14,6 +14,7 @@ import fcntl
 import json
 import math
 import os
+import sqlite3
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -137,6 +138,68 @@ def _budget_merge_and_clip(d, limit_default):
 
 def claim_path(lane):
     return os.path.join(CLAIM_DIR, lane + ".json")
+
+
+# ── 条目级 claim（2026-11-20）────────────────────────────────────────────
+# 用户口径：「多来一个人任务也多一点，少一个人就少做点事」。
+# 原来 claim 是「每 lane 一个文件」，同 lane 只能一个节点干活 —— 加节点不会加吞吐。
+# 这里把锁粒度降到「一集」：谁抢到 key 谁干，抢不到换下一集。
+
+ITEM_TTL = int(os.environ.get("JOB_CLAIM_TTL") or 14400)
+
+
+def _claim_db():
+    con = sqlite3.connect(os.path.join(HERE, "tg.db"), timeout=30)
+    con.execute("create table if not exists job_claim("
+                "key text primary key, worker text, ts integer, ttl integer)")
+    return con
+
+
+def claim_item(key, worker, ttl=None):
+    """抢一集。返回 True 表示抢到；别人已抢且未过期返回 False。"""
+    if not key:
+        return True
+    ttl = int(ttl or ITEM_TTL)
+    now = int(time.time())
+    con = _claim_db()
+    try:
+        con.execute("delete from job_claim where ts + ttl < ?", (now,))
+        cur = con.execute("insert or ignore into job_claim(key, worker, ts, ttl) "
+                          "values(?,?,?,?)", (key, worker, now, ttl))
+        con.commit()
+        if cur.rowcount:
+            return True
+        row = con.execute("select worker from job_claim where key=?", (key,)).fetchone()
+        return bool(row and row[0] == worker)
+    finally:
+        con.close()
+
+
+def release_item(key, worker=None):
+    if not key:
+        return 0
+    con = _claim_db()
+    try:
+        if worker:
+            n = con.execute("delete from job_claim where key=? and worker=?",
+                            (key, worker)).rowcount
+        else:
+            n = con.execute("delete from job_claim where key=?", (key,)).rowcount
+        con.commit()
+        return n
+    finally:
+        con.close()
+
+
+def reap_items():
+    con = _claim_db()
+    try:
+        n = con.execute("delete from job_claim where ts + ttl < ?",
+                        (int(time.time()),)).rowcount
+        con.commit()
+        return n
+    finally:
+        con.close()
 
 
 def active_claim(path):
