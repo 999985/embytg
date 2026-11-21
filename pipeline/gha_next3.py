@@ -2488,6 +2488,23 @@ def main():
             continue
         # 条目级 claim：同一集只能被一个节点领走，不同节点领不同集。
         # 没有这一层，多节点只是排队（claim 文件按 lane 分，同 lane 只能一个）。
+        # 2026-11-20：**不健康 worker 只能低调重试，不能持续烧配额。**
+        # 实测 PC(slot5) 成功率 37%、slot1 连续失败 5 次，都是 upload_failed：
+        # 每次都先下完整个文件再传失败，白白消耗源站配额。
+        # 规则：判为不健康的 worker，距上次尝试 ≥10 分钟才允许再试一次（探活），
+        # 连续成功会自然恢复（consec_fail 归零）。
+        try:
+            if os.environ.get("EMBYTG_IGNORE_HEALTH") != "1":
+                _h = GS.worker_health().get(_worker) or {}
+                if _h and not _h.get("healthy", True):
+                    if time.time() - int(_h.get("last_ts") or 0) < 600:
+                        emit({"ok": False, "reason": "worker_probation",
+                              "worker": _worker,
+                              "detail": "成功率 %.0f%%，10 分钟后才允许再试"
+                                        % (_h.get("rate", 0) * 100)})
+                        return 0
+        except Exception:                                     # noqa: BLE001
+            pass
         _wkey = GS.item_key(job)      # 去画质后缀，同集不同画质也算同一个 item
         # worker 身份：优先环境变量，其次从 run_id 里的 slotN 推断。
         # PC 的远程调用不会传 EMBYTG_WORKER，但它的 run_id 一定含 slot5，
