@@ -1,1 +1,5 @@
-{"generated_at": 0, "note": "GHA 真实上传验证（5MB）", "items": [{"run_id": "gha-real-0002", "core": "gha-upload-test", "filename": "gha-upload-test.mp4", "url": "https://speed.cloudflare.com/__down?bytes=5000000", "size": 5000000, "caption": "GHA real upload test (delete me)"}]}
+{
+ "generated_at": 0,
+ "note": "过渡期空队列：publish 生成真实派单后才会搬运",
+ "items": []
+}
