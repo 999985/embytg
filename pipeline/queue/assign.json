@@ -1,0 +1,14 @@
+{
+ "generated_at": 0,
+ "note": "演练单：只验证链路（下载+结果回写），不含真实影片",
+ "items": [
+  {
+   "run_id": "gha-smoke-0001",
+   "core": "smoke-test",
+   "filename": "smoke.bin",
+   "url": "https://speed.cloudflare.com/__down?bytes=2000000",
+   "size": 2000000,
+   "caption": "GHA transport smoke test"
+  }
+ ]
+}

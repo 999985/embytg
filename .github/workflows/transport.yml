@@ -16,8 +16,12 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "本轮最多搬几个（建议 1，多跑几次比一次跑久安全）"
+        description: "本轮最多搬几个（建议 1）"
         default: "1"
+        required: true
+      dry_run:
+        description: "演练：只下载、不上传（不需要 GH_SESSION_STRING）"
+        default: "true"
         required: true
   # 定时默认关闭：先手动跑通再打开
   # schedule:
@@ -34,14 +38,14 @@ permissions:
 jobs:
   transport:
     runs-on: ubuntu-latest
-    timeout-minutes: 75          # 单 job 不超 75 分钟（硬上限 6h，但长跑容易被风控盯上）
+    timeout-minutes: 45
     steps:
       - name: 拉代码
         uses: actions/checkout@v4
 
       - name: 熔断开关
         run: |
-          if [ -f queue/PAUSED ]; then
+          if [ -f pipeline/queue/PAUSED ]; then
             echo "检测到 queue/PAUSED，直接退出"; exit 0
           fi
 
@@ -61,8 +65,9 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_STORE_CH: ${{ secrets.TG_STORE_CH }}
           LIMIT: ${{ github.event.inputs.limit }}
+          DRY: ${{ github.event.inputs.dry_run }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python gha_transport_run.py
+        run: python pipeline/gha_transport_run.py
 
       - name: 失败留痕
         if: failure()
