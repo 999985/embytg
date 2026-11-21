@@ -167,6 +167,7 @@
   "todb_watch.py",
   "upgrade_episodes.py",
   "upgrade_from_channels.py",
-  "web_lookup.py"
+  "web_lookup.py",
+  "gha_queue.py"
  ]
 }
