@@ -1,0 +1,9 @@
+{
+ "run_id": "gha-smoke-0001",
+ "ok": true,
+ "reason": "dry_run",
+ "core": "smoke-test",
+ "dry": true,
+ "size": 2000000,
+ "secs": 0.1
+}
