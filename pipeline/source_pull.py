@@ -351,6 +351,11 @@ def _cap_learn(label, original, used):
         _cap_put(label, **kw)
 
 
+def _is_cooling(e):
+    """源级熔断（跨进程）——与「这条路径 400 / 这部剧 404」是两码事，不能写负缓存。"""
+    return bool(getattr(e, "src_cooling", False)) or "熔断中" in str(e)
+
+
 def _ep_get(g, st, path):
     """带缓存的 Episodes 请求。缓存异常一律退回直接请求（缓存不能成为故障源）。
 
@@ -402,6 +407,8 @@ def _ep_get(g, st, path):
         data = g.get(st, base)
         _cap_learn(key[0], path, base)
     except Exception as e:                                          # noqa: BLE001
+        if _is_cooling(e):
+            raise                     # 源级熔断：不是这条路径的错，冷却结束自然恢复
         if not any(s in str(e) for s in ("400", "404")):
             _ep_err_put(k, e)
             raise
@@ -420,6 +427,8 @@ def _ep_get(g, st, path):
                 _cap_learn(key[0], path, p2)
                 break
             except Exception as e2:                                 # noqa: BLE001
+                if _is_cooling(e2):
+                    raise
                 if not any(s in str(e2) for s in ("400", "404")):
                     _ep_err_put(k, e2)
                     raise
@@ -437,6 +446,8 @@ def _ep_get(g, st, path):
                     d3 = g.get(st, p3)
                 except Exception as e3:                             # noqa: BLE001
                     last = e3
+                    if _is_cooling(e3):
+                        raise
                     if not any(s in str(e3) for s in ("400", "404")):
                         _ep_err_put(k, e3)
                         raise

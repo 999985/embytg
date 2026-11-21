@@ -64,7 +64,16 @@ MIN_INTERVAL = 1.6          # 元数据 GET 的最小间隔
 SEARCH_INTERVAL = 2.5       # 搜索类接口更贵，间隔更大
 MAX_PER_HOST = 12           # 单会话单源上限
 COOLDOWN_FAIL = 600         # 熔断 10 分钟
+COOLDOWN_RATE = 1800        # 429（限流/封禁前兆）熔断 30 分钟
 MAX_CONSEC_FAIL = 2
+# 2026-11-21：熔断状态原先只活在 Guard 实例里。每个 runner 进程都是新 Guard，
+# fails/cool_until 归零 → 「连续 2 次失败熔断」在跨进程场景下**等于不存在**。
+# 实测 7 天：yuntv 1451 次请求里 713 次 status=0 + 217 次 429（今天 46 次全部失败），
+# lite 568 次 400，合计 2176 次白烧（占全部请求 17.4%，≈286 集的配额）。
+# 现在把失败计数/冷却落盘，所有进程共享同一份「这个源现在不能用」的记忆。
+HEALTH_FILE = os.getenv("EMBYTG_SRC_HEALTH_FILE") or os.path.join(HERE, "cache", "src_health.json")
+HEALTH_TTL = int(os.getenv("EMBYTG_SRC_HEALTH_TTL", str(12 * 3600)))   # 记录 12h 后自然遗忘
+FAIL_WINDOW = int(os.getenv("EMBYTG_SRC_FAIL_WINDOW", "600"))          # 10min 内才算「连续」
 
 UA = "Hills Windows/1.5.1 (windows; 19041.vb_release.191206-1406)"   # 用户 2026-11-10：UA 固定一个即可
 
@@ -223,6 +232,82 @@ def _skip_labels():
         return set()
 
 
+def _health_load():
+    """读跨进程源健康表（label -> {fails,ts,cool_until,last_status}）。
+
+    缺失/损坏一律当空表：源服闸门不能因为状态文件坏了就整条断掉。
+    """
+    try:
+        with open(HEALTH_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:                                          # noqa: BLE001
+        return {}
+
+
+def _health_rmw(label, mut):
+    """在 flock 下对单源记录做「读-改-写」，返回改后的记录。
+
+    为什么必须加锁：source_pull / gha_next3 / daily_ops 会并发起 Guard，
+    无锁 read-modify-write 会让两边的 fails 互相覆盖，熔断永远到不了阈值。
+    写盘用 tmp + os.replace（同目录原子替换），读方永远看不到半截 JSON。
+    """
+    rec = {}
+    try:
+        d = _health_load()
+        now = time.time()
+        rec = dict(d.get(label) or {})
+        rec = mut(rec, now) or rec
+        rec["ts"] = now
+        d[label] = rec
+        for k in list(d):
+            r = d[k] or {}
+            # 12h 没再出过事且不在冷却中 → 遗忘，避免一次抖动变成终身惩罚
+            if now - float(r.get("ts") or 0) > HEALTH_TTL and float(r.get("cool_until") or 0) <= now:
+                d.pop(k, None)
+        os.makedirs(os.path.dirname(HEALTH_FILE) or ".", exist_ok=True)
+        tmp = "%s.tmp.%d" % (HEALTH_FILE, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(d, fh, ensure_ascii=False)
+        try:
+            import fcntl
+            lock_path = HEALTH_FILE + ".lock"
+            with open(lock_path, "a+") as lk:
+                fcntl.flock(lk, fcntl.LOCK_EX)
+                os.replace(tmp, HEALTH_FILE)
+                fcntl.flock(lk, fcntl.LOCK_UN)
+        except Exception:                                      # noqa: BLE001
+            os.replace(tmp, HEALTH_FILE)
+    except Exception:                                          # noqa: BLE001
+        return rec
+    return rec
+
+
+def _health_fail(label, status):
+    """记一次失败（跨进程累计）；返回最新记录，调用方据此同步 cool_until。"""
+    def _mut(rec, now):
+        if now - float(rec.get("ts") or 0) > FAIL_WINDOW:
+            rec["fails"] = 0          # 隔了 10min 以上不算「连续」
+        rec["fails"] = int(rec.get("fails") or 0) + 1
+        rec["last_status"] = int(status or 0)
+        if rec["fails"] >= MAX_CONSEC_FAIL:
+            cool = COOLDOWN_RATE if int(status or 0) == 429 else COOLDOWN_FAIL
+            rec["cool_until"] = now + cool
+        return rec
+    return _health_rmw(label, _mut)
+
+
+def _health_ok(label, status=200):
+    """一次成功 → 清零失败计数、解除冷却（源站恢复后一次请求就能重新入选）。"""
+    def _mut(rec, now):
+        rec["fails"] = 0
+        rec["cool_until"] = 0
+        rec["last_status"] = int(status)
+        rec["ok_streak"] = int(rec.get("ok_streak") or 0) + 1
+        return rec
+    return _health_rmw(label, _mut)
+
+
 def load_url_map():
     """Read the existing multi-URL source inventory.
 
@@ -279,6 +364,15 @@ def load_sources():
         out[label] = {"label": label, "host": host, "hostname": hostname,
                       "hosts": hosts or [host], "token": tok}
     return out
+
+
+class SourceCoolingDown(RuntimeError):
+    """源级熔断中（跨进程共享）。**不是**这条路径/这部剧的问题。
+
+    调用方（source_pull._ep_get）必须把它与「400 端点不支持」区分开：
+    前者只影响现在这 10~30 分钟，不该写成路径负缓存或能力记忆。
+    """
+    src_cooling = True
 
 
 class HostState:
@@ -338,6 +432,7 @@ class Guard:
         self.verbose = verbose
         self.total = 0
         self._seed_latency()
+        self._seed_health()
         self._rr = 0
         os.makedirs(os.path.dirname(LOG), exist_ok=True)
 
@@ -360,6 +455,25 @@ class Guard:
             if label in self.states and arr:
                 self.states[label].avg_ms = sum(arr) / len(arr)
 
+    def _seed_health(self):
+        """把别的进程记下的「这个源正在熔断」搬进本会话。
+
+        这是本轮修复的核心：原来 fails/cool_until 只活在 `self.states`，
+        每起一个 runner 就归零 → yuntv 这种「整源不可用」每天被几十个进程
+        各撞一次（今天 46 次请求 0 次成功）。现在同一份状态被所有进程共享。
+        """
+        now = time.time()
+        for label, rec in _health_load().items():
+            st = self.states.get(label)
+            if not st or not isinstance(rec, dict):
+                continue
+            if now - float(rec.get("ts") or 0) > HEALTH_TTL:
+                continue
+            cu = float(rec.get("cool_until") or 0)
+            if cu > now:
+                st.cool_until = cu
+                st.fails = max(st.fails, int(rec.get("fails") or MAX_CONSEC_FAIL))
+
     # ---------- 调度 ----------
     def order(self):
         """负载均衡：可用源按 (连续失败, -成功率, 本会话已请求数) 排序，轮转起点偏移"""
@@ -375,6 +489,13 @@ class Guard:
     def get(self, st, path, search=False, timeout=25):
         if any(p in path for p in FORBIDDEN_PATHS):
             raise RuntimeError("规则禁止访问登录端点：%s" % path)
+        # 2026-11-21：熔断在**唯一入口**强制执行。原来只有 `order()` 会跳过冷却中的源，
+        # 任何直接拿 `g.states[label]` 调 get() 的路径都能绕过，于是 yuntv 白天被
+        # 40 多个进程各撞一次。这里挡住 = 入口挡住（比事后统计更早一层）。
+        if time.time() < st.cool_until and not os.getenv("EMBYTG_SRC_FORCE"):
+            raise SourceCoolingDown("源 %s 熔断中（到 %s），本轮不请求"
+                                    % (st.label, time.strftime("%H:%M:%S",
+                                                               time.localtime(st.cool_until))))
         if st.count >= MAX_PER_HOST:
             raise RuntimeError("源 %s 已达单会话上限 %d 次" % (st.label, MAX_PER_HOST))
         gap = SEARCH_INTERVAL if search else MIN_INTERVAL
@@ -420,8 +541,10 @@ class Guard:
                 st.answered += 1
                 st.ok += 1
                 st.fails = 0
+                st.cool_until = 0.0
                 st.avg_ms = (st.avg_ms * 0.7 + (time.time() - t0) * 1000 * 0.3) if st.avg_ms else (time.time() - t0) * 1000
                 data = json.loads(raw) if raw.strip().startswith(("{", "[")) else raw
+                _health_ok(st.label, status)
                 return data
             except urllib.error.HTTPError as e:
                 status = e.code
@@ -429,11 +552,13 @@ class Guard:
                 st.answered += 1          # 服务器回了状态码 = 它确实处理了这次请求
                 st.fails += 1
                 last_error = e
+                # 2026-11-21：401/403/429/5xx 记进**跨进程**健康表。
+                # 429 是限流/封禁前兆 → 冷却 30min（原来只是本进程 10min，
+                # 换个进程立刻又去撞，7 天撞了 217 次）。404 是缺片、400 是调用方
+                # 能力问题，都不算源故障，不进表。
+                if e.code in (401, 403, 429) or e.code >= 500:
+                    self._mark_fail(st, e.code)
                 if e.code in (401, 403, 429):
-                    if st.fails >= MAX_CONSEC_FAIL:
-                        st.cool_until = time.time() + COOLDOWN_FAIL
-                        if self.verbose:
-                            print("    ! %s 连续失败 %d 次，熔断 10min" % (st.label, st.fails))
                     raise
                 if e.code < 500:
                     raise
@@ -441,21 +566,31 @@ class Guard:
                 st.last = time.time()
                 st.fails += 1
                 last_error = e
-                # 2026-11-14（E073）：走代理的源，**代理本身挂了**也必须熔断。
-                # 香港节点是借用的，随时可能失效；不熔断的话每轮都要为它
-                # 白等一次连接超时。连接类错误（拒绝/超时/网络不可达）
-                # 与 401/403/429 一样计入连续失败。
-                if proxy and isinstance(e, (ConnectionError, OSError, socket.timeout)):
-                    if st.fails >= MAX_CONSEC_FAIL:
-                        st.cool_until = time.time() + COOLDOWN_FAIL
-                        if self.verbose:
-                            print("    ! %s 代理不可用，连续失败 %d 次，熔断 10min"
-                                  % (st.label, st.fails))
+                # status==0 = 源站压根没应答（连接被拒/超时/TLS/代理挂）。
+                # 与 429 同罪：这一次请求的配额已经白烧，必须让后面的进程知道。
+                if status == 0:
+                    self._mark_fail(st, 0)
             finally:
                 self._audit(st, path, status, time.time() - t0)
         if last_error:
             raise last_error
         raise RuntimeError("源 %s 没有可用镜像" % st.label)
+
+    def _mark_fail(self, st, status):
+        """把一次失败写进跨进程健康表，并把冷却/计数同步回本会话。
+
+        熔断判据不再是「本实例连续 2 次」，而是「10 分钟内全网累计 2 次」——
+        因为浪费配额的是「多个进程各撞一次」，不是单个进程连撞两次。
+        """
+        rec = _health_fail(st.label, status)
+        st.fails = max(st.fails, int(rec.get("fails") or 0))
+        cu = float(rec.get("cool_until") or 0)
+        if cu > time.time():
+            st.cool_until = cu
+            if self.verbose:
+                print("    ! %s HTTP/%s 累计 %d 次失败，熔断到 %s"
+                      % (st.label, status or "无应答", st.fails,
+                         time.strftime("%H:%M:%S", time.localtime(cu))))
 
     def _audit(self, st, path, status, dur):
         rec = {"ts": time.strftime("%F %T"), "session_ua": self.ua[:24], "host": st.hostname,
@@ -517,6 +652,15 @@ def main():
         print("今日各源请求：")
         for k, (n, ok) in sorted(agg.items(), key=lambda x: -x[1][0]):
             print("  %-24s %3d 次  成功率 %.0f%%" % (k, n, ok * 100.0 / n))
+        now = time.time()
+        cool = {k: v for k, v in _health_load().items()
+                if isinstance(v, dict) and float(v.get("cool_until") or 0) > now}
+        if cool:
+            print("熔断中（跨进程共享）：")
+            for k, v in sorted(cool.items(), key=lambda x: -float(x[1]["cool_until"])):
+                print("  %-24s 到 %s  last=%s 累计 %s 次"
+                      % (k, time.strftime("%H:%M:%S", time.localtime(float(v["cool_until"]))),
+                         v.get("last_status"), v.get("fails")))
         return
 
     g = Guard()
