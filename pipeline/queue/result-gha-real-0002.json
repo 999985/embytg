@@ -1,0 +1,10 @@
+{
+ "run_id": "gha-real-0002",
+ "ok": true,
+ "reason": "",
+ "core": "gha-upload-test",
+ "dry": false,
+ "size": 5000000,
+ "file_id": 116861,
+ "secs": 17.7
+}
