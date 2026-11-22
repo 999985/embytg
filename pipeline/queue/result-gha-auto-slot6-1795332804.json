@@ -1,9 +1,8 @@
 {
  "run_id": "gha-auto-slot6-1795332804",
  "ok": false,
- "reason": "The number of file parts is invalid (caused by SaveBigFilePartRequest)",
+ "reason": "HTTP Error 403: Forbidden",
  "core": "tv|id:224372|(1, 4)|2160p",
  "dry": false,
- "size": 4813204743,
- "secs": 90.5
+ "secs": 0.7
 }
