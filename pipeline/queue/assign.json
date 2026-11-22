@@ -1,21 +1,5 @@
 {
- "generated_at": 1795279722,
- "items": [
-  {
-   "run_id": "gha-auto-slot6-1795279720",
-   "core": "tv|id:219833|(1, 28)|2160p",
-   "filename": "风雨送春归 S01E28 - 1080p.mp4",
-   "url": "https://emby.bangumi.ca/Videos/86736/stream?Static=true&api_key=7ff49acd586942249572c1085db061c4",
-   "size": 1211881690,
-   "caption": "风雨送春归",
-   "meta": {
-    "folders": "TV/国产剧/风雨送春归 (未知) {tmdb=219833}/Season 01",
-    "tmdb": 219833,
-    "season": 1,
-    "ep": 28,
-    "channel_id": 4413117262,
-    "mnt": "/opt/embytg/mnt/embytg"
-   }
-  }
- ]
+ "generated_at": 0,
+ "note": "空队列：由 gha_stock.sh / publish-auto 在有合适活时补单（跳过慢源与 >600MB）",
+ "items": []
 }
