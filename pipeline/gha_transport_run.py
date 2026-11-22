@@ -61,21 +61,52 @@ def download(url, dest):
     return total
 
 
-async def upload(path, caption):
+PART_MB = int(os.environ.get("GHA_PART_MB") or 1800)
+
+
+def split(path, part_bytes):
+    """把文件切成若干段——单条消息有 2GB 上限，但整集不必塞进一条。"""
+    parts = []
+    with open(path, "rb") as f:
+        idx = 0
+        while True:
+            data = f.read(part_bytes)
+            if not data:
+                break
+            idx += 1
+            p = "%s.part%03d" % (path, idx)
+            with open(p, "wb") as o:
+                o.write(data)
+            parts.append((idx, p, len(data)))
+    return parts
+
+
+async def upload_parts(parts, caption, meta):
+    """逐段上传，返回 teldrive 需要的 parts 列表（与 pc_upload.py 同构）。"""
     from telethon import TelegramClient
     from telethon.sessions import StringSession
 
     s = os.environ.get("GH_SESSION_STRING") or ""
     if not s:
         raise RuntimeError("缺少 GH_SESSION_STRING（消耗号），DRY=1 可先验证链路")
-    c = TelegramClient(StringSession(s), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+    ch = int(os.environ["TG_STORE_CH"])
+    c = TelegramClient(StringSession(s), int(os.environ["TG_API_ID"]),
+                       os.environ["TG_API_HASH"])
     await c.connect()
     if not await c.is_user_authorized():
         raise RuntimeError("GH_SESSION_STRING 未授权（消耗号可能已失效）")
-    msg = await c.send_file(int(os.environ["TG_STORE_CH"]), str(path),
-                            caption=caption, supports_streaming=True)
+    out = []
+    n = len(parts)
+    for idx, path, size in parts:
+        msg = await c.send_file(
+            ch, path, caption="%s [%d/%d]" % (caption or "", idx, n),
+            attributes=[], supports_streaming=False, force_document=True)
+        out.append({"part_no": idx, "message_id": msg.id,
+                    "plain_size": size, "stored_size": size,
+                    "channel_id": meta.get("channel_id") or 0})
+        print("  part %d/%d 完成 msg=%s %.0fMB" % (idx, n, msg.id, size / 1e6))
     await c.disconnect()
-    return msg.id
+    return out
 
 
 def main():
@@ -100,9 +131,14 @@ def main():
                     rec["reason"] = "dry_run"
                     print("  DRY：跳过上传")
                 else:
-                    rec["file_id"] = asyncio.run(upload(dest, it.get("caption") or ""))
+                    parts = split(dest, PART_MB * 1024 * 1024)
+                    print("  切成 %d 段（每段 ≤%dMB）" % (len(parts), PART_MB))
+                    rec["parts"] = asyncio.run(
+                        upload_parts(parts, it.get("caption") or "", rec.get("meta") or {}))
+                    rec["file_id"] = rec["parts"][0]["message_id"]
+                    rec["meta"] = it.get("meta") or {}
                     rec["ok"] = True
-                    print("  上传完成 msg_id=%s" % rec["file_id"])
+                    print("  全部完成，共 %d 段" % len(rec["parts"]))
         except Exception as e:                                  # noqa: BLE001
             rec["reason"] = str(e)[:200]
             print("  失败: %s" % rec["reason"])
