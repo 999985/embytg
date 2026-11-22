@@ -1,18 +1,18 @@
 {
- "generated_at": 1795330037,
+ "generated_at": 1795331478,
  "items": [
   {
-   "run_id": "gha-auto-slot6-1795330035",
-   "core": "tv|id:49471|(2, 9)|1080p",
-   "filename": "弹丸论破 S02E09 - 1080p.mkv",
-   "url": "https://emby.bangumi.ca/Videos/11865/stream?Static=true&api_key=7ff49acd586942249572c1085db061c4",
-   "size": 947446904,
-   "caption": "弹丸论破",
+   "run_id": "gha-auto-slot6-1795331474",
+   "core": "tv|id:52890|(1, 11)|1080p",
+   "filename": "悠悠式 S01E11 - 1080p.mkv",
+   "url": "https://emby.bangumi.ca/Videos/6240/stream?Static=true&api_key=7ff49acd586942249572c1085db061c4",
+   "size": 1062451642,
+   "caption": "悠悠式",
    "meta": {
-    "folders": "TV/国产剧/弹丸论破 (未知) {tmdb=49471}/Season 02",
-    "tmdb": 49471,
-    "season": 2,
-    "ep": 9,
+    "folders": "TV/国产剧/悠悠式 (未知) {tmdb=52890}/Season 01",
+    "tmdb": 52890,
+    "season": 1,
+    "ep": 11,
     "channel_id": 4413117262,
     "mnt": "/opt/embytg/mnt/embytg"
    }
