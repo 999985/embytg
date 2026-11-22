@@ -1,5 +1,21 @@
 {
- "generated_at": 0,
- "note": "空队列：由 gha_stock.sh / publish-auto 在有合适活时补单（跳过慢源与 >600MB）",
- "items": []
+ "generated_at": 1795330037,
+ "items": [
+  {
+   "run_id": "gha-auto-slot6-1795330035",
+   "core": "tv|id:49471|(2, 9)|1080p",
+   "filename": "弹丸论破 S02E09 - 1080p.mkv",
+   "url": "https://emby.bangumi.ca/Videos/11865/stream?Static=true&api_key=7ff49acd586942249572c1085db061c4",
+   "size": 947446904,
+   "caption": "弹丸论破",
+   "meta": {
+    "folders": "TV/国产剧/弹丸论破 (未知) {tmdb=49471}/Season 02",
+    "tmdb": 49471,
+    "season": 2,
+    "ep": 9,
+    "channel_id": 4413117262,
+    "mnt": "/opt/embytg/mnt/embytg"
+   }
+  }
+ ]
 }
