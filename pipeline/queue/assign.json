@@ -1,5 +1,21 @@
 {
- "generated_at": 0,
- "note": "过渡期空队列：publish 生成真实派单后才会搬运",
- "items": []
+ "generated_at": 1795279722,
+ "items": [
+  {
+   "run_id": "gha-auto-slot6-1795279720",
+   "core": "tv|id:219833|(1, 28)|2160p",
+   "filename": "",
+   "url": "https://emby.bangumi.ca/Videos/86736/stream?Static=true&api_key=7ff49acd586942249572c1085db061c4",
+   "size": 1211881690,
+   "caption": "风雨送春归",
+   "meta": {
+    "folders": "",
+    "tmdb": 219833,
+    "season": 1,
+    "ep": 28,
+    "channel_id": 4413117262,
+    "mnt": "/opt/embytg/mnt/embytg"
+   }
+  }
+ ]
 }
