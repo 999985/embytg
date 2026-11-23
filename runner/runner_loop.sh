@@ -32,6 +32,13 @@ while true; do
         sleep_s="$IDLE_MIN"          # 干到了活，下一轮立刻可跑
         continue
     fi
+    # 2026-11-23：**rc=0 且很快退出 = 没活，不是故障**，不该指数退避到 300 秒。
+    # 实测 23:44 整条 lane 睡 300s，而队列里明明有 900 条 new —— 四条 lane 里
+    # 两条在睡觉，看起来就像「四个号没同时工作」。没活就 20 秒后再看。
+    if [ "$rc" -eq 0 ]; then
+        sleep "$IDLE_MIN"
+        continue
+    fi
     # 没活 / 失败退避：指数增长，上限 IDLE_MAX
     echo "$(date '+%F %T') [loop] idle rc=$rc dur=${dur}s → sleep ${sleep_s}s" >>"$LOG"
     sleep "$sleep_s"

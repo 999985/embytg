@@ -630,14 +630,18 @@ def main():
 
             def _pending(x):
                 c = caps.get(x["label"])
-                return c is None or c == 0 or int(c) > 20
+                # 2026-11-23：策略已改为「源站配额不设上限，只保留频率约束」
+                # （src_budget_rebalance.tier_of 恒返回 0）。cap=0 是**已执行**的
+                # 目标状态，不是「还没降」。再报「建议降 limit」就是让人去改一个
+                # 按策略永远不该改的值 —— 改成只报告，不再提建议。
+                return c is None
 
             todo = [x for x in zero if _pending(x)]
             names = ",".join(x["label"][:16] for x in zero[:4])
-            days = ",".join(str(x["day"]) for x in zero[:4])
+            days = ",".join(str(x.get("day") or 0) for x in zero[:4])
             line(None, "零产出源",
-                 "%s（各烧 %s 次，建议降 limit）" % (names, days) if todo
-                 else "%s（各烧 %s 次；额度已压到 20，次日生效）" % (names, days))
+                 "%s（各烧 %s 次，无 cap；未在源列表）" % (names, days) if todo
+                 else "%s（各烧 %s 次；额度策略=不限，按 download_fails 降权）" % (names, days))
     except Exception as e:                                          # noqa: BLE001
         line(None, "源命中率", str(e)[:60])
 
