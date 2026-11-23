@@ -139,6 +139,51 @@ CHANNELS = [
     ("yingshi9999", 7, "tv_album"),   # 剧集，相册 + 独立标题
 ]
 
+# 2026-11-23：**这个变量从来没定义过。** 两处引用（扫描过滤 / 消费跳过），
+# 一处都没定义 → embytg-tgpipe.service 每次启动就 NameError 秒退，
+# 频道扫描等于完全没跑，pending 长期是 0。用户问「这些频道不是一直更新吗，
+# 为什么没利用上」—— 因为那条链路是坏的，不是没有资源。
+BLOCKED_CHANNELS = {x.strip() for x in os.environ.get("TGPIPE_BLOCKED", "").split(",") if x.strip()}
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tgpipe_log")
+
+
+def log_batch(batch, done, dry=False):
+    """把每一集的转存结果写进日志（2026-11-23 用户要求）。
+
+    「成功还是失败也需要有日志」—— 原来只有 stdout 一行 "本批登记 N 集"，
+    失败条目静默消失：看不出是哪一集、也看不出为什么。现在逐条落盘到
+    .tgpipe_log/YYYY-MM-DD.jsonl：{ts, ch, msg, title, ok, reason, size, path}
+    """
+    import json as _j
+    import time as _t
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except Exception:                                       # noqa: BLE001
+        pass
+    path = os.path.join(LOG_DIR, "%s.jsonl" % _t.strftime("%Y-%m-%d"))
+    ok_titles = {str(x.get("title") or x.get("raw_title") or "") for x in (done or [])}
+    n_ok = n_fail = 0
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            for it in batch or []:
+                t = str(it.get("title") or it.get("raw_title") or "")
+                good = bool(t and t in ok_titles and not it.get("skip"))
+                rec = {"ts": int(_t.time()), "ch": it.get("ch"), "msg": it.get("msg"),
+                       "title": t, "ok": good and not dry, "dry": bool(dry),
+                       "reason": "" if good else (it.get("skip") or it.get("err")
+                                                  or it.get("reason") or "unknown"),
+                       "size": it.get("size") or it.get("bytes") or 0,
+                       "path": it.get("path") or it.get("rel") or ""}
+                fh.write(_j.dumps(rec, ensure_ascii=False) + "\n")
+                if rec["ok"]:
+                    n_ok += 1
+                else:
+                    n_fail += 1
+        print("# 日志 %s：成功 %d / 失败 %d" % (os.path.basename(path), n_ok, n_fail), flush=True)
+    except Exception as e:                                   # noqa: BLE001
+        print("# 写日志失败: %s" % str(e)[:80], file=sys.stderr, flush=True)
+
 PG = ["docker", "exec", "-i", "teldrive-postgres", "psql", "-U", "teldrive", "-d", "teldrive",
       "-v", "ON_ERROR_STOP=1", "-At"]
 
@@ -755,7 +800,20 @@ def ensure_folder(name, parent_id=None):
 
 
 def register(parent_id, name, parts):
-    """parts: [(message_id, size)]，按顺序作为 part_no 1..N。"""
+    """parts: [(message_id, size)]，按顺序作为 part_no 1..N。
+
+    2026-11-24：**幂等。** 同名文件已经在 teldrive 里时，原来 INSERT 直接撞
+    files_unique_active_child_name_idx → 整条转存记成"登记失败"。
+    实际语义是"这部片已经在库里了"，不是错误。先查再决定：
+      · 已有且 parts 数一致 → 直接返回已有 id（重复扫描不报错）
+      · 没有 → 正常插入
+    """
+    old = sql(f"select id from teldrive.files where kind='file' and name={qq(name)} "
+              f"and user_id={USER_ID} and parent_id='{parent_id}' limit 1")
+    if old:
+        n = sql(f"select count(*) from teldrive.file_parts where file_id='{old}'")
+        if int(n or 0) == len(parts):
+            return old, int(sql(f"select size from teldrive.files where id='{old}'") or 0)
     fid = str(uuid.uuid4())
     total = sum(s for _, s in parts)
     sql(f"""insert into teldrive.files(id,user_id,parent_id,name,kind,mime_type,size,
@@ -1332,6 +1390,7 @@ async def apply(items, state, dry=False, c=None, dst=None):
                 await asyncio.sleep(0.8)      # 温和节流：TG 对非 Premium 高频转发递增限流(848→1642s)，
                                                # 0.2s/条过急触发翻倍等待；提到 0.8s 平滑速率
             if not got:
+                it["err"] = "源消息失效/无文件"
                 print(f'  ! {it["ch"]}/m{it["msg"]} 源消息失效', file=sys.stderr, flush=True)
                 continue
             if len(parts) == 1:
@@ -1377,6 +1436,8 @@ async def apply(items, state, dry=False, c=None, dst=None):
                       file=sys.stderr, flush=True)
             done.append(it)
         except Exception as e:
+            # 失败必须留原因，否则日志里全是 "unknown"，看不出是限流、禁转还是源消息失效
+            it["err"] = ("%s: %s" % (type(e).__name__, str(e)[:100]))
             print(f'  ! 登记失败 {it.get("ch")}/m{it.get("msg")}: {type(e).__name__}: {str(e)[:160]}',
                   file=sys.stderr, flush=True)
             continue
@@ -1474,6 +1535,7 @@ def main():
             print(f'# 队列: 共 {len(q["items"])} 条, 已完成 {q["cursor"]}, '
                   f'本批取 {attempted} 条 / 去重后 {len(batch)} 条', flush=True)
             done = asyncio.run(apply(batch, st, dry=a.dry))
+            log_batch(batch, done, dry=a.dry)
             if not a.dry:
                 q["cursor"] += attempted
                 save_json(PENDING, q)
