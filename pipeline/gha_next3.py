@@ -495,57 +495,74 @@ def magic_ok(head):
 
 
 def probe_source(job):
-    """Read total size and first bytes without downloading the media.
+    """Read total size, first bytes and a short throughput sample.
 
-    Emby's Items/Size can be stale or refer to another media version.  A
-    small Range probe returns the same total as the downloader's Content-Range,
-    so the claim, resume partial and manifest all agree before any bulk
-    transfer starts.  The same probe catches HTML/error pages that advertise a
-    video-sized range but cannot deliver video bytes.
+    A 4MB Range sample with a 6s deadline rejects sources that connect but
+    deliver bytes far below the floor (measured: ct.cdn.bgp.yt 0.06MB/s held
+    a lane for hours).  The same probe still validates size/type before the
+    bulk transfer starts.
     """
-    url = str(job.get("source_url") or "")
+    url = str(job.get('source_url') or '')
     if not url:
         return 0, False
+    sample = max(1 << 20, int(os.getenv('CLAIM_SPEED_BYTES', str(4 << 20))))
+    min_mbps = float(os.getenv('CLAIM_MIN_MBPS', '1.0'))
+    window = float(os.getenv('CLAIM_SPEED_SEC', '6'))
     headers = {
-        "User-Agent": job.get("source_ua") or "",
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Range": "bytes=0-63",
+        'User-Agent': job.get('source_ua') or '',
+        'Accept': '*/*',
+        'Accept-Encoding': 'identity',
+        'Range': 'bytes=0-%d' % (sample - 1),
     }
+    label = job.get('source_label') or '?'
+    t0 = time.time()
+    got = 0
+    head = b''
+    total = 0
+    timed_out = False
     try:
         with requests.Session() as s:
             s.trust_env = False
             r = s.get(url, headers=headers, stream=True,
-                      timeout=(15, 30), allow_redirects=True, verify=False)
+                      timeout=(window, window), allow_redirects=True, verify=False)
             try:
                 if r.status_code == 206:
-                    match = re.search(
-                        r"/\s*(\d+)\s*$", r.headers.get("Content-Range") or "")
+                    match = re.search(r'/\s*(\d+)\s*$', r.headers.get('Content-Range') or '')
                     total = int(match.group(1)) if match else 0
                 elif r.status_code == 200:
-                    total = int(r.headers.get("Content-Length") or 0)
+                    total = int(r.headers.get('Content-Length') or 0)
                 else:
                     total = 0
-                head = b""
-                for block in r.iter_content(64):
+                for block in r.iter_content(65536):
                     if not block:
                         continue
-                    head += block
-                    if len(head) >= 64:
+                    if len(head) < 64:
+                        head += block[:64 - len(head)]
+                    got += len(block)
+                    if got >= sample or time.time() - t0 >= window:
                         break
             finally:
                 r.close()
-    except Exception as exc:  # noqa: BLE001
-        print("SOURCE_SIZE_PROBE_FAILED source=%s error=%r" % (
-            job.get("source_label") or "?", exc), file=sys.stderr, flush=True)
+    except requests.exceptions.Timeout:
+        timed_out = True
+    except Exception as exc:
+        print('SOURCE_SIZE_PROBE_FAILED source=%s error=%r' % (label, exc),
+              file=sys.stderr, flush=True)
         return 0, False
+    elapsed = max(time.time() - t0, 0.05)
+    rate = got / elapsed / 1e6
+    if total >= 8 * 1024 * 1024 and (timed_out or got >= (1 << 20) or elapsed >= window):
+        if rate < min_mbps:
+            raise BadSource(label, 'source_too_slow:%.2fMB/s' % rate)
+    if timed_out and got == 0:
+        raise BadSource(label, 'source_too_slow:no_data_%ds' % int(window))
     if total < 20 * 1024 * 1024 or total > 12 * 1024 * 1024 * 1024:
-        print("SOURCE_SIZE_PROBE_IGNORED total=%d magic=%s source=%s" % (
-            total, "OK" if magic_ok(head) else "BAD",
-            job.get("source_label") or "?"),
+        print('SOURCE_SIZE_PROBE_IGNORED total=%d magic=%s source=%s' % (
+            total, 'OK' if magic_ok(head) else 'BAD', label),
             file=sys.stderr, flush=True)
         total = 0
     return total, magic_ok(head)
+
 
 
 def target_existing(item, ep):
@@ -730,6 +747,21 @@ def effective_position(item, rel):
         if any(os.path.normpath(row["path"]) == old_abs for row in rows):
             return season, ep, ""
     return int(item["season"]), int(item["ep"]), ""
+
+
+def probe_failed(hits):
+    """探测失败 ≠ 已存在 —— check_fail 前缀不能当作「在库」的证据。
+
+    2026-11-23 事故：06:08 Emby 容器重启，9 秒内 46 次判重全部拿到
+    `check_fail:emby:<Connection refused>`。旧代码只看 `if hits:`，于是
+      - new 车道：整季 `_miss` 全被判成已入库 → series_complete → 7 天冷却；
+      - fill 车道：47 集记 duplicate + fill_ep_present（7 天）/ 23 部剧
+        fill_all_present（12h）→ 这些集可能真的缺，却再也不会重试。
+    一次 9 秒的重启就吞掉两天产量。判据应当是：只有 state_key /
+    resource_state / teldrive / emby_effective 才算命中，check_fail 只说明
+    「这次没判断成」，必须按「未知」处理 —— 不记 duplicate、不落任何冷却。
+    """
+    return any(str(h).startswith("check_fail") for h in (hits or []))
 
 
 def episode_anywhere(item, season, ep):
@@ -957,6 +989,17 @@ def fill_target(item, ep, cands, min_bytes, max_bytes):
         return None, "no_target"
     good, reasons = valid_candidates(cands, min_bytes, max_bytes, item=item)
     if not good:
+        # 2026-11-21：**「没搜到」≠「源站没有」。**
+        # 实测大量集被标成 no_valid_source 后锁 6 小时，实际原因是那一轮
+        # 源站在 429 / 超时（yuntv 熔断、bangumi 证书告警等），根本没真正搜成。
+        # 这种情况下小时级冷却会把整个队列冻住 —— 用户看到的「没活」就是这么来的。
+        # 凡是原因里含 429 / timeout / proxy / ssl 的，一律归为「暂时不可用」，
+        # 走分钟级短退避，等源缓过来立刻重试。
+        _r = " ".join(str(x).lower() for x in (reasons or []))
+        _soft = any(k in _r for k in ("429", "timeout", "timed out", "proxy",
+                                      "ssl", "certificate", "connection", "refused"))
+        if _soft:
+            return None, "sources_unavailable" + ((":" + ",".join(reasons[:4])) if reasons else "")
         return None, "no_valid_source" + ((":" + ",".join(reasons[:4])) if reasons else "")
     c = good[0]
     q = c["quality"]["label"]
@@ -1378,11 +1421,20 @@ def pick_new_episode(item, sources, min_bytes, max_bytes):
         # 所以「缺」不等于「真缺」：对每个候选缺集再走一次 episode_anywhere()，
         # 命中的从 _miss 里剔除；只有确实查不到的才算真缺。
         _real_miss = []
+        _probe_broken = False
         for k in _miss:
             hits, _p = episode_anywhere(item2, k[0], k[1])
+            if probe_failed(hits):
+                # 判断没做成（Emby/tg.db 短暂不可用）：本地账本已查过没命中，
+                # 按真缺处理；但绝不能由此判 series_complete（7 天冷却）。
+                _probe_broken = True
+                _real_miss.append(k)
+                continue
             if hits:
                 continue                      # 已入库，只是 Emby 索引还没跟上
             _real_miss.append(k)
+        if _probe_broken:
+            return item2, None, "probe_unavailable"
         if not _real_miss:
             return item2, None, "series_complete"
         if _have_n >= 5 and len(_real_miss) <= 2:
@@ -1402,6 +1454,9 @@ def pick_new_episode(item, sources, min_bytes, max_bytes):
 
     for (season, ep) in sorted(by_ep):
         hits, _ = episode_anywhere(item2, season, ep)
+        if probe_failed(hits):
+            # 判断没做成：不记 duplicate、不落冷却，整部本轮放弃，下一轮再来。
+            return item2, None, "probe_unavailable"
         if hits:
             dup_hits.append((ep, hits))
             duplicate_log(item2, ep, None, None, ",".join(hits), season=season)
@@ -1511,6 +1566,14 @@ def _lane_scan_gated(lane):
     return True
 
 
+def _source_url(st, episode_id):
+    if getattr(st, "label", "") == "emos.enic65.eu.org":
+        import emos_direct
+        return emos_direct.direct_url(st.host, st.token, episode_id)
+    return "%s/Videos/%s/stream?Static=true&api_key=%s" % (
+        st.host.rstrip("/"), episode_id, st.token)
+
+
 def make_job(lane, item, season, ep, target, candidate, key, store_ch, store_channels,
              slot, run_id, upgrade=False):
     episode = candidate["episode"]
@@ -1542,8 +1605,7 @@ def make_job(lane, item, season, ep, target, candidate, key, store_ch, store_cha
         "tg_session_slot": slot,
         "source_label": candidate["st"].label,
         "source_ua": candidate["st"].ua,
-        "source_url": "%s/Videos/%s/stream?Static=true&api_key=%s" % (
-            candidate["st"].host.rstrip("/"), episode["Id"], candidate["st"].token),
+        "source_url": _source_url(candidate["st"], episode["Id"]),
         "status": "running",
         "ts": int(time.time()),
     }
@@ -1584,6 +1646,13 @@ def try_fill(item, available_labels, leased, min_bytes, max_bytes, run_id,
     for raw_ep in missing[:max(1, int(max_eps_scan))]:
         ep = int(raw_ep)
         hits, existing_rel = episode_anywhere(item, int(item["season"]), ep)
+        if probe_failed(hits):
+            # 判断没做成（Emby 重启 / tg.db 短暂不可用）：既不算在库、也不落
+            # 冷却 —— 这一轮到此为止，后面每一集都会以同样方式失败。
+            print("fill: 判重探测失败，本轮跳过 %s S%dE%d（%s）" % (
+                item.get("series"), _season, ep, ",".join(hits)[:60]),
+                file=sys.stderr, flush=True)
+            return None
         if hits:
             duplicate_log(item, ep, None, existing_rel, ",".join(hits),
                           season=int(item["season"]))
@@ -1598,12 +1667,13 @@ def try_fill(item, available_labels, leased, min_bytes, max_bytes, run_id,
         if not allowed:
             continue
         g = SG.Guard(verbose=False)
+        _st_stats = {}
         try:
             with contextlib.redirect_stdout(sys.stderr):
                 cands = SP.resolve_candidates(
                     g, item["series"], int(item["season"]), ep,
                     exclude=HARD_EXCLUDE, max_hosts=2, year=item.get("year", 0),
-                    order_labels=allowed)
+                    order_labels=allowed, stats=_st_stats)
         finally:
             GS.charge_guard(g)
         chosen, why2 = fill_target(item, ep, cands, min_bytes, max_bytes)
@@ -1626,6 +1696,19 @@ def try_fill(item, available_labels, leased, min_bytes, max_bytes, run_id,
             # too_big 是「本时段策略跳过」，不是「源站没有这一集」：
             # 落按集冷却会让 4GB+ 的集整天不再尝试，而它夜里本该允许。
             _is_policy_skip = "too_big" in str(why2 or "")
+            # 2026-11-22：**「所有源这一轮都失败」不是「所有源都没有这一集」。**
+            # 前者给整集落 6h 冷却 = 把源站故障记成缺片（今日 2263 条队列停泊里
+            # 大部分就是这种形状：mirror 回 HTML、401，被当成缺片）。
+            # 只有在「有源确实答过、并且答的是没有」时才落集级冷却。
+            _all_err = (int(_st_stats.get("errors") or 0)
+                        >= max(1, int(_st_stats.get("sources") or 0)))
+            if (str(why2 or "").startswith("no_valid_source") and _all_err
+                    and not _is_policy_skip):
+                print("fill: 全部源本轮失败/坏应答（非缺片），不落集级冷却 %s S%dE%d（%d/%d）"
+                      % (item.get("series"), _season, ep,
+                         int(_st_stats.get("errors") or 0), int(_st_stats.get("sources") or 0)),
+                      file=sys.stderr, flush=True)
+                continue
             if why2 and str(why2) != "no_target" and not _is_policy_skip:
                 _k3 = ep_cool_key(item, _season, ep)
                 if _k3:
@@ -1648,7 +1731,13 @@ def try_fill(item, available_labels, leased, min_bytes, max_bytes, run_id,
         target, c = chosen
         key, why = check_existing(item, int(item["season"]), ep, target, c["quality"]["label"])
         if why:
-            # 2026-11-14 根因修复（fill lane 同一部剧每轮反复打 duplicate）：
+            if str(why).startswith("check_fail"):
+                # check_existing 自己抛了异常（tg.db/teldrive 不可用）：
+                # 这不是「已入库」，不能落 fill_ep_present（7 天）冷却。
+                print("fill: check_existing 探测失败，本轮跳过 %s S%dE%d（%s）" % (
+                    item.get("series"), _season, ep, str(why)[:60]),
+                    file=sys.stderr, flush=True)
+                return None
             # check_existing() 的 why（state_key / resource_state / teldrive）说明
             # **这一集已经入库**，只是当前目标画质/路径对不上（例如库里已有 1080p，
             # 而源站这一集给的是别的画质 → 目标路径不同 → 判成"缺"）。
@@ -1706,9 +1795,17 @@ def try_fill(item, available_labels, leased, min_bytes, max_bytes, run_id,
     _missing = [int(x) for x in (item.get("missing") or [])]
     if _missing:
         _still = []
+        _probe_broken = False
         for _e in _missing:
-            if not episode_anywhere(item, int(item["season"]), _e)[0]:
+            _h, _ = episode_anywhere(item, int(item["season"]), _e)
+            if probe_failed(_h):
+                _probe_broken = True
+                break
+            if not _h:
                 _still.append(_e)
+        if _probe_broken:
+            # 探测没做成 ≠ 全在库：绝不能落 fill_all_present，下一轮重来。
+            return None
         if not _still:
             try:
                 # 2026-11-15：键必须与队列过滤用的 item_cool_key() 一致，
@@ -2089,9 +2186,22 @@ def main():
     _unhealthy = {w for w, h in _health.items() if not h.get("healthy", True)}
     _ext_ok = {w for w in _ext_seen if w not in _unhealthy
                or os.environ.get("EMBYTG_IGNORE_HEALTH") == "1"}
-    _ext_cap = max(_ext_declared, len(_ext_ok) + 1, 1)
+    # 末尾 +1 是「当前这个外部 claimant 自己的位置」：否则外部 worker 自己
+    # 计入 active 之后又被自己的位置挡住（实测 active=4/cap=4 空转）。
+    # +1 = 当前 claimant 自己的位置；再 +1 = 下一台新机器的位置。
+    # 原来只 +1，导致「本机 3 + PC 1 + 遗留 claim 2」把 cap 顶满后，
+    # 外部 worker 连自己那一格都算进去，反而领不到（实测 active=6/cap=6）。
+    _ext_cap = max(_ext_declared, len(_ext_ok) + 1, 1) + 2
     _total_cap = _pool_cap + _ext_cap
-    _cap = min(int(a.max_active or _total_cap), _total_cap)
+    # 2026-11-21：--max-active 只管本机 worker（默认 2）。外部 worker（GHA/PC）
+    # 自带 session，不该被这个本机旋钮挡住——否则「来了就跑」永远跑不起来：
+    # 实测 active=4、cap=2、pool_cap=3，外部单子被本机上限卡死。
+    _is_ext_early = (os.environ.get("EMBYTG_EXTERNAL") == "1"
+                     or bool(re.search(r"slot([5-9])", str(getattr(a, "run_id", "") or ""))))
+    if _is_ext_early:
+        _cap = _total_cap
+    else:
+        _cap = min(int(a.max_active or _total_cap), _total_cap)
     if len(active) >= _cap and not a.force:
         emit({"ok": False, "reason": "max_active", "active": len(active),
               "cap": _cap, "pool_cap": _pool_cap})
@@ -2136,7 +2246,7 @@ def main():
     items = []
     if os.path.exists(qpath):
         data = json.load(open(qpath, encoding="utf-8"))
-        items = data.get("items") or []
+        items = [GS.norm_job(x) for x in (data.get("items") or [])]
 
     # 本队列空 → 依次尝试其他队列（池化取活）
     if not items:
@@ -2151,7 +2261,7 @@ def main():
                 continue
             if _it:
                 emit({"ok": True, "pooled_from": _alt, "lane": a.lane})
-                data, items = _d, _it
+                data, items = _d, [GS.norm_job(x) for x in _it]
                 # 不改进程内的 a.lane：后面 claim 写入、日志标签都依赖原 lane，
                 # 改它会让 claim 归属错乱。只借用它的数据。
                 _pooled_from = _alt
@@ -2167,7 +2277,7 @@ def main():
             return 0
         if os.path.exists(qpath):
             data = json.load(open(qpath, encoding="utf-8"))
-            items = data.get("items") or []
+            items = [GS.norm_job(x) for x in (data.get("items") or [])]
     if _qkind == "fill":
         items = A.dedupe_items(items)
     # 池化借来的活不做分片：分片是按"这条 lane 该看队列的哪一份"设计的，
@@ -2257,7 +2367,14 @@ def main():
     # 2026-11-13 软租约：leased 不再作为「排除集合」传给源解析，否则
     # 一个源被占用就会让所有节点都拿不到（实测 3 个能产出的源被 3 个 claim
     # 由 eligible_sources(load=...) 处理。exclude 只保留真正的硬排除（空集合）。
-    leased = GS.leased_sources(active)
+    # 2026-11-22：**外部 worker 不该被本机的源租约挡住。**
+    # 「单源并发 1」是为了不让同一出口/同一账号打同一个源；
+    # GHA 在 GitHub 的网络里，出口 IP 完全不同，源站看到的是另一个客户端，
+    # 所以本机占着某个源不代表 GHA 不能用它。
+    # 实测：3 个本机 worker 占满快源后，GHA 永远 source_budget: queue_sources_throttled。
+    _is_ext_now = (os.environ.get("EMBYTG_EXTERNAL") == "1"
+                   or bool(re.search(r"slot([5-9])", str(getattr(a, "run_id", "") or ""))))
+    leased = set() if _is_ext_now else GS.leased_sources(active)
     leased_load = GS.leased_source_load(active)
     probe = SG.Guard(verbose=False)
     available_labels = sorted(probe.states)
