@@ -599,7 +599,14 @@ def invalid_candidate(episode, size, min_bytes, max_bytes):
     name = str(episode.get("Name") or "").strip()
     if not size or int(size) < min_bytes:
         return "size=%s" % size
-    if PLACEHOLDER.match(name):
+    # 2026-11-23：**占位集名不再否决候选。**
+    # 实测「地面师」「【我推的孩子】」「太太太厉害」等 56 部剧，源站每集都叫「第 N 集」，
+    # 于是每集都在这里被判 placeholder → 整部剧 no_candidate → 每轮重扫 90 次、永不入库，
+    # 而它们的文件其实是 2GB 的 1080p（画质完全合格）。
+    # 占位名是**正常态**：docs/ERRORS.md 里 `placeholder` 就定义为「NFO 是第 7 集、TMDB 有真名」，
+    # 下游 nfo_episodes_tmdb 会补真名，且我们的目标文件名本来就不取源站显示名。
+    # 需要恢复旧行为时置 ALLOW_PLACEHOLDER_CANDIDATE=0。
+    if PLACEHOLDER.match(name) and os.environ.get("ALLOW_PLACEHOLDER_CANDIDATE", "1") != "1":
         return "placeholder=%s" % name
     if int(size) > max_bytes:
         return "too_big=%.2fGB" % (int(size) / 1e9)
