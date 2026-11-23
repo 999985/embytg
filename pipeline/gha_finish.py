@@ -204,6 +204,40 @@ def journal_path(run_id):
     return os.path.join(JOURNAL_DIR, safe + ".json")
 
 
+LANDING_LOG_DIR = os.path.join(HERE, ".landings")
+
+
+def log_landing(job):
+    """入库归因：谁（worker）在什么时间落了哪一集（2026-11-23）。
+
+    此前**没有按机器归因**：resource_state 只有 path/tmdb/landed_at，
+    想回答「今天本机多少、PC 多少」只能靠日志反推，PC 的非 upgrade 完成
+    更是完全没记录。这里把每次成功入库追加一行 JSONL，按天分文件，
+    以后一条命令就能出准确数字。
+    """
+    try:
+        os.makedirs(LANDING_LOG_DIR, mode=0o700, exist_ok=True)
+        day = time.strftime("%Y-%m-%d")
+        rec = {
+            "ts": int(time.time()),
+            "worker": job.get("worker") or GS.worker_id(job.get("run_id")),
+            "run_id": job.get("run_id"),
+            "lane": job.get("lane"),
+            "kind": job.get("kind"),
+            "series": job.get("series"),
+            "season": job.get("season"),
+            "ep": job.get("ep"),
+            "quality": job.get("quality"),
+            "size": job.get("size"),
+            "rel": job.get("target_rel") or job.get("rel"),
+        }
+        with open(os.path.join(LANDING_LOG_DIR, "%s.jsonl" % day), "a",
+                  encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:                                       # noqa: BLE001
+        pass
+
+
 def write_journal(job, stage, extra=None):
     old_rel = str(job.get("old_rel") or "")
     data = {
@@ -846,6 +880,7 @@ def main():
             if job.get("upgrade"):
                 write_journal(job, "complete", {
                     "new_file_id": fid, "dup_rel": dup_rel})
+            log_landing(job)          # 归因：哪个 worker 落了哪一集
             GS.record_source_success(job.get("source_label"))
             queue_state = None
             try:
