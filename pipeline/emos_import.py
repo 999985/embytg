@@ -28,6 +28,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -46,7 +47,8 @@ class Emos:
         self.tok = None
         self.uid = None
 
-    def _req(self, path, q=None, data=None, method="GET", timeout=60, stream=False):
+    def _req(self, path, q=None, data=None, method="GET", timeout=60, stream=False,
+             _relogin=True):
         url = BASE + path + ("?" + urllib.parse.urlencode(q) if q else "")
         if self.tok:
             url += ("&" if q or "?" in path else "?") + "api_key=" + self.tok
@@ -58,10 +60,19 @@ class Emos:
             hd["Content-Type"] = "application/json"
             body = json.dumps(data).encode()
         req = urllib.request.Request(url, data=body, headers=hd, method=method)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            if stream:
-                return r
-            return json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if stream:
+                    return r
+                return json.loads(r.read())
+        except urllib.error.HTTPError as ex:
+            # 令牌会过期：夜间窗口一个进程能跑 6h，PlaybackInfo 往往在排队等 slot
+            # 1-2h 之后才发出。旧代码只在进程启动时 login 一次，令牌过期后整集
+            # 直接 401 报废（2026-11-22 E20）。401 时重登一次再重试，过期时长无关。
+            if ex.code == 401 and _relogin:
+                self.login()
+                return self._req(path, q, data, method, timeout, stream, _relogin=False)
+            raise
 
     def login(self):
         req = urllib.request.Request(

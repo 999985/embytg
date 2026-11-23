@@ -12,7 +12,8 @@
 1. **补 NFO**：`todb_resolve.py --apply --series <剧>`（TODB 结构匹配，只补缺失）
    → 仍缺则 `nfo_episodes_tmdb.py --apply --series <剧>`（TMDB 兜底）
 2. **写 Emby Name**：`nfo_name_to_emby.py --apply --lib <库>`（E007 直写，不靠扫描）
-3. **通知 + 单剧 Refresh**：`/Library/ScanPath`（E036，TargetedScan 插件，能建新条目）
+3. **通知 + 集条目 Refresh**：`/Library/ScanPath`（E036，TargetedScan 插件，能建新条目）
+   → 再对**集条目本身**发 Refresh（E115 第五根因：Series 级 Refresh 会枚举季目录造重复条目）
    → 失败时退回 `/Library/Media/Updated`（只能刷新已有）
 4. **验收**：抽样检查 `.nfo` 存在、标题非占位、Emby Name == NFO title；输出 PASS/FAIL
 
@@ -383,25 +384,87 @@ def scan_running():
                and t.get("State") == "Running" for t in tasks)
 
 
-def refresh_series(series_list):
-    """只对本批涉及的剧发 Refresh；返回成功数与错误，不再静默吞异常。"""
+def series_dir_of(path):
+    """从媒体文件路径推出剧目录：`.../TV/<库>/<剧目录>/Season NN/file.mkv`。"""
+    p = os.path.normpath(path or "")
+    parts = p.split(os.sep)
+    for i, c in enumerate(parts):
+        if re.fullmatch(r"Season\s*\d+", c or "", re.I):
+            return os.sep.join(parts[:i])
+    return ""
+
+
+def refresh_episodes(paths, timeout=120):
+    """只对**集条目本身**发 Refresh；永不发 Series / Season 级 Refresh。
+
+    E115 第五根因（2026-11-23 02:12、04:15 实测 171873/171874、171900/171901）：
+    `Items/{SeriesId}/Refresh?Recursive=false` 在 Emby 4.10 里仍会刷新子季 →
+    枚举季目录 → 把「文件已落地、条目还没入库」的新集当新增插入。事故现场：
+    02:12:19.424 NFO 任务发 Series Refresh，50ms 后 ingest lane 的 TargetedScan
+    建同一条，两条同 guid、同 Path、DateCreated 同秒（DB 里有两条 171873/171874）。
+    叶子条目没有子项可枚举，机制上不可能再长出兄弟条目。
+
+    按完整 Path 匹配条目；查不到时用文件名里的 SxxEyy 匹配同季集（改名场景：
+    Emby 条目还指着旧文件名，Path 变了但季集号不变）。返回 (hit, errors)。
+    """
+    want = [os.path.normpath(p) for p in (paths or []) if p]
+    if not want:
+        return 0, []
+    by_series = {}
+    for p in want:
+        d = series_dir_of(p)
+        if d:
+            by_series.setdefault(d, []).append(p)
+    if not by_series:
+        return 0, ["no-series-dir"]
     q = urllib.parse.urlencode({"Recursive": "true", "IncludeItemTypes": "Series",
-                                "Fields": "Path", "Limit": "5000"})
-    all_series = emby("/Items?" + q).get("Items", [])
+                               "Fields": "Path", "Limit": "5000"})
+    sid = {}
+    for s in (emby("/Items?" + q) or {}).get("Items", []):
+        sp = os.path.normpath(s.get("Path") or "")
+        if sp in by_series:
+            sid[sp] = s["Id"]
     hit, errors = 0, []
-    for s in all_series:
-        p = s.get("Path") or ""
-        if any(("/" + sdir) in p for _, sdir in series_list):
+    for d, ps in by_series.items():
+        if d not in sid:
+            errors.append("%s:no-series" % os.path.basename(d)[:30])
+            continue
+        q2 = urllib.parse.urlencode({
+            "Recursive": "true", "IncludeItemTypes": "Episode", "ParentId": sid[d],
+            "Fields": "Path,IndexNumber,ParentIndexNumber", "Limit": "20000"})
+        eps = (emby("/Items?" + q2) or {}).get("Items", [])
+        by_path = {os.path.normpath(e.get("Path") or ""): e for e in eps}
+        by_num = {}
+        for e in eps:
             try:
-                emby("/Items/%s/Refresh?Recursive=true&MetadataRefreshMode=Default" % s["Id"], "POST")
+                by_num[(int(e.get("ParentIndexNumber")), int(e.get("IndexNumber")))] = e
+            except (TypeError, ValueError):
+                continue
+        done = set()
+        for p in ps:
+            item = by_path.get(p)
+            if item is None:
+                m = EP_RE.search(os.path.basename(p))
+                if m:
+                    item = by_num.get((int(m.group(1)), int(m.group(2))))
+            if item is None:
+                errors.append("%s:not-in-emby" % os.path.basename(p)[:36])
+                continue
+            eid = str(item.get("Id"))
+            if eid in done:
+                continue
+            done.add(eid)
+            try:
+                emby("/Items/%s/Refresh?Recursive=false&MetadataRefreshMode=Default" % eid,
+                     "POST", timeout=min(timeout, 60))
                 hit += 1
             except Exception as e:                             # noqa: BLE001
-                errors.append("%s:%s" % (s.get("Name"), str(e)[:60]))
+                errors.append("%s:%s" % (os.path.basename(p)[:28], str(e)[:50]))
     return hit, errors
 
 
 def refresh_library_roots(libs):
-    """新剧还没有 Series Id，单剧 Refresh 找不到；必须刷库根才能发现。
+    """新剧还没有 Series Id，集级 Refresh 找不到；插件不可用时才刷库根兜底。
     复用 rescan_libs.py 的 MediaFolders 真源与 Refresh 逻辑，避免再造轮子。"""
     try:
         import rescan_libs
@@ -777,9 +840,12 @@ def main():
         # 实测：缺失的「初代奥特曼 S01E05」→ Status=Created，ItemId=166580，25 秒后
         # Name 已是 NFO 里的「食虫草的秘密」，集号 5 正确 —— 全程 <1 秒，无整库 ffprobe。
         updates = media_file_updates(series, a.verify_file)
+        created = 0
+        res = {}
         try:
             import emby_scan
             res = emby_scan.scan_paths([u["Path"] for u in updates])
+            created = int(res.get("Created") or 0)
             print("  ② Emby 通知(%s) %d 文件：Created=%d Refreshed=%d Failed=%d"
                   % (res["mode"], len(updates), res.get("Created", 0),
                      res.get("Refreshed", 0), res.get("Failed", 0)))
@@ -788,15 +854,19 @@ def main():
         except Exception as e:                                     # noqa: BLE001
             print("  ② Emby 通知失败:", str(e)[:60])
         ready, pending = wait_series_ready(series, a.wait_emby, a.verify_file)
-        hit, refresh_err = 0, []
         root_hit, root_err = 0, []
-        if not ready:
-            hit, refresh_err = refresh_series(series)
-            if hit < len(series) and not scan_running():
-                root_hit, root_err = refresh_library_roots(sorted({s[0] for s in series}))
+        plugin_ok = (res or {}).get("mode") == "scanpath"
+        if not ready and not scan_running() and not plugin_ok:
+            # 只有插件不可用（mode != scanpath）才允许目录级刷新作为建条目退路；
+            # 插件可用时 TargetedScan 是唯一建条目入口（E115 第三~五根因）。
+            root_hit, root_err = refresh_library_roots(sorted({s[0] for s in series}))
             ready, pending = wait_series_ready(series, max(300, a.wait_emby), a.verify_file)
+        # E115 第五根因（2026-11-23）：Series 级 Refresh 即使 Recursive=false 也会刷新
+        # 子季并枚举季目录，把「文件已落地、条目未入库」的新集插成第二条。本批只刷
+        # **集条目本身**（叶子），机制上不可能再造出兄弟条目。
+        hit, refresh_err = refresh_episodes([u["Path"] for u in updates])
         rf2, re2 = repair_series_metadata(series)
-        print("  ② 单剧 Refresh %d 部；库根 Refresh %d 个；本批枚举 %s%s；身份修 %d%s" % (
+        print("  ② 集条目 Refresh %d 条；库根 Refresh %d 个；本批枚举 %s%s；身份修 %d%s" % (
             hit, root_hit, "完成" if ready else "未完全完成",
             "" if not pending else "（缺：%s）" % ", ".join(x[:16] for x in pending[:4]),
             rf2, "" if not (refresh_err or root_err or re2) else "；错误 %s" % ", ".join((refresh_err + root_err + re2)[:3])))

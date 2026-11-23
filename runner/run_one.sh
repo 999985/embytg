@@ -383,7 +383,11 @@ for L in $LANES_ORDER; do
       break
     fi
   fi
-  if ! ssh_o "cd /opt/embytg/pipeline && python3 gha_next3.py --lane '$L' --run-id '$RUN_KEY' --max-attempts $MAX_ATTEMPTS --max-active $MAX_ACTIVE --lock-wait 900 $SOURCE_ARG" >"$JOB" 2>"$WORK/next.err"; then
+  # 2026-11-23：**必须带 worker 身份。** 原来这里不传 EMBYTG_WORKER，
+  # gha_next3 落到默认值 "local" —— job_claim 里所有本机记录都是同一个
+  # worker，worker_stat 的成功率/连续失败就分不清是哪条 lane，
+  # 不健康剔除也就无从谈起（PC 之所以能看到 slot5，是因为它另外传了）。
+  if ! ssh_o "cd /opt/embytg/pipeline && EMBYTG_WORKER=slot$SLOT EMBYTG_RUN_SLOT=$SLOT python3 gha_next3.py --lane '$L' --run-id '$RUN_KEY' --max-attempts $MAX_ATTEMPTS --max-active $MAX_ACTIVE --lock-wait 900 $SOURCE_ARG" >"$JOB" 2>"$WORK/next.err"; then
     log "CLAIM_TRANSPORT_FAILED lane=$L"
     sleep 2
     if ! ssh_o "pgrep -af 'gha_next3.py.*$RUN_KEY' >/dev/null 2>&1"; then

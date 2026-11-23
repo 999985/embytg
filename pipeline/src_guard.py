@@ -59,10 +59,16 @@ TOKEN_STALE = {}
 # /Users/Me/Items 正常）。按 label 覆写搜索/取数前缀，未列出的源走默认路径。
 ITEMS_PREFIX = {
     "video.emos.best": "/Users/Me",
+    "emos.enic65.eu.org": "/Users/Me",
 }
 MIN_INTERVAL = 1.6          # 元数据 GET 的最小间隔
 SEARCH_INTERVAL = 2.5       # 搜索类接口更贵，间隔更大
-MAX_PER_HOST = 12           # 单会话单源上限
+# 2026-11-22 用户口径：**源站不设量子上限，只要求不频繁请求。**
+# 原来的 12 次/会话把「枚举源站目录」直接掐死：lite 有 28716 部剧，
+# 每页 200 → 需要 144 次请求，12 次只能拿到 8%。
+# 现在默认 400（可由 EMBYTG_SRC_MAX_PER_HOST 覆盖），
+# 真正的节流靠下面的 MIN_INTERVAL / SEARCH_INTERVAL（1.6s / 2.5s）。
+MAX_PER_HOST = int(os.environ.get("EMBYTG_SRC_MAX_PER_HOST") or 400)
 COOLDOWN_FAIL = 600         # 熔断 10 分钟
 COOLDOWN_RATE = 1800        # 429（限流/封禁前兆）熔断 30 分钟
 MAX_CONSEC_FAIL = 2
@@ -74,6 +80,21 @@ MAX_CONSEC_FAIL = 2
 HEALTH_FILE = os.getenv("EMBYTG_SRC_HEALTH_FILE") or os.path.join(HERE, "cache", "src_health.json")
 HEALTH_TTL = int(os.getenv("EMBYTG_SRC_HEALTH_TTL", str(12 * 3600)))   # 记录 12h 后自然遗忘
 FAIL_WINDOW = int(os.getenv("EMBYTG_SRC_FAIL_WINDOW", "600"))          # 10min 内才算「连续」
+# 2026-11-22：**200 + 非 JSON 不是成功。**
+# `39.96.113.82-mirror` 的第一个 url 是 `emby.taotu.ink`，它对 `/Items?SearchTerm=` 与
+# `/System/Info/Public` 都返回 **200 + Emby 登录页 HTML**（不是这台源，是另一个站）。
+# 旧 `get()` 把「200 且 body 不以 { [ 开头」原样 return 字符串，于是：
+#   ① 调用方 `d.get("Items")` AttributeError（search_series 当场崩）；
+#   ② 崩溃前已经执行了 `st.ok += 1; st.cool_until = 0; _health_ok()` ——
+#      **用一个假成功把真镜像的 401 冷却清掉了**，这个源永远出不了轮转；
+#   ③ 异常被 `resolve_candidates` 吞成「这个源没有这部剧」→ 按集 6h 冷却
+#      （今日 151 次请求全是 HTML、77 次是同题重复搜索）。
+# 现在：坏应答 = 该 host 记坏（跨进程 6h）+ 立刻换下一个镜像；全部坏才抛错。
+HOST_BAD_FILE = os.getenv("EMBYTG_SRC_HOSTBAD_FILE") or os.path.join(HERE, "cache", "src_hosts_bad.json")
+HOST_BAD_TTL = int(os.getenv("EMBYTG_SRC_HOSTBAD_TTL", str(6 * 3600)))
+# 401 = 我们存的 token 被拒，重试一万次也不会成功（只有人能换 token）。
+# 按「待换 token」长冷却，别再每 10 分钟重撞一次。
+TOKEN_STALE_TTL = int(os.getenv("EMBYTG_SRC_TOKEN_STALE_TTL", str(12 * 3600)))
 
 UA = "Hills Windows/1.5.1 (windows; 19041.vb_release.191206-1406)"   # 用户 2026-11-10：UA 固定一个即可
 
@@ -290,6 +311,15 @@ def _health_fail(label, status):
             rec["fails"] = 0          # 隔了 10min 以上不算「连续」
         rec["fails"] = int(rec.get("fails") or 0) + 1
         rec["last_status"] = int(status or 0)
+        if int(status or 0) == 401:
+            # 2026-11-22：401 = 本地 token 被源站拒绝。换进程、等 10 分钟、
+            # 换镜像都不会让它变好 —— 只有人能重新登录换 token。
+            # 实测 mirror 8 天 1012 次请求里 401 之外还有一堆「首个镜像返回
+            # 登录页」，每次假成功都把冷却清掉 → 这个源永远出不了轮转。
+            rec["token_stale_until"] = now + TOKEN_STALE_TTL
+            rec["cool_until"] = max(float(rec.get("cool_until") or 0),
+                                    rec["token_stale_until"])
+            return rec
         if rec["fails"] >= MAX_CONSEC_FAIL:
             cool = COOLDOWN_RATE if int(status or 0) == 429 else COOLDOWN_FAIL
             rec["cool_until"] = now + cool
@@ -302,10 +332,53 @@ def _health_ok(label, status=200):
     def _mut(rec, now):
         rec["fails"] = 0
         rec["cool_until"] = 0
+        rec["token_stale_until"] = 0
         rec["last_status"] = int(status)
         rec["ok_streak"] = int(rec.get("ok_streak") or 0) + 1
         return rec
     return _health_rmw(label, _mut)
+
+
+def _host_bad_load():
+    """跨进程的「这个镜像 url 是坏的」表：``{label\\x1fhost: {ts, why}}``。
+
+    与源级健康表分开：一个 label 有 4 个镜像 url 时，坏的是 **url**，
+    不是整个源。冷却整个 label 会把 3 个能用的镜像一起关掉。
+    """
+    try:
+        with open(HOST_BAD_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        if not isinstance(d, dict):
+            return {}
+        now = time.time()
+        return {k: v for k, v in d.items()
+                if isinstance(v, dict) and now - float(v.get("ts") or 0) <= HOST_BAD_TTL}
+    except Exception:                                          # noqa: BLE001
+        return {}
+
+
+def _host_bad_mark(label, host, why="non_json"):
+    """记一个坏镜像（跨进程 6h）；返回写后的表。flock + 原子替换。"""
+    key = "%s\x1f%s" % (label, str(host).rstrip("/"))
+    now = time.time()
+    d = _host_bad_load()
+    d[key] = {"ts": now, "why": str(why)[:40]}
+    try:
+        os.makedirs(os.path.dirname(HOST_BAD_FILE) or ".", exist_ok=True)
+        tmp = "%s.tmp.%d" % (HOST_BAD_FILE, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(d, fh, ensure_ascii=False)
+        try:
+            import fcntl
+            with open(HOST_BAD_FILE + ".lock", "a+") as lk:
+                fcntl.flock(lk, fcntl.LOCK_EX)
+                os.replace(tmp, HOST_BAD_FILE)
+                fcntl.flock(lk, fcntl.LOCK_UN)
+        except Exception:                                      # noqa: BLE001
+            os.replace(tmp, HOST_BAD_FILE)
+    except Exception:                                          # noqa: BLE001
+        pass
+    return d
 
 
 def load_url_map():
@@ -364,6 +437,16 @@ def load_sources():
         out[label] = {"label": label, "host": host, "hostname": hostname,
                       "hosts": hosts or [host], "token": tok}
     return out
+
+
+class SourceBadAnswer(RuntimeError):
+    """源站回了 200，但 body 不是 JSON（登录页 / WAF / 反代首页 / HTML 错误页）。
+
+    这**不是**「源站没有这部剧」，也**不是**「这条路径不存在」。把它当成两者之一
+    都会造成静默损失：前者会给整部剧落 6h 冷却，后者会永久记住一条假的能力。
+    """
+
+    bad_answer = True
 
 
 class SourceCoolingDown(RuntimeError):
@@ -433,8 +516,25 @@ class Guard:
         self.total = 0
         self._seed_latency()
         self._seed_health()
+        self._drop_bad_hosts()
         self._rr = 0
         os.makedirs(os.path.dirname(LOG), exist_ok=True)
+
+    def _drop_bad_hosts(self):
+        """把别的进程记下的「这个镜像 url 是登录页/HTML」从轮转里摘掉。"""
+        bad = _host_bad_load()
+        if not bad:
+            return
+        for st in self.states.values():
+            good = [h for h in st.hosts
+                    if ("%s\x1f%s" % (st.label, str(h).rstrip("/"))) not in bad]
+            if good and len(good) < len(st.hosts):
+                if self.verbose:
+                    print("    ! %s 跳过坏镜像 %s" % (st.label,
+                          ",".join(urllib.parse.urlparse(h).hostname or h
+                                   for h in st.hosts if h not in good)))
+                st.hosts = good
+                st.select_host(good[0])
 
     def _seed_latency(self):
         """从审计日志取近 2000 条的每源平均耗时，作为调度权重（避免每次都先撞慢源）"""
@@ -470,6 +570,8 @@ class Guard:
             if now - float(rec.get("ts") or 0) > HEALTH_TTL:
                 continue
             cu = float(rec.get("cool_until") or 0)
+            ts_until = float(rec.get("token_stale_until") or 0)
+            cu = max(cu, ts_until)
             if cu > now:
                 st.cool_until = cu
                 st.fails = max(st.fails, int(rec.get("fails") or MAX_CONSEC_FAIL))
@@ -539,11 +641,32 @@ class Guard:
                         status = r.status
                 st.last = time.time()
                 st.answered += 1
+                body = raw.lstrip()
+                if body and not body.startswith(("{", "[")):
+                    # 2026-11-22（根因）：**200 + 非 JSON 不是成功，是这个 url 走错了。**
+                    # 实测 mirror 的首个 url（emby.taotu.ink）对任何路径都回 200+登录页
+                    # HTML；旧代码在这里 `st.ok += 1; _health_ok()` 并 return 字符串，
+                    # 于是真镜像的 401 冷却被假成功清掉、search_series 当场 AttributeError、
+                    # 上层再把异常当成「源站没这部剧」→ 按集 6h 冷却（今日 151 次全白烧）。
+                    hostname = urllib.parse.urlparse(st.host).hostname or st.host
+                    st.fails += 1
+                    last_error = SourceBadAnswer(
+                        "源 %s 镜像 %s 回 200 但非 JSON（%s）"
+                        % (st.label, hostname, body[:40].replace("\n", " ")))
+                    _host_bad_mark(st.label, st.host, "non_json")
+                    if len(st.hosts) > 1 and st.host in st.hosts:
+                        st.hosts = [h for h in st.hosts if h != st.host]
+                        st.select_host(st.hosts[0])
+                    if self.verbose:
+                        print("    ! %s 镜像 %s 回 HTML/非 JSON，换下一个（已记坏 6h）"
+                              % (st.label, hostname))
+                    status = -200          # 审计里与真 200 区分：HTTP 成功但内容不是 API
+                    continue
                 st.ok += 1
                 st.fails = 0
                 st.cool_until = 0.0
                 st.avg_ms = (st.avg_ms * 0.7 + (time.time() - t0) * 1000 * 0.3) if st.avg_ms else (time.time() - t0) * 1000
-                data = json.loads(raw) if raw.strip().startswith(("{", "[")) else raw
+                data = json.loads(raw) if body else {}
                 _health_ok(st.label, status)
                 return data
             except urllib.error.HTTPError as e:
@@ -573,6 +696,9 @@ class Guard:
             finally:
                 self._audit(st, path, status, time.time() - t0)
         if last_error:
+            if isinstance(last_error, SourceBadAnswer):
+                # 全部镜像都回 HTML → 这个源今天不能用于取数，按 5xx 级冷却。
+                self._mark_fail(st, 502)
             raise last_error
         raise RuntimeError("源 %s 没有可用镜像" % st.label)
 
@@ -612,6 +738,13 @@ class Guard:
             except Exception as e:                                  # noqa: BLE001
                 if self.verbose:
                     print("    × %-22s %s" % (st.label, str(e)[:40]))
+                continue
+            # 2026-11-21：源站有时返回字符串（错误页/HTML/纯文本），原来直接
+            # d.get() 会 AttributeError 崩掉整个搜索 —— 一个坏源把整轮探测带崩。
+            # 这里按「坏应答」处理并继续，不许让一个源拖垮全部探测。
+            if not isinstance(d, dict):
+                if self.verbose:
+                    print("    × %-22s 非 JSON 应答: %s" % (st.label, str(d)[:40]))
                 continue
             for it in (d.get("Items") or [])[:per_host]:
                 hits.append({"label": st.label, "id": it.get("Id"), "name": it.get("Name"),

@@ -319,17 +319,23 @@ def wait_sidecars_in_td(job, timeout=180):
     return missing
 
 
-def refresh_series(job):
-    series = [(job["lib"], job["dir"])]
+def refresh_episode(job):
+    """扫描本集文件 + 只刷**这条集条目**（leaf）。绝不刷 Series/Season 目录。
+
+    E115 第五根因（2026-11-23 02:12 / 04:15，DB 实证 171873/171874、171900/171901）：
+    `Items/{SeriesId}/Refresh?Recursive=false` 在 Emby 4.10 里仍会刷新子季并枚举
+    季目录，把「文件已落地、条目还没入库」的新集当新增插入。事故现场 02:12:19.424
+    一条 Series Refresh，50ms 后本函数发 TargetedScan，两条同 guid 同 Path 同秒落库。
+    叶子条目没有子项可枚举，机制上不可能再长出兄弟条目。
+    """
     # E008/E028/E036：必须喂精确媒体文件，不能喂 Series 目录（整库 ffprobe）。
     # 2026-11-14 回归修复：这里曾退回裸 Media/Updated，而它**只能刷新已有条目**；
     # 新剧/新集（Series 尚不存在）会 204 假成功 → Emby Items 里查不到 →
     # gha_finish 判「未就位」把 claim 标 failed，runner 反复重试直到被 claim_reap 回收。
-    # 证据：少年包青天 S01E02（2026-11-14 02:39 完成）、钻石王牌 S01E01（02:39）
-    # 完成数小时后 teldrive 与 pgsql files 里都没有该路径，tg.db 也没有 state_key。
     # 正路是 TargetedScan 的 /Library/ScanPath：向上找最近已知祖先，<1 秒建出
     # Series/Season/Episode；插件不在时 emby_scan 自动降级回 Media/Updated（不会整库扫）。
     scan_path = "/mnt/embytg/" + job["target_rel"].lstrip("/")
+    res = {}
     try:
         import emby_scan
         res = emby_scan.scan_paths([scan_path])
@@ -344,9 +350,9 @@ def refresh_series(job):
             print("  ScanPath 失败：%s" % str(res)[:120], file=sys.stderr)
     except Exception as e:                                 # noqa: BLE001
         print("  Emby ScanPath 异常：%s" % str(e)[:120], file=sys.stderr)
-    hit, errors = P.refresh_series(series)
+    hit, errors = P.refresh_episodes([scan_path])
     for x in errors[:3]:
-        print("  Series Refresh 失败：%s" % x, file=sys.stderr)
+        print("  Episode Refresh 失败：%s" % x, file=sys.stderr)
     return hit
 
 
@@ -495,7 +501,7 @@ def verify_actual_emby(job, width, height, timeout=180):
             if got_w == int(width) and got_h == int(height):
                 return episode
         if not refreshed and time.time() > deadline - max(30, timeout - 30):
-            refresh_series(job)
+            refresh_episode(job)
             refreshed = True
         time.sleep(10)
     raise RuntimeError("Emby 实测分辨率未收敛：want=%sx%s got=%s" % (
@@ -503,8 +509,16 @@ def verify_actual_emby(job, width, height, timeout=180):
 
 
 def verify_upgrade_emby(job, timeout=300):
-    new_abs = target_abs(job["target_rel"])
-    old_abs = target_abs(job["old_rel"])
+    """洗版收尾判据：新文件在、旧文件不在、该集只指向新文件、画质达标。
+
+    2026-11-22（E178）：判据从「匹配条目数 == 1」改成「匹配**不同 Path 集合** == {新文件}」。
+    事故：我是歌手 S01E03 / V世代 S01E08 洗版后 new=True old=False rank=4/4，
+    但同 Path 重复条目让 len(matching)==2 → 连刷 300s 也永远不收敛（refresh 不合并重复，
+    E125 已留证）→ claim 标 failed、堵住 upgrade lane。
+    同 Path 重复是 E125 类库索引瑕疵（由 clean_dup_items.py 专门清），不是洗版失败。
+    """
+    new_abs = os.path.normpath(target_abs(job["target_rel"]))
+    old_abs = os.path.normpath(target_abs(job["old_rel"]))
     same_name = os.path.abspath(new_abs) == os.path.abspath(old_abs)
     season, ep = int(job["season"]), int(job["ep"])
     want_rank = Q_RANK.get(str(job.get("quality") or "sd").lower(), 0)
@@ -512,19 +526,24 @@ def verify_upgrade_emby(job, timeout=300):
     last = None
     while time.time() < deadline:
         sid, rows = emby_episode_paths(job)
-        matching = [p for p, e in rows
-                    if int(e.get("ParentIndexNumber") or -1) == season
-                    and int(e.get("IndexNumber") or -1) == ep]
-        saw_new = new_abs in matching
-        saw_old = (not same_name) and old_abs in matching
-        new_ep = next((e for p, e in rows if p == new_abs), {})
+        items = [(os.path.normpath(p), e) for p, e in rows
+                 if int(e.get("ParentIndexNumber") or -1) == season
+                 and int(e.get("IndexNumber") or -1) == ep]
+        paths = {p for p, _ in items}
+        saw_new = new_abs in paths
+        saw_old = (not same_name) and old_abs in paths
+        new_ep = next((e for p, e in items if p == new_abs), {})
         got_rank = episode_rank(new_ep)
-        if (saw_new and not saw_old and len(matching) == 1
+        if (saw_new and not saw_old and paths == {new_abs}
                 and got_rank >= want_rank):
+            if len(items) > len(paths):
+                print("  ⚠ %s：%d 条同 Path 重复条目（E125 口径，不计洗版失败）"
+                      % (job.get("name"), len(items) - len(paths)),
+                      file=sys.stderr)
             return sid
-        last = "sid=%s new=%s old=%s matching=%d rank=%s/%s" % (
-            sid, saw_new, saw_old, len(matching), got_rank, want_rank)
-        refresh_series(job)
+        last = "sid=%s new=%s old=%s paths=%d items=%d rank=%s/%s" % (
+            sid, saw_new, saw_old, len(paths), len(items), got_rank, want_rank)
+        refresh_episode(job)
         time.sleep(15)
     raise RuntimeError("洗版后 Emby 定向刷新未收敛：%s" % (last or "无数据"))
 
@@ -669,7 +688,7 @@ def main():
                         raise RuntimeError("旧文件 .dup 未进入 teldrive")
                     dup_rel = old_rel + ".dup"
                 wait_mount_file(target, 120)
-                refresh_series(job)
+                refresh_episode(job)
                 r2 = run([sys.executable, os.path.join(HERE, "post_ingest.py"),
                           "--tmdb", str(job["tmdb"]), "--wait-emby", "20",
                           "--sample", "5", "--verify-file", job["name"],

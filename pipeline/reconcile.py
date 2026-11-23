@@ -173,8 +173,15 @@ def ledger_tgdb():
 
 
 def ledger_emby():
-    """⑤ Emby：Series（按 tmdb）+ Episode（按 Path）。"""
-    series, eps = {}, {}
+    """⑤ Emby：Series（按 tmdb）+ Episode（按 Path）。
+
+    返回 (series, eps, eps_all)：
+      eps     —— 按 key 去重（五账计数用，同 Path 多条只算 1）
+      eps_all —— 每条 Emby 行都留一件（dup_path / dup_file 护栏用）
+    2026-11-22：原先只返回去重后的 eps，导致下面按 Path 归组的判据永远只看到 1 条，
+    dup_path 形同死代码（11 组同 Path 重复时对账仍报「差异 0」）。
+    """
+    series, eps, eps_all = {}, {}, []
     d = emby("/Items?Recursive=true&IncludeItemTypes=Series&Limit=100000"
              "&Fields=ProviderIds,Path,Name") or {}
     for i in d.get("Items") or []:
@@ -190,13 +197,16 @@ def ledger_emby():
         if not its:
             break
         for i in its:
-            k = key_of((i.get("Path") or "").replace("/mnt/embytg/TV/", "TV/", 1))
+            raw = i.get("Path") or ""
+            k = key_of(raw.replace("/mnt/embytg/TV/", "TV/", 1))
             if k:
                 eps[k] = {"id": i["Id"], "series_id": i.get("SeriesId")}
+                eps_all.append({"Id": i["Id"], "Path": raw, "key": k,
+                                "Size": i.get("Size")})
         start += len(its)
         if start >= (d.get("TotalRecordCount") or 0):
             break
-    return series, eps
+    return series, eps, eps_all
 
 
 def series_tmdb_index(series):
@@ -211,7 +221,7 @@ def series_tmdb_index(series):
 def reconcile(lib_filter=None):
     td = ledger_teldrive()
     tg = ledger_tgdb()
-    series, eps = ledger_emby()
+    series, eps, eps_all = ledger_emby()
     by_tmdb = series_tmdb_index(series)
 
     gaps = []
@@ -229,22 +239,23 @@ def reconcile(lib_filter=None):
 
     # 0) 重复体检：同 Path 多条目 / 同集多文件（E115、E128 的护栏）
     #    只记 gaps，不影响五账计数；出现即说明扫描并发或重传又发生了。
+    #    必须用 eps_all（每条 Emby 行一件）：eps 按 key 去重，用它归组永远只有 1 条。
     _by_path = {}
-    for it in eps.values():
+    for it in eps_all:
         _by_path.setdefault(it.get("Path") or "", []).append(it)
     for _p, _its in _by_path.items():
         if _p and len(_its) > 1:
-            k0 = next(iter(_its))
+            k0 = _its[0].get("key") or ("", "", None, None, "")
             gaps.append({"kind": "dup_path",
-                         "lib": k0.get("lib", ""), "series": k0.get("series", ""),
-                         "season": k0.get("season"), "ep": k0.get("ep"),
-                         "quality": k0.get("quality", ""),
+                         "lib": k0[0], "series": k0[1],
+                         "season": k0[2], "ep": k0[3],
+                         "quality": k0[4],
                          "detail": "同 Path 有 %d 个条目：%s" %
                                    (len(_its), ",".join(str(x.get("Id")) for x in _its)),
                          "path": _p})
     _by_ep = {}
-    for k, it in eps.items():
-        _by_ep.setdefault(k, []).append(it)
+    for it in eps_all:
+        _by_ep.setdefault(it.get("key"), []).append(it)
     for k, _its in _by_ep.items():
         _sz = {it.get("Size") for it in _its}
         if (len({it.get("Path") for it in _its}) > 1
@@ -460,6 +471,9 @@ def repair(gaps, only=None, cooldown_h=12):
                 print("  · 库 %s 在冷却期内，跳过（避免反复整库 ffprobe）" % lib)
                 continue
             try:
+                # E115-fallback：只有 ScanPath 对该剧路径回 PathNotFound（插件不认识它，
+                # 库里连 Series 都没有）时才会走到这里 —— 此时不存在「同一条目被
+                # TargetedScan 并发创建」的可能，库级刷新是唯一建剧退路，且有 6h 冷却。
                 emby("/Items/%s/Refresh?Recursive=true&MetadataRefreshMode=Default" % iid,
                      "POST")
                 print("  ✓ 已对库 %s 发一次库级 Refresh（建新 Series 用）" % lib)
@@ -485,8 +499,15 @@ def repair(gaps, only=None, cooldown_h=12):
             done["episode_missing_emby"] += r.get("Created", 0) + r.get("Refreshed", 0)
             only = (only or []) + ["__skip_series_refresh__"]
 
-    if not only or ("episode_missing_emby" in only
-                    and "__skip_series_refresh__" not in only):
+    # E115（2026-11-22 夜，第四处漏口）：插件可用时**绝不**再用 Series 级 Recursive=true。
+    # 这条兜底原来写成 `if not only or (...)`：--repair 全量模式（systemd 每 15 分钟跑）
+    # 的 only 恒为 None，于是即便 ScanPath 这条路刚跑过（todo 为空 = 该路径在 6h 冷却里），
+    # 也会对 episode_missing_emby 的剧发 Refresh?Recursive=true —— 它重新枚举季目录插条目，
+    # 与并发的 TargetedScan 在同秒各建一条（实测 171822/171823 等 8 组同 Path 双条目，
+    # 创建时刻 guard 文件无记录，11 秒后才被 ScanPath 判 Refreshed）。
+    # 只有插件不可用时才允许它当建条目退路。
+    if not _scanpath_ok and (not only or ("episode_missing_emby" in only
+                                         and "__skip_series_refresh__" not in only)):
         sids = defaultdict(set)
         for g in gaps:
             if g["kind"] != "episode_missing_emby":

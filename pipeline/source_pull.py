@@ -356,6 +356,11 @@ def _is_cooling(e):
     return bool(getattr(e, "src_cooling", False)) or "熔断中" in str(e)
 
 
+def _is_bad_answer(e):
+    """源回 200 但 body 不是 JSON（走错镜像/登录页）——同样是源级事实，不是这条路径的。"""
+    return bool(getattr(e, "bad_answer", False)) or "非 JSON" in str(e)
+
+
 def _ep_get(g, st, path):
     """带缓存的 Episodes 请求。缓存异常一律退回直接请求（缓存不能成为故障源）。
 
@@ -409,6 +414,8 @@ def _ep_get(g, st, path):
     except Exception as e:                                          # noqa: BLE001
         if _is_cooling(e):
             raise                     # 源级熔断：不是这条路径的错，冷却结束自然恢复
+        if _is_bad_answer(e):
+            raise                     # 镜像回 HTML：来源级事实，不能写成「这条路径失败」
         if not any(s in str(e) for s in ("400", "404")):
             _ep_err_put(k, e)
             raise
@@ -429,6 +436,8 @@ def _ep_get(g, st, path):
             except Exception as e2:                                 # noqa: BLE001
                 if _is_cooling(e2):
                     raise
+                if _is_bad_answer(e2):
+                    raise
                 if not any(s in str(e2) for s in ("400", "404")):
                     _ep_err_put(k, e2)
                     raise
@@ -447,6 +456,8 @@ def _ep_get(g, st, path):
                 except Exception as e3:                             # noqa: BLE001
                     last = e3
                     if _is_cooling(e3):
+                        raise
+                    if _is_bad_answer(e3):
                         raise
                     if not any(s in str(e3) for s in ("400", "404")):
                         _ep_err_put(k, e3)
@@ -723,6 +734,12 @@ def search_series(g, st, series):
             {"SearchTerm": query, "Recursive": "true",
              "IncludeItemTypes": "Series", "Limit": 3,
              "Fields": "ProviderIds,ProductionYear"}), search=True)
+        if not isinstance(d, dict):
+            # 2026-11-22：兜底。get() 现在把「200 非 JSON」当 SourceBadAnswer 抛出，
+            # 正常走不到这里；但任何一个未来路径若再返回字符串，也绝不能让
+            # AttributeError 冒到上层被当成「源站没这部剧」（那会落 6h 集级冷却）。
+            raise SG.SourceBadAnswer("源 %s 搜索应答不是 JSON（%s）"
+                                     % (st.label, str(d)[:40].replace("\n", " ")))
         got = d.get("Items") or []
         if got:
             items = got
@@ -765,19 +782,25 @@ def resolve_all(g, series, season, ep, host_pref=None):
 
 
 def resolve_candidates(g, series, season, ep, exclude=None, max_hosts=0, year=0,
-                       order_labels=None):
+                       order_labels=None, stats=None):
     """Return candidate episodes with real quality, capped by source count.
 
     This is for the upgrade/new lanes, which must compare quality.  Fill uses
     resolve(), preserving the project's "first valid source" rule.
+
+    ``stats``（可选 dict）会被填上 ``sources`` / ``errors``：
+    上层用它区分「所有源都搜过、确实没有这一集」与「所有源这一轮都失败/坏应答」。
+    后者绝不能给整集落 6h 冷却 —— 那是把源站故障记成缺片。
     """
     order = _ordered_sources(g, exclude, max_hosts, order_labels, series=series)
     out = []
     _hosts_with_hit = 0          # E132：真正「贡献了候选」的源数
+    _errs = 0                    # 搜索/列集抛异常的源数（坏应答、超时、401…）
     for st in order:
         try:
             items = search_series(g, st, series)
         except Exception as e:                                     # noqa: BLE001
+            _errs += 1
             print("  × %-24s 搜索失败 %s" % (st.label, str(e)[:40]))
             continue
         if not items:
@@ -797,6 +820,7 @@ def resolve_candidates(g, series, season, ep, exclude=None, max_hosts=0, year=0,
             })
             eps = _ep_get(g, st, "/Shows/%s/Episodes?%s" % (sid, q)).get("Items", [])
         except Exception:                                          # noqa: BLE001
+            _errs += 1
             continue
         hit = [x for x in eps if x.get("IndexNumber") == ep]
         if not hit:
@@ -827,6 +851,12 @@ def resolve_candidates(g, series, season, ep, exclude=None, max_hosts=0, year=0,
         # upgrade lane 也只在现有是 1080p/720p 时才会来扫，4K 出现即是确定要换。
         if int(quality.get("rank") or 0) >= 4:
             break
+    if stats is not None:
+        try:
+            stats["sources"] = len(order)
+            stats["errors"] = _errs
+        except Exception:                                      # noqa: BLE001
+            pass
     return out
 
 

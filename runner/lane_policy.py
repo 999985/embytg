@@ -79,6 +79,57 @@ def _save(data):
     os.replace(tmp, STATE)
 
 
+def _pressure():
+    """每条 lane 有多「欠」活。缺文件就退回 1，保证永远有 lane 可选。
+
+    2026-11-21：用户指出「按固定顺序轮转」等于把 worker 钉死在 lane 上——
+    某条 lane 没活就空转，某条堆几千集也只有一个 worker 啃。
+    改成按欠活量排序：谁欠得多谁先干。
+    """
+    pipe = os.getenv("EMBYTG_PIPELINE", "/opt/embytg/pipeline")
+    p = {}
+    # fill 的真实来源：.nfo_gap.json（缺口台账）；.gap_report.json 是另一脚本产物，可能不存在
+    p["fill"] = 0
+    for cand, getter in (((".gap_report.json"), lambda g: g.get("missing_total") or g.get("missing")),
+                         ((".nfo_gap.json"), lambda g: len(g.get("episodes") or g.get("items") or g) if isinstance(g, (dict, list)) else 0)):
+        try:
+            g = json.load(open(os.path.join(pipe, cand), encoding="utf-8"))
+            n = getter(g) if isinstance(g, dict) else len(g)
+            if isinstance(n, list):
+                n = len(n)
+            p["fill"] = max(p["fill"], int(n or 0))
+        except Exception:                                  # noqa: BLE001
+            continue
+    try:
+        lo = json.load(open(os.path.join(pipe, ".lowq_library.json"), encoding="utf-8"))
+        items = lo if isinstance(lo, list) else (lo.get("items") or lo.get("episodes") or [])
+        p["upgrade"] = int(len(items) * 0.5)      # 每集要重传，成本高，权重折半
+    except Exception:                                      # noqa: BLE001
+        p["upgrade"] = 0
+    # 2026-11-22：new 的真实库存 = .gha_queue_new.json（源站目录比对后的新剧）。
+    # 原来读 tg_state.json 的 queue，那是旧的手工清单，永远几百条，
+    # 于是 new 的压力算出来只有个位数，调度几乎不排 new。
+    # 实测 catalog_sync 一跑，源站有 7556 部不在库的剧 → 队列 9922 条。
+    p["new"] = 1
+    for fname, scale in ((".gha_queue_new.json", 0.3),):
+        try:
+            d = json.load(open(os.path.join(pipe, fname), encoding="utf-8"))
+            items = d.get("items") if isinstance(d, dict) else d
+            n = len(items or [])
+            if n:
+                p["new"] = max(1, int(n * scale))
+        except Exception:                                  # noqa: BLE001
+            continue
+    try:
+        st = json.load(open(os.path.join(pipe, "tg_state.json"), encoding="utf-8"))
+        q = st.get("queue") or st.get("pending") or []
+        if isinstance(q, list) and q:
+            p["new"] = max(p["new"], int(len(q) * 0.3))
+    except Exception:                                      # noqa: BLE001
+        pass
+    return {k: max(0, v) for k, v in p.items()}
+
+
 def _order(data):
     active = [lane for lane in LANES if not data["lanes"][lane]["done"]]
     if not active:
@@ -91,10 +142,10 @@ def _order(data):
     # cooling, try the one whose cooldown expires first.
     if not ready:
         return []
-    preferred = SEQUENCE[int(data.get("rotation") or 0) % len(SEQUENCE)]
-    if preferred not in ready:
-        preferred = ready[0]
-    return [preferred] + [lane for lane in ready if lane != preferred]
+    # 按欠活量排序（原来按 SEQUENCE 轮转，绑死了 worker）
+    pres = _pressure()
+    ready_sorted = sorted(ready, key=lambda l: pres.get(l, 0), reverse=True)
+    return ready_sorted
 
 
 def _select_claim(path):

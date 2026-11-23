@@ -22,6 +22,20 @@ import gha_state as GS  # noqa: E402
 LOCAL_SLOTS = {"slot1", "slot2", "slot3", "slot4"}
 
 
+def _local_pool():
+    """本机实际可用号数 = session 总数 − 被预留的槽位。
+
+    2026-11-21：用户决定本机只跑 new / fill / upgrade 三条 lane，
+    slot1（new2）闲置并预留 → 可用 3 个。写死 4 会让容量虚高。
+    """
+    try:
+        sys.path.insert(0, HERE)
+        import gha_next3 as _G
+        return max(1, _G._session_count() - len(_G.reserved_slots()))
+    except Exception:                                          # noqa: BLE001
+        return 3
+
+
 def _scale():
     p = os.path.join(os.path.dirname(HERE), "config", "scale.json")
     try:
@@ -81,7 +95,7 @@ def main():
         "local_active": len(local),
         "external_active": len(ext),
         "capacities": {
-            "local": 4,
+            "local": _local_pool(),
             "external_declared": ext_declared,
             "external_observed": len({c["_worker"] for c in ext}),
             "headroom": 1,
@@ -100,8 +114,9 @@ def main():
         return 0
 
     print("worker 总览: %s" % ", ".join(out["workers"]))
-    print("并发占用  : 本机 %d / 外部 %d  （总容量 %d = 4 本机 + %d 外部 + 1 预留）"
+    print("并发占用  : 本机 %d / 外部 %d  （总容量 %d = %d 本机可用 + %d 外部 + 1 预留）"
           % (out["local_active"], out["external_active"], out["capacities"]["total"],
+             out["capacities"]["local"],
              max(out["capacities"]["external_declared"],
                  out["capacities"]["external_observed"])))
     print("条目 lease:")

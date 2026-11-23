@@ -2461,6 +2461,17 @@ def main():
                  if str(x.get("key") or x.get("video_id")) not in _epbad]
         if len(items) != _before and os.environ.get("GHA_DEBUG"):
             print("[ep_backoff] 过滤 %d 条长冷却集" % (_before - len(items)))
+    # 2026-11-23：**先打好源。** 队列里 emos 1050 条（今日 2/300）、
+    # bangumi 268 条（今日 74/287）。按原顺序试 = 把重试次数全烧在死源上，
+    # 然后报 no_job。命中率排序让有限的重试次数先落在能出片的源上。
+    _rate = {}
+    try:
+        _rate = GS.source_success_rate()
+    except Exception:                                      # noqa: BLE001
+        _rate = {}
+    if _rate and items:
+        items = sorted(items, key=lambda x: -_rate.get(str(x.get("source_label")), 0.5))
+
     if _hot:
         # 2026-11-15：fill/upgrade 条目没有 video_id，以前这里读 None → 永远不进
         # 冷却过滤 → 陈旧的 fill item 每轮都被重新探测。改走 item_cool_key()。

@@ -599,9 +599,23 @@ def pack(snap, audit, checks):
         _c.close()
     except Exception as e:                                         # noqa: BLE001
         log("  ! tg.db checkpoint 失败：%s" % str(e)[:60])
+    # 2026-11-23 周度体检修根因：BACKUP_FILES 是模块级全局，pack() 每调一次就
+    # 无条件 append 一份 tg.db（没有 _seen_rel 闸门）。--loop 进程跑 41 轮后，
+    # 包里塞了 41 份 state/tg.db —— 实测 20261123_071921 包解开 state/ = 5536MB，
+    # 压缩后 1.66GB，其中 5.5GB 是同一份 141MB 台账的副本。同时进程内还留着启动时
+    # 存在、之后已删除的旧条目（docs/BOX_CONTROL_20261113.md 等），让「关键文档齐」
+    # 这条判据对长跑进程恒定 FAIL。
+    # 修法：每轮在本地副本上组装、按包内相对路径去重，绝不污染全局。
+    files, _seen_rel = [], set()
+    for _src, _rel in BACKUP_FILES:
+        if _rel in _seen_rel:
+            continue
+        _seen_rel.add(_rel)
+        files.append((_src, _rel))
     for _src, _rel in ((os.path.join(PIPE, "tg.db"), "state/tg.db"),):
-        if os.path.isfile(_src):
-            BACKUP_FILES.append((_src, _rel))
+        if os.path.isfile(_src) and _rel not in _seen_rel:
+            _seen_rel.add(_rel)
+            files.append((_src, _rel))
 
     # 2026-11-13 灾备改造：脚本/文档不再手写白名单，改成按目录自动发现。
     # 根因：手写名单漏了 35 个现役脚本（gha_next3/gha_finish/gha_state/pc_upload/
@@ -609,7 +623,6 @@ def pack(snap, audit, checks):
     # 恢复出来的机器 Emby 能起但一集片子都收不进来。
     # 规则：pipeline 下所有 .py/.sh 全收（排除 __pycache__、*.bak*、*.pyc、日志）；
     # 文档目录 docs/ 全收 .md；/etc/cron.d/embytg_* 与 systemd unit 全收。
-    _seen_rel = {rel for _src, rel in BACKUP_FILES}
     for _dir, _arc, _exts in (
             (PIPE, "scripts/", (".py", ".sh")),
             # 2026-11-14：RUNNER_DIR 必须**连非脚本的凭据文件一起收**。
@@ -638,24 +651,36 @@ def pack(snap, audit, checks):
             if _rel in _seen_rel:
                 continue
             _seen_rel.add(_rel)
-            BACKUP_FILES.append((os.path.join(_dir, _f), _rel))
+            files.append((os.path.join(_dir, _f), _rel))
     for _f in sorted(glob.glob("/etc/cron.d/embytg_*") + glob.glob("/etc/cron.d/p03_*")):
         _rel = "systemd/" + os.path.basename(_f)
         if _rel not in _seen_rel:
             _seen_rel.add(_rel)
-            BACKUP_FILES.append((_f, _rel))
+            files.append((_f, _rel))
     for _f in sorted(glob.glob("/etc/systemd/system/embytg-*")):
+        if os.path.isdir(_f):
+            # drop-in 目录（*.service.d）本身是配置真源，但 os.path.isfile 会判 False
+            # → 旧代码只在 files_missing 里记一条目录名，内容一份都没进包（换机后
+            # drop-in 的 Environment=/TimeoutStartSec 全丢）。展开成逐个文件。
+            for _g in sorted(glob.glob(os.path.join(_f, "*"))):
+                if not os.path.isfile(_g):
+                    continue
+                _rel = "systemd/%s/%s" % (os.path.basename(_f), os.path.basename(_g))
+                if _rel not in _seen_rel:
+                    _seen_rel.add(_rel)
+                    files.append((_g, _rel))
+            continue
         _rel = "systemd/" + os.path.basename(_f)
         if _rel not in _seen_rel:
             _seen_rel.add(_rel)
-            BACKUP_FILES.append((_f, _rel))
-    log("  BACKUP_FILES 自动发现后共 %d 项" % len(BACKUP_FILES))
+            files.append((_f, _rel))
+    log("  BACKUP_FILES 自动发现后共 %d 项" % len(files))
 
     tmp_dump = os.path.join(BK, ".teldrive_dump_%s.sql.gz" % ts)
     try:
         with tarfile.open(out_tar, "w:gz", compresslevel=6) as tf:
             # 1) 静态文件
-            for src, rel in BACKUP_FILES:
+            for src, rel in files:
                 if not os.path.isfile(src):
                     missing.append(rel)
                     continue

@@ -602,7 +602,15 @@ def main():
                            "status": j.get("status") or "",
                            "error": str(j.get("error") or "")[:60],
                            "ts": float(j.get("ts") or 0)})
-    # 3.0) 孤儿 claim：同一 runner lane 上已有更新 claim，说明旧任务早该释放。
+    # 2026-11-15：有活进程的 claim 不算卡单（慢上传 ≠ 卡死）。
+    # 必须在孤儿判定**之前**算 live —— 2026-11-23 巡检实测：
+    # 局部 S01E16（slot2，405MB）在 0.06MB/s 的号上跑了 116min，同 lane 又有
+    # slot5 的新 claim，于是被判「疑似孤儿」→ daily_ops 假 FAIL。
+    # 年龄 + 同 lane 有更新 claim 都不是孤儿证据：一条 lane 本来就可以有多个
+    # slot 并行（fill 同时跑 slot2/slot5 是常态）。唯一可信的判据是「没有活进程」。
+    for c in claims:
+        c["live"] = claim_live(c.get("run_id"))
+    # 3.0) 孤儿 claim：同一 runner lane 上已有更新 claim **且本机已无活进程**。
     # 不能按物理 slot 分组：不同云电脑会重复使用 slot3。
     newest = {}
     for c in claims:
@@ -610,12 +618,10 @@ def main():
             newest[c["lane"]] = c["ts"]
     rep["orphan_claims"] = [c for c in claims
                             if c["lane"] and c["age_min"] > ORPHAN_CLAIM_MIN
+                            and not c["live"]
                             and c["ts"] < newest.get(c["lane"], 0)]
     # Oracle cannot directly inspect every runner's work directory. Age alone is
     # not proof of a stale job, so report candidates for remote job/manifest review.
-    # 2026-11-15：有活进程的 claim 不算卡单（慢上传 ≠ 卡死）。
-    for c in claims:
-        c["live"] = claim_live(c.get("run_id"))
     old = [c for c in claims if c["age_min"] > STALE_CLAIM_MIN and not c["live"]]
     rep["live_claims"] = [c for c in claims if c["live"]]
     rep["stale_claims"] = old

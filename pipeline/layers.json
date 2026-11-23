@@ -15,7 +15,7 @@
   "self_audit.py",
   "status_now.py"
  ],
- "generated": "2026-11-19",
+ "generated": "2026-11-21",
  "legacy": [
   "_db_state.py",
   "_inspect_td.py",
@@ -39,6 +39,7 @@
   "claim_reap.py",
   "emby_scan.py",
   "embytg_conf.py",
+  "emos_direct.py",
   "gap_report.py",
   "gate_history.py",
   "gha_cancel.py",
@@ -47,6 +48,7 @@
   "gha_next3.py",
   "gha_orphan_finish.py",
   "gha_state.py",
+  "gha_stock.sh",
   "ingest_quota.py",
   "ingest_review.py",
   "lane_queue.py",
@@ -101,7 +103,11 @@
   "fix_shenmu.py",
   "gap_list.py",
   "gen_nfo_gap_report.py",
+  "gha_e2e_once.py",
   "gha_next.py",
+  "gha_queue.py",
+  "gha_register.py",
+  "gha_transport_run.py",
   "ingest_sop.sh",
   "migrate_to_sqlite.py",
   "moviewatch.py",
@@ -168,6 +174,8 @@
   "upgrade_episodes.py",
   "upgrade_from_channels.py",
   "web_lookup.py",
-  "gha_queue.py"
+  "check_caps.py",
+  "catalog_sync.py",
+  "gha_run_now.py"
  ]
 }

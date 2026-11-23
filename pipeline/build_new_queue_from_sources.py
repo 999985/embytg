@@ -368,6 +368,17 @@ def build(limit=2000, apply=False):
     if len(picked) < total_cap:
         picked.extend(overflow[:total_cap - len(picked)])
     rows = picked
+    # 2026-11-21: interleave by source so the queue head is not monopolized by one source
+    _buckets = {}
+    for _r in rows:
+        _buckets.setdefault(_r.get("source_label") or "?", []).append(_r)
+    _order = [k for k, _ in sorted(_buckets.items(), key=lambda kv: -_prio.get(kv[0], 0))]
+    _inter = []
+    while any(_buckets.values()):
+        for _l in _order:
+            if _buckets[_l]:
+                _inter.append(_buckets[_l].pop(0))
+    rows = _inter
     result = {
         "ok": True,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),

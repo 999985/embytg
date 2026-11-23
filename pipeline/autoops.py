@@ -1229,7 +1229,30 @@ def refresh_mismatched(f, st=None):
                     tries[nm] = hist
                     skipped.append({"lib": lib, "series": nm, "disk": n, "emby": e, "tries": len(hist)})
                     continue
-                emby("/Items/%s/Refresh?Recursive=true&MetadataRefreshMode=Default" % s["Id"], "POST")
+                # E115（2026-11-22 夜）：**插件可用时不许发 Recursive=true** —— 它会重新枚举
+                # 季目录插一条，与并发的 TargetedScan 在同秒各建一条（同 Path 双条目）。
+                # 正确做法：把「磁盘有、Emby 没有」的精确文件路径交给 TargetedScan（自带
+                # 同路径去重窗），只有插件不可用时才退回 Recursive=true 当建条目退路。
+                _miss = [_host_path(p) for p in sorted(disk_files)
+                         if _host_path(p) not in {_host_path(x) for x in _paths}]
+                _used_scanpath = False
+                try:
+                    import emby_scan as _ES
+                    if _ES.have_scanpath() and _miss:
+                        _c = [MNT_MAP[0] + p[len(MNT):] if p.startswith(MNT) else p
+                              for p in _miss][:50]
+                        _r = _ES.scan_paths(_c)
+                        _used_scanpath = True
+                        if not (_r.get("Created") or _r.get("Refreshed")):
+                            skipped.append({"lib": lib, "series": nm, "disk": n,
+                                            "emby": e, "tries": len(hist),
+                                            "why": "ScanPath 未建成 %s" % _r.get("mode")})
+                            tries[nm] = hist + [now]
+                            continue
+                except Exception:                          # noqa: BLE001
+                    _used_scanpath = False
+                if not _used_scanpath:
+                    emby("/Items/%s/Refresh?Recursive=true&MetadataRefreshMode=Default" % s["Id"], "POST")
                 fixed.append({"lib": lib, "series": nm, "disk": n, "emby": e})
                 tries[nm] = hist + [now]
                 if len(fixed) >= 3:

@@ -123,14 +123,19 @@ def save_token(label, host, tok):
 
 
 def clear_stale(label):
-    p = os.path.join(HERE, "src_guard.py")
-    s = open(p, encoding="utf-8").read()
-    if label in s:
-        import re
-        s2 = re.sub(r'\n?\s*"%s":\s*"[^"]*",?' % re.escape(label), "", s)
-        if s2 != s:
-            open(p, "w", encoding="utf-8").write(s2)
-            print("  ✓ 已从 src_guard.TOKEN_STALE 移除")
+    """换到新 token 后，把「这个源不能用了」的门打开。
+
+    2026-11-22 改：原实现是用正则去 **改 src_guard.py 源码**删 TOKEN_STALE 里的条目，
+    而 TOKEN_STALE 早已是空 dict —— 等于什么都没做（还可能误删同名的其它配置行）。
+    真正拦着它的是 `cache/src_health.json` 里的 `token_stale_until` / `cool_until`：
+    换好 token 却不清冷却，源会继续黑 12 小时（"修好了但闸门没开"）。
+    """
+    try:
+        import src_guard as SG
+        SG._health_ok(label, 200)
+        print("  ✓ 已清除源健康表里的失败/冷却（新 token 立即生效）")
+    except Exception as e:                                     # noqa: BLE001
+        print("  ! 清理源健康表失败（token 仍已保存）：%s" % str(e)[:80])
 
 
 def main():

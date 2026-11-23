@@ -376,6 +376,28 @@ def norm_job(j):
     return out
 
 
+def source_success_rate():
+    """源站命中率 {label: ok/day}，用于把好源排到前面（2026-11-23）。
+
+    今天实测：emos 2/300（0.7%）、bangumi 74/287（26%）。而 new 队列里
+    emos 有 1050 条、bangumi 只有 268 条 —— 按队列顺序试，等于把有限的
+    重试次数全烧在死源上，最后报 no_job。**顺序也是产能。**
+    """
+    try:
+        with open(os.path.join(HERE, ".gha_src_budget.json"), encoding="utf-8") as fh:
+            d = json.load(fh)
+    except Exception:                                       # noqa: BLE001
+        return {}
+    out = {}
+    for name, rec in (d.get("sources") or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        day = float(rec.get("day") or 0)
+        ok = float(rec.get("ok") or 0)
+        out[str(name)] = (ok / day) if day else 0.5
+    return out
+
+
 def read_claims(include_legacy=True):
     """返回所有活跃 claim —— **以 tg.db.job_claim 为唯一真源**。
 

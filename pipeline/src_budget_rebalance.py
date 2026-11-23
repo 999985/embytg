@@ -39,15 +39,13 @@ PIPE = os.path.dirname(os.path.abspath(__file__))
 BUDGET = os.path.join(PIPE, ".gha_src_budget.json")
 MIN_SAMPLE = 30          # 少于这么多次请求不判命中率
 
-TIERS = [(0.30, 800), (0.15, 500), (0.05, 200)]
-ZERO_CAP = 20
-
-
-def tier_of(hit, day):
-    for th, cap in TIERS:
-        if hit >= th:
-            return cap
-    return ZERO_CAP if day >= MIN_SAMPLE else None
+# 2026-11-23（用户口径）：**源站配额不设上限，只做不频繁的请求。**
+# 这里原来按命中率把 daily_cap 压到 800/500/200/20，每 2 小时跑一次 ——
+# 等于我手工把上限放开后，它又会悄悄改回去（今天实测 daily_cap 又变回 20）。
+# 频率约束（间隔 1.6s / 单源并发 1 / src_guard 的 burst）才是真正该管的，
+# 而那是 src_guard 的职责。本脚本从此只做两件事：报告命中率、把额度置 0（不限）。
+def tier_of(hit, day):                                     # noqa: ARG001
+    return 0
 
 
 def main(apply=True):
@@ -67,7 +65,7 @@ def main(apply=True):
             continue
         if rec.get("daily_cap") != new_cap:
             changed += 1
-            note = "2026-11-17 命中率 %d/%d=%.0f%% → cap %d" % (ok, day, hit * 100, new_cap)
+            note = "2026-11-23 命中率 %d/%d=%.0f%% → 不限（只保留频率约束）" % (ok, day, hit * 100)
             if apply:
                 rec["daily_cap"] = new_cap
                 rec["cap_note"] = note

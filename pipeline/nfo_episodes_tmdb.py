@@ -624,9 +624,13 @@ def main():
                   open(OUT, "w"), ensure_ascii=False, indent=1)
         return
     stats = {}
+    written = []
     with ThreadPoolExecutor(max_workers=a.workers) as ex:
-        for f in as_completed([ex.submit(do, j) for j in jobs]):
+        futs = {ex.submit(do, j): j for j in jobs}
+        for f in as_completed(futs):
             r = f.result(); k = r.split(":")[0]; stats[k] = stats.get(k, 0) + 1
+            if k == "write":
+                written.append(futs[f][0])
     print("# 完成 %s / %.1fs" % (stats, time.time() - t0))
     json.dump({"ts": time.strftime("%H:%M:%S"), "jobs": len(jobs), "notes": notes, "stats": stats},
               open(OUT, "w"), ensure_ascii=False, indent=1)
@@ -634,14 +638,15 @@ def main():
     # 2026-11-14（E085）：写进 NFO 不等于 Emby 会读。
     # 实测：NFO 内容已是「停战」，Emby 仍显示「百年孤独 S02E01 - 2160p」，
     # 因为 ScanPath 只负责发现文件，不触发元数据重读。
-    # 必须对受影响的剧发一次 Refresh，否则用户看不到新标题。
-    if stats.get("write"):
+    # 2026-11-23（E115 第五根因）：以前这里刷 Series，而 Emby 4.10 的 Series Refresh
+    # 即使 Recursive=false 也会刷新子季并枚举季目录 → 把刚落地、未入库的新集插成
+    # 第二条（171873/171874、171900/171901，与 ingest lane 的 TargetedScan 相隔 50ms）。
+    # 现在只刷**写过的那些集条目**（叶子），没有子项可枚举，机制上不会再造重复。
+    if written:
         try:
-            from post_ingest import refresh_series
-            _pairs = [(k.split(" ", 1)[0], os.path.basename(k.split(" ", 1)[1]))
-                      for k in detail if " " in k]
-            _hit, _err = refresh_series(_pairs)
-            print("# Emby 刷新：%d 部%s" % (
+            from post_ingest import refresh_episodes
+            _hit, _err = refresh_episodes(written)
+            print("# Emby 集条目刷新：%d 条%s" % (
                 _hit, ("；错误 %s" % _err[:2]) if _err else ""), flush=True)
         except Exception as _e:                            # noqa: BLE001
             print("# Emby 刷新失败（NFO 已写，需人工 Refresh）: %s"
