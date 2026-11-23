@@ -11,9 +11,19 @@ runner 每分钟刷 no_session —— 全都躺在日志里没人看。事故不
 是没被记录成事故。
 
 本脚本做三件事：
-  1. 扫近 24h 所有 embytg-* 单元的失败（Failed with result / 非零退出）
+  1. 扫 embytg-* 单元的失败（Failed with result / 非零退出）
   2. 统计 runner loop.log 的退出码与原因分布（rc=1 / no_session / no_job …）
-  3. 有失败 → 写 alerts 日志 + 走 alert.py 出口；全绿 → 只留一行摘要
+  3. 有**新增**失败 → 写 alerts 日志 + 走 alert.py 出口；全绿 → 只留一行摘要
+
+2026-11-23（E198）——「同一场事故别报第二遍」：
+  旧判据把所有单元近 24h 的 failure 全量再报一次。于是 07:37 那批
+  「run_one 以 rc=1 表示没活干」的架构问题（364 条）被每一次巡检重复告警，
+  第二天又因为窗口还盖着它再报一遍；真正的性质是**已经修好的旧事故**，
+  却永远占用告警位，把新事故挤掉。
+  现在每个单元记 journal cursor，只报 cursor 之后的新失败；
+  首次运行/换机没有 cursor 时退回「上次巡检时间之后」，再退回 24h 窗口。
+  同时 runner 判据只数**真正领到活**的迭代（dur>=20s）——3 秒就退出的
+  空转探测不是失败，之前 80% 的「失败率」全是这类空转。
 
 用法：
   python3 timer_audit.py            # 人读
@@ -23,6 +33,7 @@ runner 每分钟刷 no_session —— 全都躺在日志里没人看。事故不
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -32,45 +43,105 @@ RUNNER_LOG = "/opt/embytg-runner/logs/loop.log"
 STATE = os.path.join(HERE, ".timer_audit.json")
 FAIL_RE = re.compile(r"Failed with result '([^']+)'")
 REASON_RE = re.compile(r"reason=([a-z_]+)")
+CURSOR_RE = re.compile(r"cursor:\s*(\S+)")
 
 
-def _sh(cmd, timeout=60):
+def _sh_rc(cmd, timeout=60):
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
                            timeout=timeout)
-        return r.stdout or ""
+        return (r.stdout or ""), r.returncode
     except Exception:                                       # noqa: BLE001
-        return ""
+        return "", 127
 
 
-def service_failures(hours=24):
-    """每个 embytg 单元在窗口内的失败次数与最后一条原因。"""
+def _sh(cmd, timeout=60):
+    return _sh_rc(cmd, timeout)[0]
+
+
+def journal_cursor(unit):
+    """单元当前 journal 游标；拿不到返回空串。"""
+    out = _sh("journalctl -u %s -n0 --show-cursor --no-pager -o cat 2>/dev/null"
+              % shlex.quote(unit), timeout=15)
+    m = CURSOR_RE.search(out)
+    return m.group(1) if m else ""
+
+
+def _failure_lines(txt):
+    """返回 (失败次数, 最后一条原因)。失败计数只看 systemd 的 result 行。"""
+    fails = FAIL_RE.findall(txt)
+    last = ""
+    for line in reversed(txt.splitlines()):
+        if "Failed with result" in line or "error" in line.lower():
+            last = line.strip()[:160]
+            break
+    return len(fails), last
+
+
+def service_failures(hours=24, cursors=None, since_ts=None):
+    """每个 embytg 单元**自上次巡检以来**的失败次数与最后一条原因。
+
+    取数优先级：
+      1. 该单元上次记下的 journal cursor（精确，不受 24h 窗口限制）
+      2. 上次巡检的时间戳（首次升级后没有 cursor 的迁移路径）
+      3. 近 hours 小时（全新安装）
+    窗口内的历史失败数另存 window_fails，只作背景，不触发告警。
+    """
+    cursors = cursors or {}
     units = [u.strip() for u in _sh(
         "systemctl list-units 'embytg-*' --all --no-legend --no-pager "
         "| awk '{print $1}'").splitlines() if u.strip()]
     out = []
+    new_cursors = {}
     for u in units:
-        txt = _sh("journalctl -u %s --since '-%dh' --no-pager -o cat" % (u, hours),
-                  timeout=30)
-        fails = FAIL_RE.findall(txt)
-        if not fails:
+        window = _sh("journalctl -u %s --since '-%dh' --no-pager -o cat"
+                     % (shlex.quote(u), hours), timeout=30)
+        window_fails, last = _failure_lines(window)
+
+        new_txt, mode = "", "window"
+        cur = cursors.get(u)
+        if cur:
+            new_txt, rc = _sh_rc("journalctl -u %s --after-cursor=%s "
+                                 "--no-pager -o cat"
+                                 % (shlex.quote(u), shlex.quote(cur)))
+            # cursor 可能因 journal 轮转失效 → 退回时间判据，不要静默漏报
+            mode = "cursor" if rc == 0 else ""
+        if mode != "cursor" and since_ts:
+            new_txt = _sh("journalctl -u %s --since '@%d' --no-pager -o cat"
+                          % (shlex.quote(u), int(since_ts)), timeout=30)
+            mode = "since"
+        if mode not in ("cursor", "since"):
+            mode = "window"
+
+        if mode == "window":
+            new_fails, last_new = window_fails, last
+        else:
+            new_fails, last_new = _failure_lines(new_txt)
+
+        new_cursors[u] = journal_cursor(u) or cursors.get(u, "")
+
+        if not new_fails and not window_fails:
             continue
-        last = ""
-        for line in reversed(txt.splitlines()):
-            if "Failed with result" in line or "error" in line.lower():
-                last = line.strip()[:160]
-                break
-        out.append({"unit": u, "fails": len(fails), "last": last})
-    out.sort(key=lambda x: -x["fails"])
-    return out
+        out.append({"unit": u, "fails": new_fails, "window_fails": window_fails,
+                    "mode": mode, "last": last_new or last})
+    out.sort(key=lambda x: (-x["fails"], -x["window_fails"]))
+    return out, new_cursors
 
 
-def runner_stats():
-    """loop.log 里最近 24h 的退出码与原因分布。"""
+def runner_stats(since_ts=None):
+    """loop.log 里最近 24h 的退出码与原因分布。
+
+    判据用 **EXIT 行**（真领到活、真跑完的单）而不是 [loop] idle 行：
+    空转探测的 rc=1 表示 no_job/no_session/source_budget，是调度状态不是失败；
+    旧版把这些一起计数，得出「80% 失败率」的假信号。
+    since_ts 之后的失败另记 job_fail_new —— 巡检只对新失败告警。
+    """
     if not os.path.exists(RUNNER_LOG):
         return {"exists": False}
     cutoff = time.time() - 24 * 3600
-    rc0 = rc1 = 0
+    job_rc0 = job_rc1 = 0
+    job_fail_new = job_done_new = 0
+    idle_rc1 = 0
     reasons = {}
     try:
         with open(RUNNER_LOG, encoding="utf-8", errors="replace") as fh:
@@ -83,46 +154,79 @@ def runner_stats():
                     continue
                 if ts < cutoff:
                     continue
-                if "EXIT" in line and "rc=0" in line:
-                    rc0 += 1
-                elif "EXIT" in line and "rc=1" in line:
-                    rc1 += 1
                 m = REASON_RE.search(line)
                 if m:
                     reasons[m.group(1)] = reasons.get(m.group(1), 0) + 1
+                em = re.search(r"\bEXIT\s+\S+\s+rc=(\d+)", line)
+                if em:
+                    rc = int(em.group(1))
+                    if rc == 0:
+                        job_rc0 += 1
+                    else:
+                        job_rc1 += 1
+                    if since_ts and ts >= since_ts:
+                        job_done_new += 1
+                        if rc != 0:
+                            job_fail_new += 1
+                    continue
+                if "[loop] idle rc=" in line and " rc=1 " in line:
+                    idle_rc1 += 1
     except Exception:                                       # noqa: BLE001
         return {"exists": True, "error": "read_failed"}
-    return {"exists": True, "rc0": rc0, "rc1": rc1,
+    return {"exists": True, "rc0": job_rc0, "rc1": job_rc1,
+            "job_fail_new": job_fail_new, "job_done_new": job_done_new,
+            "idle_rc1": idle_rc1,
             "reasons": dict(sorted(reasons.items(), key=lambda x: -x[1])[:8])}
+
+
+def _load_state():
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            return json.load(fh) or {}
+    except Exception:                                       # noqa: BLE001
+        return {}
 
 
 def main():
     as_json = "--json" in sys.argv
     quiet = "--quiet" in sys.argv
-    svc = service_failures()
-    run = runner_stats()
+    prev = _load_state()
+    cursors = prev.get("cursors") if isinstance(prev.get("cursors"), dict) else {}
+    since_ts = prev.get("ts")
+    svc, new_cursors = service_failures(cursors=cursors, since_ts=since_ts)
+    run = runner_stats(since_ts=since_ts)
 
-    # 阈值：单元失败 >0 或 runner rc=1 占比 >20% 视为需要处理
-    total_fail = sum(x["fails"] for x in svc)
+    # 判据：自上次巡检以来有**新增**的单元失败或整单失败。
+    # 24h 的历史失败只作背景：修好的事故不该每天重报一次。
+    new_fail = sum(x["fails"] for x in svc)
+    job_fail_new = int(run.get("job_fail_new") or 0)
     rc1 = int(run.get("rc1") or 0)
     rc0 = int(run.get("rc0") or 0)
-    bad_ratio = (rc1 / max(1, rc0 + rc1)) if (rc0 + rc1) >= 20 else 0.0
-    problems = bool(total_fail) or bad_ratio > 0.2
+    bad_ratio = (rc1 / max(1, rc0 + rc1)) if (rc0 + rc1) >= 5 else 0.0
+    problems = bool(new_fail) or bool(job_fail_new)
 
     report = {"ts": int(time.time()), "services": svc, "runner": run,
-              "problems": problems}
+              "new_fail": new_fail, "problems": problems,
+              "cursors": new_cursors}
 
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
     elif not quiet or problems:
-        print("== 近 24h 单元失败 ==")
-        if not svc:
-            print("   全部正常（0 个单元失败）")
+        print("== 自上次巡检以来的新失败 ==")
+        if not new_fail:
+            print("   无新增（24h 窗口内历史失败 %d 条，属已记录事故）"
+                  % sum(x["window_fails"] for x in svc))
         for x in svc[:8]:
-            print("   %-32s %3d 次 | %s" % (x["unit"], x["fails"], x["last"][:70]))
+            if not x["fails"]:
+                continue
+            print("   %-32s %3d 次 (窗口 %d) | %s"
+                  % (x["unit"], x["fails"], x["window_fails"], x["last"][:70]))
         print("== runner 退出与原因 ==")
-        print("   rc=0 %d | rc=1 %d | 失败占比 %.0f%%"
+        print("   24h 整单 rc=0 %d | rc=1 %d | 失败占比 %.0f%%"
               % (rc0, rc1, bad_ratio * 100))
+        print("   上次巡检后整单 %d 个，其中失败 %d 个；空转探测 rc=1 %d 次（不计）"
+              % (int(run.get("job_done_new") or 0), job_fail_new,
+                 int(run.get("idle_rc1") or 0)))
         _rs = run.get("reasons")
         if not isinstance(_rs, dict):
             _rs = {}
@@ -140,9 +244,10 @@ def main():
             sys.path.insert(0, HERE)
             import alert as A
             top = ", ".join("%s×%d" % (x["unit"].replace(".service", ""), x["fails"])
-                            for x in svc[:4]) or "runner"
-            A.alert("warn", "timer_audit",
-                    "定时任务日志有失败：%s（rc=1 %d/%d）" % (top, rc1, rc0 + rc1))
+                            for x in svc[:4] if x["fails"])
+            if job_fail_new:
+                top = (top + "，" if top else "") + "整单失败×%d" % job_fail_new
+            A.alert("warn", "timer_audit", "定时任务新增失败：%s" % top)
         except Exception:                                   # noqa: BLE001
             pass
         return 1
