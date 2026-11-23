@@ -546,6 +546,44 @@ def verify_actual_emby(job, width, height, timeout=180):
         width, height, last or "未收录"))
 
 
+def forget_emby_items_at(path_abs, timeout=120):
+    """摘掉「文件已经不在盘上」的旧集条目（只按精确 Path 匹配）。
+
+    E199（2026-11-23）：洗版 pre-dup 把旧片改名成 ``.dup`` 后，旧 Emby 条目
+    仍然指着旧 Path。实测 Emby 4.10：集条目 Refresh 只刷元数据、TargetedScan
+    只建新条目，**两者都不会删掉缺文件的旧条目** —— 只有「递归刷新剧/季」在
+    枚举目录时才会发现文件缺失并移除。而递归刷新正是 E115 造同 Path 重复条目
+    的机制，不能为了收尾去发。
+
+    事故现场：法警小队 S02E06（12:53 判 failed，13:12 才被别的进程的 Series
+    递归刷新清掉）、仙逆 S01E156（13:40 判 failed，13:42 才清掉）—— 都只差
+    一两次目录枚举，却把 upgrade lane 堵了 19~70 分钟。
+
+    这里在「旧 Path 已不在挂载上」的前提下按精确 Path 删条目：Emby 的
+    DELETE 会尝试删 Path 指向的文件，路径已不存在 → 无字节可删（与 drop_old
+    第 ④ 步同一口径）。绝不按集号删，避免误伤新版条目。
+    """
+    host_root = A.MNT_ROOT.rstrip("/")
+    want = os.path.normpath(path_abs)
+    q = urllib.parse.urlencode({"Recursive": "true", "IncludeItemTypes": "Episode",
+                                "Fields": "Path", "Limit": "20000"})
+    items = (P.emby("/Items?" + q) or {}).get("Items") or []
+    hit = []
+    for e in items:
+        p = e.get("Path") or ""
+        if p.startswith("/mnt/embytg/"):
+            p = host_root + p[len("/mnt/embytg"):]
+        if os.path.normpath(p) == want:
+            hit.append(str(e.get("Id")))
+    for eid in hit:
+        try:
+            P.emby("/Items/%s" % eid, "DELETE", timeout=timeout)
+        except Exception as exc:                               # noqa: BLE001
+            print("  ⚠ 旧条目删除失败 %s：%s" % (eid, str(exc)[:80]),
+                  file=sys.stderr)
+    return len(hit)
+
+
 def verify_upgrade_emby(job, timeout=300):
     """洗版收尾判据：新文件在、旧文件不在、该集只指向新文件、画质达标。
 
@@ -581,6 +619,13 @@ def verify_upgrade_emby(job, timeout=300):
             return sid
         last = "sid=%s new=%s old=%s paths=%d items=%d rank=%s/%s" % (
             sid, saw_new, saw_old, len(paths), len(items), got_rank, want_rank)
+        # E199：改名后的旧条目不会被集级 Refresh 删掉，只有递归扫描才会 —— 不能等。
+        # 判据收紧到「盘上确实没有旧文件」才摘条目，避免误删还有字节的版本。
+        if saw_old and not os.path.exists(old_abs):
+            n = forget_emby_items_at(old_abs)
+            if n:
+                print("  已摘掉缺文件的旧 Emby 条目 %d 条：%s"
+                      % (n, os.path.basename(old_abs)), file=sys.stderr)
         refresh_episode(job)
         time.sleep(15)
     raise RuntimeError("洗版后 Emby 定向刷新未收敛：%s" % (last or "无数据"))
