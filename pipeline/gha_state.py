@@ -376,6 +376,27 @@ def norm_job(j):
     return out
 
 
+def landed_at_of(rel):
+    """某条已入库路径的落地时间（epoch）；查不到返回 0（2026-11-23）。
+
+    用途：upgrade lane 的「刚入库先别洗」闸门 —— 今天 19/19 次洗版都是
+    3 天内刚入库的集，等于先落 1080p 再回头重下 4K。等 48 小时再洗，
+    4K 批次也齐了，一次能洗多集，少下无效流量。
+    """
+    if not rel:
+        return 0.0
+    try:
+        con = sqlite3.connect(os.path.join(HERE, "tg.db"), timeout=20)
+        try:
+            row = con.execute("select landed_at from resource_state where rel=? limit 1",
+                              (str(rel),)).fetchone()
+        finally:
+            con.close()
+        return float(row[0]) if row and row[0] else 0.0
+    except Exception:                                       # noqa: BLE001
+        return 0.0
+
+
 def source_success_rate():
     """源站命中率 {label: ok/day}，用于把好源排到前面（2026-11-23）。
 

@@ -143,8 +143,17 @@ def _order(data):
     if not ready:
         return []
     # 按欠活量排序（原来按 SEQUENCE 轮转，绑死了 worker）
+    #
+    # 2026-11-23（用户口径）：**重点先放在 new 和 fill**，upgrade 降权。
+    # upgrade 是「重下一整集」的活，单位流量产出最低；new/fill 是净增长。
+    # 这里给 upgrade 乘 0.05 —— 不是禁用它，而是让 new/fill 有活时先干它们，
+    # 只有当 new/fill 都冷却/空了，upgrade 才会浮上来。
+    _W = {"new": 1.0, "fill": 1.0, "upgrade": 0.05}
     pres = _pressure()
-    ready_sorted = sorted(ready, key=lambda l: pres.get(l, 0), reverse=True)
+    ready_sorted = sorted(
+        ready,
+        key=lambda l: pres.get(l, 0) * _W.get(l, 1.0),
+        reverse=True)
     return ready_sorted
 
 

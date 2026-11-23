@@ -1846,6 +1846,17 @@ def try_upgrade(item, available_labels, leased, min_bytes, max_bytes, run_id,
               file=sys.stderr)
         return None
     item = {**item, "season": season, "ep": ep}
+    # 2026-11-23：**刚入库的集先别洗。** 今天 19/19 次升级都是 3 天内刚入库的，
+    # 等于「先落 1080p、当晚再重下 4K」。等 UPGRADE_MIN_AGE_H（默认 48h）再洗，
+    # 一是避免无效下载，二是那时 4K 批次通常已齐，一次能洗多集。
+    _hold = float(os.environ.get("UPGRADE_MIN_AGE_H", "48") or 0)
+    if _hold > 0 and item.get("current_rel"):
+        _ts = GS.landed_at_of(item.get("current_rel"))
+        if _ts and (time.time() - _ts) < _hold * 3600:
+            print("upgrade hold: %s E%s 落地不足 %dh，先不洗"
+                  % (str(item.get("series"))[:20], item.get("ep"), int(_hold)),
+                  file=sys.stderr)
+            return None
     allowed = GS.eligible_sources(available_labels, leased, load=leased_load)
     if not allowed:
         return None
@@ -1917,8 +1928,11 @@ def try_new(item, available_labels, leased, min_bytes, max_bytes, run_id,
             # 队列是从源站目录建的，因此这两个字段是确定的；
             # 原来只用他们分片，解析时重新按剧名搜 —— 搜不到就
             # no_source_probe 冷藏 3 天（今日 255 部）。
+            # 2026-11-23：3 → 5。新片只比 3 个源，就出现「落到 1080p，
+            # 当晚又被 upgrade 成 2160p」（今天 19/19 次升级都是 3 天内新入库的）。
+            # 多比两个源的代价是每集多几次搜索，省下的是一整集 3-5GB 的重下。
             sources = SP.resolve_series_all(
-                g, item["series"], exclude=HARD_EXCLUDE, max_hosts=3,
+                g, item["series"], exclude=HARD_EXCLUDE, max_hosts=5,
                 year=item.get("year", 0), order_labels=allowed,
                 hint=(item.get("source_label"), item.get("source_series_id")))
     finally:

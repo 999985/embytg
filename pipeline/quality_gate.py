@@ -69,7 +69,10 @@ def _env_float(name, default):
 
 STOCK_MIN_MBPS = {"2160p": 2.0, "1080p": 0.8, "720p": 0.4}   # 低于此值 = 该洗
 STOCK_FLOOR_DEFAULT = 0.6
-ADMIT_MIN_MBPS = {"2160p": _env_float("QG_ADMIT_2160", 4.0),
+# 2026-11-23：2160p 准入线 4.0 → 2.0，与「2160p ≥2.0Mbps 达标」口径一致。
+# 原来新片准入要 4.0，而 upgrade 收 2.0 —— 同一部 3.2Mbps 的 4K：
+# 新片阶段被拒（于是落 1080p），当晚 upgrade 又把它收进来。等于自己制造返工。
+ADMIT_MIN_MBPS = {"2160p": _env_float("QG_ADMIT_2160", 2.0),
                   "1080p": _env_float("QG_ADMIT_1080", 2.0)}   # 达到此值 = 可交付
 FLOOR_MBPS = 2.0                                              # 假 4K 一票否决线
 
