@@ -70,6 +70,31 @@ def _sort_eq(emby_sort, title):
     return _fold_sort(emby_sort) == _fold_sort(title)
 
 
+# 2026-11-24：收尾退出码必须区分「本集坏了」和「本集没问题、Emby 还没枚举」。
+#
+# 证据（/opt/embytg-runner/work/*/finish.log 里所有 post_ingest rc=2 的记录）：
+# 绝大多数是 `④ 无NFO 0 / 占位 0 / Emby缺 1 / Name不符 0` —— 文件已登记、NFO 已写，
+# 只是 Emby 还没把它枚举出来；少数是 Series 级判据（⑤ 身份 / ⑥ 搜索）失败。
+# gha_finish 把 rc!=0 一律当「本集失败」→ claim 标 failed → 同集被重新领取下载，
+# 白烧源站配额，还会在 .gha_claims 里挂成「卡单」。
+#
+# 退出码契约：
+#   0 = 全 PASS
+#   2 = **文件级**失败（无 NFO / 占位 / Name 不符）—— 本集确实要重做
+#   3 = 文件级全 PASS，只剩 Emby 枚举或 Series 级未收敛 —— 由 reconcile 每 15 分钟
+#       （episode_missing_emby → heal_mount_cache + ScanPath）补齐，不判本集失败
+PENDING_EXIT = 3
+
+
+def verdict_exit(n_file, n_emby, n_series, file_scope):
+    """把三类失败折成一个退出码（file_scope = 单集收尾模式）。"""
+    if n_file or n_emby or n_series:
+        if file_scope and not n_file:
+            return PENDING_EXIT
+        return 2
+    return 0
+
+
 def emby(path, method="GET", body=None, timeout=120):
     req = urllib.request.Request(EMBY + path, method=method,
                                  data=json.dumps(body).encode() if body is not None else None,
@@ -871,6 +896,30 @@ def main():
             "" if not pending else "（缺：%s）" % ", ".join(x[:16] for x in pending[:4]),
             rf2, "" if not (refresh_err or root_err or re2) else "；错误 %s" % ", ".join((refresh_err + root_err + re2)[:3])))
 
+        # 2026-11-24（E178 同源）：刚上传完的文件会被 rclone DirCache 藏起来，
+        # TargetedScan 只会回 PathNotFound —— 再等多久都枚举不出来。reconcile 每 15 分钟
+        # 正是靠 heal_mount_cache（vfs/forget + 重新 stat）把这类文件补进 Emby 的；
+        # 收尾阶段直接用同一招，把「可见性延迟 15 分钟」压成一次重扫，
+        # 避免 claim 因为「Emby 还没枚举」被判失败（见 PENDING_EXIT 说明）。
+        if a.verify_file and not ready:
+            try:
+                from reconcile import heal_mount_cache
+                _vis, _healed = heal_mount_cache([u["Path"] for u in updates])
+                if _healed:
+                    print("  ② 挂载目录缓存自愈 %d 条（vfs/forget 后可见）" % _healed)
+            except Exception as e:                                # noqa: BLE001
+                print("  ② 挂载缓存自愈跳过：%s" % str(e)[:80])
+            try:
+                import emby_scan
+                _res2 = emby_scan.scan_paths([u["Path"] for u in updates])
+                print("  ② 自愈后复扫 %d 文件：Created=%d Refreshed=%d Failed=%d"
+                      % (len(updates), _res2.get("Created", 0),
+                         _res2.get("Refreshed", 0), _res2.get("Failed", 0)))
+            except Exception as e:                                # noqa: BLE001
+                print("  ② 自愈后复扫失败：%s" % str(e)[:80])
+            ready, pending = wait_series_ready(series, a.wait_emby, a.verify_file)
+            print("  ② 复扫后枚举：%s" % ("完成" if ready else "仍未完成"))
+
         for lib in libs:
             cmd = [sys.executable, os.path.join(HERE, "nfo_name_to_emby.py"),
                    "--apply", "--lib", lib, "--workers", "8"]
@@ -883,9 +932,8 @@ def main():
                 lib, r.returncode, (out.splitlines() or [""])[-1][:90]))
 
     checked, bad = verify(series, a.sample, a.strict_emby, a.verify_file)
-    n_bad = sum(len(bad[k]) for k in ("no_nfo", "placeholder", "name_mismatch"))
-    if a.strict_emby:
-        n_bad += len(bad["emby_missing"])
+    n_file = sum(len(bad[k]) for k in ("no_nfo", "placeholder", "name_mismatch"))
+    n_emby = len(bad["emby_missing"]) if a.strict_emby else 0
     print("  ④ 验收：抽样 %d 集 → 无NFO %d / 占位 %d / Emby缺 %d / Name不符 %d%s"
           % (checked, len(bad["no_nfo"]), len(bad["placeholder"]),
              len(bad["emby_missing"]), len(bad["name_mismatch"]),
@@ -898,15 +946,21 @@ def main():
                                    "FAIL %d" % len(identity_bad)))
     for x in identity_bad[:5]:
         print("      ✘ identity: %s" % x[:120])
-    n_bad += len(identity_bad)
     search_bad = series_searchable(series)
     print("  ⑥ 用户搜索：%s" % ("PASS" if not search_bad else
                                 "FAIL %d" % len(search_bad)))
     for x in search_bad[:5]:
         print("      ✘ search: %s" % x[:120])
-    n_bad += len(search_bad)
-    print("\n  结论：%s" % ("PASS" if n_bad == 0 else "FAIL"))
-    return 0 if n_bad == 0 else 2
+    n_series = len(identity_bad) + len(search_bad)
+    rc = verdict_exit(n_file, n_emby, n_series, bool(a.verify_file))
+    if rc == 0:
+        print("\n  结论：PASS")
+    elif rc == PENDING_EXIT:
+        print("\n  结论：PENDING（本集文件/NFO 已就绪；Emby 枚举或 Series 级未收敛，"
+              "由 reconcile 每 15 分钟补齐，不判本集失败）")
+    else:
+        print("\n  结论：FAIL")
+    return rc
 
 
 if __name__ == "__main__":

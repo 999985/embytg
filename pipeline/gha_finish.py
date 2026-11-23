@@ -104,6 +104,14 @@ def run(cmd, data=None, timeout=1800):
     return p
 
 
+def _last_line(p):
+    """取子进程输出最后一条非空行（写进 claim.error 里，事后能看懂为什么失败）。"""
+    for line in reversed(((p.stdout or "") + (p.stderr or "")).splitlines()):
+        if line.strip():
+            return line.strip()[:200]
+    return ""
+
+
 def td_file_id(rel, force=True):
     nodes, paths = A.td_snapshot(force=force)
     return next((nid for nid, p in paths.items()
@@ -554,8 +562,14 @@ def align_claim_with_manifest(job, manifest, claim_path):
     return job
 
 
-def verify_actual_emby(job, width, height, timeout=180):
-    """Verify the exact indexed file reports the same dimensions as ffprobe."""
+def verify_actual_emby(job, width, height, timeout=180, allow_missing=False):
+    """Verify the exact indexed file reports the same dimensions as ffprobe.
+
+    allow_missing=True（2026-11-24）：文件已登记、NFO 已写，只是 Emby 还没把它列出来时，
+    返回 None 而不是抛错 —— 这类可见性延迟由 reconcile 每 15 分钟 ScanPath 补齐，
+    不该把已落地的集判成失败（那会让 runner 重下同一集，白烧源站配额）。
+    注意：**Emby 已列出但分辨率不符**仍然抛错，那是画质标签错了，必须拦住。
+    """
     target = target_abs(job["target_rel"])
     deadline = time.time() + timeout
     last = None
@@ -576,6 +590,10 @@ def verify_actual_emby(job, width, height, timeout=180):
             refresh_episode(job)
             refreshed = True
         time.sleep(10)
+    if allow_missing and last is None:
+        print("  ⚠ Emby 尚未枚举该文件（不判失败；reconcile 15 分钟内 ScanPath 补齐）",
+              file=sys.stderr)
+        return None
     raise RuntimeError("Emby 实测分辨率未收敛：want=%sx%s got=%s" % (
         width, height, last or "未收录"))
 
@@ -780,16 +798,25 @@ def main():
                      "--sample", "5", "--verify-file", job["name"],
                      "--strict-emby"], timeout=1800)
             nfo = os.path.splitext(target)[0] + ".nfo"
-            if r.returncode != 0 and not job.get("upgrade"):
-                raise RuntimeError("post_ingest 失败 rc=%d" % r.returncode)
+            # 2026-11-24：rc=3 是「本集文件/NFO 已就绪，Emby 枚举或 Series 级未收敛」。
+            # 这类失败 claim 自己修不好（要等 Emby 扫描/挂载缓存自愈），
+            # 判成本集失败只会让它被重新领取、重新下载 —— 白烧配额。
+            emby_pending = (r.returncode == P.PENDING_EXIT)
+            if r.returncode not in (0, P.PENDING_EXIT) and not job.get("upgrade"):
+                raise RuntimeError("post_ingest 失败 rc=%d；%s"
+                                   % (r.returncode, _last_line(r)))
             if not os.path.exists(nfo):
                 raise RuntimeError("NFO 仍不存在：%s" % nfo)
-            if r.returncode != 0:
+            if emby_pending:
+                print("  ⚠ post_ingest rc=3（本集文件/NFO 已就绪，Emby 尚未收敛）："
+                      "不判失败，交 reconcile 每 15 分钟补齐", file=sys.stderr)
+            elif r.returncode != 0:
                 print("  洗版首轮 post_ingest rc=%d；NFO 已生成，旧版改名后再复核"
                       % r.returncode, file=sys.stderr)
             verify_actual_emby(
                 job, int(manifest["actual_width"]),
-                int(manifest["actual_height"]), timeout=180)
+                int(manifest["actual_height"]), timeout=180,
+                allow_missing=emby_pending)
 
             dup_rel = (old_rel + ".dup") if job.get("pre_dup") else ""
             if job.get("upgrade"):
@@ -930,6 +957,7 @@ def main():
                 "ok": True, "lane": job.get("lane"), "job_id": job["job_id"],
                 "file_id": fid, "key": job["key"], "rel": rel, "stage": rs[0],
                 "nfo": nfo, "dup_rel": dup_rel,
+                "emby_pending": bool(emby_pending),
                 "queue_remaining": (queue_state or {}).get("remaining"),
                 "lane_done": LQ.is_done(job.get("lane")),
                 "size": sum(p["plain_size"] for p in td_parts(fid)),

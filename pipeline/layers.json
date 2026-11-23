@@ -60,6 +60,7 @@
   "reconcile.py",
   "rescan_libs.py",
   "resource_state.py",
+  "series_nfo_heal.py",
   "source_ingest_loop.sh",
   "source_pull.py",
   "src_guard.py",

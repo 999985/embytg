@@ -376,14 +376,19 @@ def recover(item):
                    "--tmdb", str(tmdb), "--wait-emby", "20", "--sample", "5",
                    "--verify-file", name, "--strict-emby"], timeout=1800)
         nfo = os.path.splitext(target)[0] + ".nfo"
-        if r.returncode != 0:
+        # 2026-11-24：rc=3 = 本集文件/NFO 已就绪，只差 Emby 枚举。绝不能因此回滚
+        # 刚写入的 teldrive 行（那会把好文件变回孤儿），交给 reconcile 补可见性。
+        _pending = (r.returncode == F.P.PENDING_EXIT)
+        if r.returncode not in (0, F.P.PENDING_EXIT):
             res.update(ok=False, stage="post_ingest", rc=r.returncode)
             return res
         if not os.path.exists(nfo):
             res.update(ok=False, stage="nfo", detail=nfo)
             return res
         F.verify_actual_emby(job, int(d["actual_width"]), int(d["actual_height"]),
-                             timeout=180)
+                             timeout=180, allow_missing=_pending)
+        if _pending:
+            res["emby_pending"] = True
         F.run([sys.executable, os.path.join(HERE, "resource_state.py"), "--scan"],
               timeout=1800)
         con = sqlite3.connect("file:%s?mode=ro" % A.TGDB, uri=True, timeout=30)
