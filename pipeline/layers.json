@@ -180,6 +180,11 @@
   "gha_run_now.py",
   "forward_import.py",
   "merge_parts_fix.py",
-  "movie_catalog_sync.py"
+  "movie_catalog_sync.py",
+  "make_bots3.py",
+  "provision_pending_bots.py",
+  "make_bots.py",
+  "make_bots2.py",
+  "prewarm.py"
  ]
 }

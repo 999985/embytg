@@ -881,6 +881,14 @@ def main():
                 write_journal(job, "complete", {
                     "new_file_id": fid, "dup_rel": dup_rel})
             log_landing(job)          # 归因：哪个 worker 落了哪一集
+            # 2026-11-24：落库后立刻把这集头部读进 teldrive 缓存（后台线程，不拖慢收尾）。
+            # 用户口径「起播要非常舒服」：冷读首字节 1.7~9s，缓存命中 0.009s。
+            try:
+                import threading as _th
+                import prewarm as _pw
+                _th.Thread(target=_pw.warm, args=(fid,), daemon=True).start()
+            except Exception:                              # noqa: BLE001
+                pass
             GS.record_source_success(job.get("source_label"))
             queue_state = None
             try:

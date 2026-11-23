@@ -850,6 +850,31 @@ def main():
     except Exception as e:                                          # noqa: BLE001
         line(False, "part 尺寸", str(e)[:60])
 
+    # 5.95) teldrive 频道容量与 bot 池（2026-11-24）
+    sec("5.95) teldrive 容量与 bot 池")
+    try:
+        import subprocess as _sp2
+        def _q2(sql):
+            r = _sp2.run(["docker", "exec", "teldrive-postgres", "psql", "-U", "teldrive",
+                          "-d", "teldrive", "-t", "-A", "-c", sql],
+                         capture_output=True, text=True, timeout=30)
+            return (r.stdout or "").strip()
+        _parts = int(_q2("select count(*) from file_parts;") or 0)
+        _max = int(_q2("select coalesce(max(cnt),0) from (select count(*) cnt "
+                       "from file_parts group by channel_id) x;") or 0)
+        _chans = int(_q2("select count(distinct channel_id) from file_parts;") or 0)
+        # channel-part-limit 默认 500000；到 80% 提醒准备新频道
+        _lim = 500000
+        _pct = (_max / _lim) * 100 if _lim else 0
+        line(_pct < 80, "频道分片水位",
+             "%d 片 / 单频道最高 %d（%.0f%%，%d 个频道）" % (_parts, _max, _pct, _chans))
+        _on = int(_q2("select count(*) from bots where enabled;") or 0)
+        _all = int(_q2("select count(*) from bots;") or 0)
+        line(_all == 0 or _on >= max(1, int(_all * 0.6)), "下载 bot",
+             "%d/%d 已启用" % (_on, _all))
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "teldrive 容量", str(e)[:60])
+
     # 6) 源服
     sec("6) 源服可用性")
     try:
