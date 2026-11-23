@@ -14,6 +14,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import sqlite3
 import time
 
@@ -322,30 +323,116 @@ def read_claim(lane):
     return active_claim(claim_path(lane))
 
 
+_JOB_ALIASES = {
+    "tmdb": ("tmdb", "tmdb_id", "tmdbid", "tmdbid"),
+    "series": ("series", "series_name", "name", "title"),
+    "season": ("season", "s"),
+    "ep": ("ep", "episode", "e"),
+    "target_rel": ("target_rel", "target", "rel", "path"),
+    "filename": ("filename", "file", "basename"),
+    "folders": ("folders", "folder", "dir"),
+    "year": ("year",),
+    "url": ("url", "src", "source_url", "download_url"),
+    "video_id": ("video_id", "vid", "show_id"),
+    "lib": ("lib", "library", "lib_name"),
+    "source_label": ("source_label", "source", "src_label"),
+}
+_SE2 = re.compile(r"[Ss](\d{1,2})\s*[Ee](\d{1,4})")
+
+
+def norm_job(j):
+    """把三套队列 schema 归一成一套字段（2026-11-23）。
+
+    现状是三份「待办」用三种结构表达同一件事，必然出错：
+        fill 队列   {tmdb, series, missing[]}
+        new  队列   {tmdb, video_id, lib, target_quality}
+        目录同步    {tmdb, series, year, source}
+    GHA 那次 ``no_candidate`` 就是生产者与消费者字段名不一致导致的 ——
+    补进来的目录条目缺 lane 期望的 video_id/url。
+
+    这里做一层归一：任何生产者只要语义对，字段叫什么都行。
+    """
+    if not isinstance(j, dict):
+        return j
+    out = dict(j)
+    for canon, alts in _JOB_ALIASES.items():
+        if out.get(canon) in (None, "", [], {}):
+            for a in alts:
+                v = j.get(a)
+                if v not in (None, "", [], {}):
+                    out[canon] = v
+                    break
+    # 季集从名字里补（new 队列只有 series 名，没有 season/ep）
+    for field in ("series", "filename", "target_rel"):
+        v = out.get(field)
+        if isinstance(v, str):
+            m = _SE2.search(v)
+            if m:
+                if out.get("season") in (None, "", 0):
+                    out["season"] = int(m.group(1))
+                if out.get("ep") in (None, "", 0):
+                    out["ep"] = int(m.group(2))
+                break
+    return out
+
+
 def read_claims(include_legacy=True):
-    """返回所有活跃 claim（多 worker 并行时会有多个文件）。
+    """返回所有活跃 claim —— **以 tg.db.job_claim 为唯一真源**。
 
     2026-11-20：原来按 LANES 逐个 read_claim(lane)，只认 <lane>.json，
-    改成 cap 文件后一个新文件都看不到 —— 这里必须 glob 全部。
+    改成 cap 文件后一个新文件都看不到 —— 改为 glob 全部。
+
+    2026-11-23（架构修正）：此前「容量判定读 .gha_claims/*.json、互斥判定读
+    job_claim」两套状态并存。两边不一致时，删一边另一边仍生效 —— 本会话已踩：
+    删了 DB 行容量没释放，因为文件还在。现在反过来：
+      · DB 决定「有没有这条 claim」（能不能占容量）
+      · 文件只提供可读元数据（series / source_label / run_id），
+        用 worker + 时间戳 ±180s 与 DB 行配对
+      · 配不上的文件直接忽略，不再虚占产能
     """
     import glob as _glob
-    out = []
-    seen = set()
+    # 先收集文件里的可读元数据
+    files = []
     for path in sorted(_glob.glob(os.path.join(CLAIM_DIR, "*.json"))):
         d = active_claim(path)
         if not d:
             continue
-        lane = os.path.basename(path).split(".")[0]
-        key = (lane, d.get("job_id") or d.get("run_id") or id(d))
-        if key not in seen:
-            out.append(d)
-            seen.add(key)
-    if include_legacy:
-        d = active_claim(LEGACY_CLAIM)
-        if d:
-            key = ("legacy", d.get("job_id") or d.get("run_id") or id(d))
-            if key not in seen:
-                out.append(d)
+        d.setdefault("lane", os.path.basename(path).split(".")[0])
+        files.append(d)
+
+    rows = []
+    try:
+        con = _claim_db()
+        rows = con.execute(
+            "select key, worker, ts, ttl from job_claim where ts+ttl>=?",
+            (int(time.time()),)).fetchall()
+    except Exception:                                       # noqa: BLE001
+        rows = []
+
+    if not rows:
+        # DB 不可用（或真的空）时才退回文件，避免整体瞎掉
+        return files
+
+    out = []
+    used = set()
+    for key, worker, ts, ttl in rows:
+        best, best_dt = None, 1e9
+        for i, d in enumerate(files):
+            if i in used:
+                continue
+            dw = str(d.get("worker") or "")
+            if dw and worker and dw.split(":")[-1] != str(worker).split(":")[-1]:
+                continue
+            dt = abs(float(d.get("ts") or ts) - float(ts or 0))
+            if dt < best_dt and dt <= 180:
+                best, best_dt = i, dt
+        if best is not None:
+            used.add(best)
+            item = dict(files[best])
+        else:
+            item = {"lane": str(key).split("|")[0], "run_id": None}
+        item.update({"key": key, "worker": worker, "ts": ts, "ttl": ttl})
+        out.append(item)
     return out
 
 
@@ -655,8 +742,14 @@ def _eff_cap_of(rec, limits, now):
     if per is not None:
         per = int(per)
         if per == 0:
-            # 「不限」= 不设礼貌上限，但仍受失败率约束
-            return 10 ** 9 if pen >= 1.0 else int(400 * pen)
+            # 「不限」= 不设礼貌上限，但仍受失败率约束（E104）。
+            # 2026-11-21 回归：原来这里直接 return 1e9，把 pen 整个跳过 ——
+            # `test_unlimited_cap_still_penalised_when_failing` 当场变红。
+            # 语义只能是：**近期零失败**（pen=1.0）才真正不限；
+            # 有下载失败证据的源退回「默认日额度 × 惩罚」，用有限额度约束它。
+            if pen >= 1.0:
+                return 10 ** 9
+            return max(1, int(int(limits["daily"]) * pen))
         if per > 0:
             return max(1, int(per * pen)) if pen < 1.0 else per
     return min(400, int(int(limits["daily"]) * pen
@@ -719,10 +812,19 @@ def eligible_sources(labels, leased=None, load=None):
             # `emby.bangumi.ca` / `ct.cdn.bgp.yt` 无限制），对它们套 300/400
             # 的礼貌值纯属浪费。声明方式：`.gha_src_budget.json` 的
             # sources[label].daily_cap。三档语义见 `_eff_cap_of()`。
-            eff_cap = _eff_cap_of(rec, limits, now)
-            if int(rec.get("day") or 0) >= eff_cap:
-                continue
-            if len(rec["events"]) >= int(limits["burst_20m"]):
+            # 2026-11-21 用户口径：**源站不设量子上限**，只要「不频繁请求」。
+            # 原来的 300/400 日上限 + 20 分钟 burst 上限，会把整天配额用完后
+            # 让所有 lane（含 GHA）一律 source_budget 空转。
+            # 现在：日上限只作为「人工显式配置」生效（sources[label].daily_cap），
+            # 未配置即不限；burst 检查放宽到同样的语义。
+            _explicit_cap = ((d.get("sources") or {}).get(label) or {}).get("daily_cap")
+            # daily_cap=0 的语义是「不限」（见 `_eff_cap_of` 三档表），
+            # 不能被当成「上限 0」直接判死 —— 那会让显式放开的源一个请求都发不出去。
+            if _explicit_cap is not None and int(_explicit_cap) > 0:
+                if int(rec.get("day") or 0) >= int(_explicit_cap):
+                    continue
+            _burst = int(limits.get("burst_20m") or 0)
+            if _burst and _burst < 100000 and len(rec["events"]) >= _burst:
                 continue
             # 软租约：被占用的源额外增加排序权重，但不禁用
             busy = (1 if label in leased else 0) + int(load.get(label) or 0)
@@ -965,7 +1067,11 @@ EP_FAIL_SLOW_BASE_MIN = float(os.environ.get("EP_FAIL_SLOW_BASE_MIN") or 60.0)
 EP_FAIL_SLOW_HARD = int(os.environ.get("EP_FAIL_SLOW_HARD") or 6)
 _EP_SLOW_KEYS = ("too_slow", "slow_download", "download_slow")
 _EP_SRC_KEYS = ("source", "quality", "bad_source", "no_valid_source")
-_EP_OURS_KEYS = ("upload", "manifest", "resume_scan", "claim", "slot", "session", "tg_", "emby")
+# 2026-11-21：sources_unavailable = 源站暂时不可用（429/超时/证书/连接），
+# 不是「源站没有这一集」。必须走分钟级短退避，否则一次 429 就把整集冻 6 小时，
+# 队列看起来「没活」，实际是我们在自己锁自己。
+_EP_OURS_KEYS = ("upload", "manifest", "resume_scan", "claim", "slot", "session", "tg_",
+                 "emby", "sources_unavailable")
 
 
 def ep_fail_class(reason):
@@ -981,6 +1087,10 @@ def ep_fail_class(reason):
     未知原因一律按 `src` 处理：宁可多等，也不要在原因不明时进入分钟级热循环。
     """
     r = str(reason or "").strip().lower()
+    # 「源站暂时不可用」必须最先判：它同时含 "source"，会被 _EP_SRC_KEYS 抢先
+    # 归到长阶梯（实测就是这样，改完仍是 src）。显式前置。
+    if r.startswith("sources_unavailable"):
+        return "ours"
     if any(k in r for k in _EP_SLOW_KEYS):
         return "slow"
     if r.startswith(_EP_SRC_KEYS) or any(k in r for k in _EP_SRC_KEYS):
