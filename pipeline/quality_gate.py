@@ -57,9 +57,20 @@ import time
 sys.path.insert(0, "/opt/embytg/pipeline")
 
 # ── 阈值（两条线，务必不要混用）────────────────────────────────────────────
+# 2026-11-23：准入线做成环境变量可覆盖 —— 源池质量是外生的，改线不该改代码。
+#   QG_ADMIT_2160=4.0  QG_ADMIT_1080=2.0  （实测源池 4K 候选 p50=3.26 / p90=3.76，
+#   4.0 在当前源池几乎不可达，调低只需改这个变量，不用动 gha_next3）
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 STOCK_MIN_MBPS = {"2160p": 2.0, "1080p": 0.8, "720p": 0.4}   # 低于此值 = 该洗
 STOCK_FLOOR_DEFAULT = 0.6
-ADMIT_MIN_MBPS = {"2160p": 4.0, "1080p": 2.0}                 # 达到此值 = 可交付
+ADMIT_MIN_MBPS = {"2160p": _env_float("QG_ADMIT_2160", 4.0),
+                  "1080p": _env_float("QG_ADMIT_1080", 2.0)}   # 达到此值 = 可交付
 FLOOR_MBPS = 2.0                                              # 假 4K 一票否决线
 
 RANK = {"2160p": 4, "1440p": 3, "1080p": 2, "720p": 1, "sd": 0}

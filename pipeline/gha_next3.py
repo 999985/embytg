@@ -969,9 +969,16 @@ def valid_candidates(cands, min_bytes, max_bytes, item=None):
             c["qg_admit"] = bool(admit.get("ok"))
             c["qg_stock_ok"] = not stock.get("ok")      # stock.ok=True 表示"该洗"= 不达标
             if admit.get("reason") == "fake_4k":
+                # 2026-11-23：**不能在这里丢**。原先直接 continue，导致「整部剧只有假4K」
+                # 的条目在 fill/new 里变成 no_candidate → 每轮重扫（实测 2322 次拦截、
+                # 56 部剧 × 90 轮）。规格是「假4K 不用于首收/洗版」，不是「连兜底都不许」——
+                # 兜底条款允许「收入当前最高码率版本防空集」。所以保留候选、排到最后、
+                # 只在没有更好选择时被选中，并在兜底账本标注 reason=fake_4k。
+                c["qg_fake4k"] = True
                 reasons.append("%s:fake_4k(%sMbps)" % (c["st"].label, admit.get("mbps")))
                 QG.log_reject("candidate", (c.get("episode") or {}).get("Name", ""),
                               c.get("size"), 0, admit.get("tier"), admit.get("mbps"), "fake_4k")
+                out.append(c)
                 continue
         except Exception as e:                          # noqa: BLE001
             # 闸门自身出错不许卡死选源：退化成"未过线"，仍可兜底
@@ -979,7 +986,8 @@ def valid_candidates(cands, min_bytes, max_bytes, item=None):
             c["qg_admit"] = False
             c["qg_stock_ok"] = True
         out.append(c)
-    out.sort(key=lambda c: (bool(c.get("qg_admit")), (c.get("qg") or {}).get("rank", 0),
+    out.sort(key=lambda c: (bool(c.get("qg_admit")), not c.get("qg_fake4k"),
+                            (c.get("qg") or {}).get("rank", 0),
                             c["quality"]["score"]), reverse=True)
     return out, reasons
 
@@ -1938,6 +1946,17 @@ def try_new(item, available_labels, leased, min_bytes, max_bytes, run_id,
             # 源站只列了部分集、其余全是已入库的重复：给短冷却等源站补集，
             # 否则它会每 5 分钟把同样 N 条 duplicate 重写一遍。
             mark_new_done(item["video_id"], days=0.5, reason="series_partial_done")
+        elif why == "no_candidate":
+            # 2026-11-23：**no_candidate 从来没落过冷却**，游标每轮转回来就重扫一次源站。
+            # 实测 200 个 work 目录里，同一部剧 4 天出现 88-92 次（死期将至 / 蘑菇狗 /
+            # 地面师 …，≈22 次/天/剧）。这些不是"暂时没扫到"，是"源站列了集但全被
+            # dedupe/尺寸/画质挡掉"，下一轮不会有不同结果。
+            # 冷却取 3 小时（可环境变量覆盖）：够长能省掉重复探测，够短不耽误日更剧。
+            try:
+                _h = float(os.environ.get("NO_CANDIDATE_COOLDOWN_H", "3"))
+            except Exception:                              # noqa: BLE001
+                _h = 3.0
+            mark_new_done(item["video_id"], days=_h / 24.0, reason="no_candidate")
         elif why in ("no_tmdb", "bad_tmdb"):
             # 2026-11-14：3 天 → 30 天。源站没给 tmdb 的条目**不会自己变好**，
             # 而实测一轮 30 次尝试里有 16 次花在这类条目上（排序后它们被顶到最前）。
