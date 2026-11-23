@@ -638,6 +638,12 @@ for attempt in 1 2; do
 done
 # E182：把上传结果记进台账（断流闸门的唯一输入）。成功/失败都要记，
 # 否则闸门只看得到失败、看不到恢复，会一直按着不放。
+if [ "$UPLOAD_OK" != "1" ]; then
+  # 2026-11-23：失败必须留一条**带原因**的日志行。原来只有 "attempt N failed rc=X"，
+  # 事后查日志得翻 upload.log 才知道是超时、额度还是分片全丢。日检只看这一行。
+  _last_err="$(grep -iE "error|failed|timeout|FloodWait|limit" "$WORK/upload.log" 2>/dev/null | tail -1 | cut -c1-140)"
+  log "UPLOAD_FAILED run=$RUN_KEY rc=${UPLOAD_RC:-?} reason=${_last_err:-unknown}"
+fi
 if [ "$UPLOAD_OK" = "1" ]; then
   "$SYSPY" "$PIPELINE_DIR/upload_health.py" --record ok --rc 0 --bytes "$UP_BYTES" \
     --claim "$RUN_KEY" --lane "${ACTIVE_LANE:-$MODE}" --err="" \
