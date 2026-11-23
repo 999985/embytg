@@ -832,6 +832,24 @@ def main():
             left = 0
             line(False, "预算", str(e)[:60])
 
+    # 5.9) teldrive part 完整性（2026-11-24 升级后新增）
+    # plain_size 缺失会让 teldrive 的偏移计算错位 → 播放到某个位置就断。
+    # 2.0.14 提供了 backfill-part-sizes 命令，这里只做体检，不自动改数据。
+    sec("5.9) teldrive 分片完整性")
+    try:
+        import subprocess as _sp
+        _q = ("select count(*) from file_parts where plain_size is null or plain_size=0;")
+        _r = _sp.run(["docker", "exec", "teldrive-postgres", "psql", "-U", "teldrive",
+                      "-d", "teldrive", "-t", "-A", "-c", _q],
+                     capture_output=True, text=True, timeout=30)
+        _bad = int((_r.stdout or "0").strip() or 0)
+        if _bad:
+            line(False, "part 尺寸缺失", "%d 条（跑 teldrive backfill-part-sizes）" % _bad)
+        else:
+            line(True, "part 尺寸", "全部完整")
+    except Exception as e:                                          # noqa: BLE001
+        line(False, "part 尺寸", str(e)[:60])
+
     # 6) 源服
     sec("6) 源服可用性")
     try:
