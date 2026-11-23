@@ -70,6 +70,20 @@ MEDIA_DIR="$BASE/media.slot$SLOT"
 # 2026-11-16（E157）：上传失败后的源文件缓存（硬链接复用，见下方 KEEP_HIT/KEEP_SAVE）
 KEEP_DIR="$BASE/_keep"
 RUN_KEY=""
+# 2026-11-23：**只租不放会让号被锁死。** gha_state 的 slot 租约原本只有
+# TTL（3h）或孤儿判定才回收 —— 3 次上传之后三个号全占满，之后每次领单都报
+# no_session（近 2 小时 37 次，是最大的错误源）。退出时统一释放。
+RUN_KEYS=()
+release_leases() {
+  local k
+  for k in "${RUN_KEYS[@]:-}"; do
+    [ -n "$k" ] || continue
+    ssh_o "cd /opt/embytg/pipeline && $SYSPY -c \"import gha_state as G; G.abandon_run('$k')\"" >/dev/null 2>&1 || true
+    rm -f "$BASE/run/$k.hb" 2>/dev/null || true
+  kill "${RUN_HB_PID:-0}" 2>/dev/null || true
+  done
+}
+trap release_leases EXIT
 WORK=""
 JOB=""
 ACTIVE_LANE=""
@@ -227,6 +241,7 @@ if [ "$SLOT" = "1" ]; then
       exit 0
     fi
     RUN_KEY="$CLAIM_RUN"
+    RUN_KEYS+=("$RUN_KEY")
     if ssh_o "test -f /opt/embytg/pipeline/.gha_paused"; then
       log "PAUSED; failed claim kept: $CLAIM_RUN"
       exit 0
@@ -353,6 +368,11 @@ BUDGET_PAUSE=0
 BUDGET_WAIT=600
 for L in $LANES_ORDER; do
   RUN_KEY="$(date -u +%Y%m%d_%H%M%S)-slot${SLOT}-${L}-$(openssl rand -hex 3)"
+  RUN_KEYS+=("$RUN_KEY")
+  # 心跳：上传进程 argv 里没有 run_id，判活只能靠它（gha_state._hb_fresh）
+  mkdir -p "$BASE/run"
+  ( while :; do date +%s >"$BASE/run/$RUN_KEY.hb" 2>/dev/null || exit 0; sleep 30; done ) &
+  RUN_HB_PID=$!
   WORK="$BASE/work/$RUN_KEY"
   JOB="$WORK/job.json"
   mkdir -p "$WORK"

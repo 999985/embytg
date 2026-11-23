@@ -142,7 +142,11 @@ def audit(items=None):
     for a, b in dups:
         print("   DUP %s  <->  %s" % (a[:60], b[:60]))
     # Series/Episode 挂载
-    orphan = [x for x in eps if not x.get("ParentIndexNumber") or not x.get("IndexNumber")]
+    # Season 00（花絮/超前营业）在 Emby 里 ParentIndexNumber 就是 0 —— 旧判据用
+    # `not x.get(...)` 把 0 当成缺失，实测 101 条全部是综艺 S00 特辑，属**假 FAIL**
+    # （2026-11-23 周度体检：按库逐条查 SeasonNumber/EpisodeNumber 缺失 = 0）。
+    orphan = [x for x in eps
+              if x.get("ParentIndexNumber") is None or x.get("IndexNumber") is None]
     print("# 挂载复核: Episode 缺季/集号 %d 条" % len(orphan))
     return bad
 

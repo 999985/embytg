@@ -1196,6 +1196,9 @@ def _ep_fail_load():
 # 这是 TG 侧的硬约束，靠"算最小占用"绕不过去。
 SLOT_DIR = os.path.join(HERE, ".gha_slots")
 SLOT_TTL = 3 * 3600          # 上传最长 2h + 余量；超时视为进程已死，可被回收
+# 2026-11-23：-- 但 TTL 只是兜底，不能当成"用完就自动放"的机制。
+# 现在每个 run 结束都会 release_slot_by_run()，TTL 保留 3h 仅防进程被 kill -9
+# 时把号永久锁死（实测：只租不放 → 3 次后全 no_session）。
 
 
 def _slot_path(n):
@@ -1280,6 +1283,26 @@ def _orphan_evidence(run_id):
     return True
 
 
+HB_DIR = "/opt/embytg-runner/run"
+
+
+def _hb_fresh(run_id, max_age=180):
+    """心跳文件判活：run_one.sh 每 30 秒写一次，最可靠（2026-11-23）。
+
+    实测问题：上传进程的 argv 是 `gha_upload.py --job <json>`，里面**没有**
+    run_id —— 于是按 argv 匹配永远判死，孤儿判定形同虚设：租约要么永久
+    占着（no_session 刷屏），要么被误判后提前释放（同一集被两台机器重复下）。
+    心跳文件是唯一和「这一轮到底活着没有」严格对应的信号。
+    """
+    try:
+        pth = os.path.join(HB_DIR, "%s.hb" % run_id)
+        if not os.path.exists(pth):
+            return False
+        return (time.time() - os.path.getmtime(pth)) <= max_age
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 def _run_is_alive(run_id):
     """run_id 对应的上传进程还在不在本机。
 
@@ -1297,6 +1320,9 @@ def _run_is_alive(run_id):
     rid = str(run_id or "")
     if not rid:
         return True
+    # 心跳优先（2026-11-23）：上传进程 argv 里根本没有 run_id，argv 匹配必判死。
+    if os.path.exists(os.path.join(HB_DIR, "%s.hb" % rid)):
+        return _hb_fresh(rid)
     # 2026-11-20：`<名字>-<pid>` 形式的 run_id（emos-3416254 / tgsrc-123）直接按 pid 判活。
     # 这类进程的 argv 里没有 run_id 字样（它是 emos_import.py --series ...），
     # 只靠下面的 argv 匹配永远查不到 → 被判孤儿 → 别的 lane 抢走同一个 TG 账号。
@@ -1387,6 +1413,77 @@ def _reserve_active(n):
         return time.time() < float(d.get("ts") or 0) + float(d.get("ttl") or 0)
     except Exception:                                  # noqa: BLE001
         return False
+
+
+def release_slot(n, run_id=None):
+    """释放第 n 个 session 租约（2026-11-23）。
+
+    原来**只租不放**：只有 TTL 到期（3 小时）或孤儿判定才会回收。
+    实测后果：每次上传都占一个号，3 次之后三个号全被锁住 →
+    runner 连续报 `no_session`（今天近 2 小时 37 次，是最大错误源）。
+    """
+    pth = _slot_path(n)
+    try:
+        if not os.path.exists(pth):
+            return False
+        with open(pth, encoding="utf-8") as f:
+            d = json.load(f) or {}
+        if run_id and str(d.get("run_id")) != str(run_id):
+            return False
+        os.unlink(pth)
+        return True
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def abandon_run(run_id):
+    """一个 run 结束时，把它持有的**所有**租约一次性放掉（2026-11-23）。
+
+    今天暴露的真实故障：session 租约和条目 claim 都只租不放。
+      · 3 个号被锁满 → 所有 lane 报 no_session（2 小时 37 次）
+      · 条目 claim 残留 → 同一集被长期占着，别的机器领不到
+    租约是「过程独占」，不是「结果记录」；进程退出时必须归还，
+    否则 TTL（3h/4h）会把它变成长期占用。
+    """
+    freed_slots = release_slot_by_run(run_id)
+    freed_items = 0
+    try:
+        hit = find_claim(str(run_id))
+        path, job = (hit if isinstance(hit, tuple) else (None, hit))
+        if job:
+            key = job.get("key") or item_key(job)
+            worker = job.get("worker") or worker_id(run_id)
+            if release_item(key, worker):
+                freed_items += 1
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:                                       # noqa: BLE001
+        pass
+    return {"slots": freed_slots, "items": freed_items}
+
+
+def release_slot_by_run(run_id):
+    """按 run_id 释放任意 slot 的租约（不知道落在哪个号时用）。"""
+    n = 0
+    try:
+        for name in os.listdir(SLOT_DIR):
+            if not name.startswith("slot") or not name.endswith(".lock"):
+                continue
+            pth = os.path.join(SLOT_DIR, name)
+            try:
+                with open(pth, encoding="utf-8") as f:
+                    d = json.load(f) or {}
+            except Exception:                               # noqa: BLE001
+                continue
+            if str(d.get("run_id")) == str(run_id):
+                try:
+                    os.unlink(pth)
+                    n += 1
+                except Exception:                           # noqa: BLE001
+                    pass
+    except Exception:                                       # noqa: BLE001
+        pass
+    return n
 
 
 def slot_lease(n, run_id, ttl=SLOT_TTL):

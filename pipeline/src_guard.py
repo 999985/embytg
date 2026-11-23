@@ -72,6 +72,17 @@ MAX_PER_HOST = int(os.environ.get("EMBYTG_SRC_MAX_PER_HOST") or 400)
 COOLDOWN_FAIL = 600         # 熔断 10 分钟
 COOLDOWN_RATE = 1800        # 429（限流/封禁前兆）熔断 30 分钟
 MAX_CONSEC_FAIL = 2
+# 2026-11-23（自省）：源排序必须基于**可观测的历史**，不是每个进程从零开始的内存。
+# 事故：yuntv 自 11-17 起 742 次请求只有 10 次成功（1.3%，其余是连接失败/429），
+# 但每个 runner 都是新建 Guard，`score` 的 ok/fails 从 0/0 起算 0.5 —— 死源和
+# 健康源在排序里完全等价，于是它每 10 分钟被重新选中一次，6 天烧掉 ~500 次配额。
+HIST_LINES = int(os.getenv("EMBYTG_SRC_HIST_LINES", "20000"))   # 历史上限（行）
+HIST_TAIL_BYTES = int(os.getenv("EMBYTG_SRC_HIST_BYTES", str(4 * 1024 * 1024)))
+HIST_MIN_N = int(os.getenv("EMBYTG_SRC_HIST_MIN_N", "30"))      # 样本 >= 30 才用历史成功率
+# 成功率只看**最近**这个窗口：10 天的平均值会把「上周还好、这周全挂」的源判成健康。
+# 实测 yuntv 20 天窗口 19.6%（历史上有过好日子）、最近 48h **0/62**。
+HIST_RECENT_H = float(os.getenv("EMBYTG_SRC_HIST_RECENT_H", "48"))
+DEAD_SCORE = float(os.getenv("EMBYTG_SRC_DEAD_SCORE", "0.05"))  # <5% 视为死源，排到最后
 # 2026-11-21：熔断状态原先只活在 Guard 实例里。每个 runner 进程都是新 Guard，
 # fails/cool_until 归零 → 「连续 2 次失败熔断」在跨进程场景下**等于不存在**。
 # 实测 7 天：yuntv 1451 次请求里 713 次 status=0 + 217 次 429（今天 46 次全部失败），
@@ -477,6 +488,9 @@ class HostState:
         self.ok = 0
         self.cool_until = 0.0
         self.avg_ms = 0.0          # 自审改进#2：按历史延迟排序，慢源后置
+        # 2026-11-23：历史成功率（来自审计日志，跨进程）。样本不足时回落到会话内统计。
+        self.hist_n = 0
+        self.hist_ok = 0
 
     @property
     def usable(self):
@@ -484,6 +498,14 @@ class HostState:
 
     @property
     def score(self):
+        """成功率：优先用**历史**（>= HIST_MIN_N 样本），否则用本会话。
+
+        为什么不能用本会话：每个 runner 周期都是新进程，ok/fails 从 0/0 起算，
+        所有源的 score 都是 0.5 —— 排序退化成「按延迟/按请求数」，死了 6 天的源
+        与健康源等价。历史来自 logs/source_requests.log，跨进程、跨重启都一致。
+        """
+        if self.hist_n >= HIST_MIN_N:
+            return self.hist_ok / float(self.hist_n)
         tot = self.ok + self.fails
         return (self.ok / tot) if tot else 0.5
 
@@ -537,23 +559,61 @@ class Guard:
                 st.select_host(good[0])
 
     def _seed_latency(self):
-        """从审计日志取近 2000 条的每源平均耗时，作为调度权重（避免每次都先撞慢源）"""
-        import collections
-        agg = collections.defaultdict(list)
+        """从审计日志取每源历史（平均耗时 + 成功率），作为调度权重。
+
+        2026-11-23：原来只读最后 2000 行算 avg_ms，成功率仍用会话内存（=0.5），
+        于是「1.3% 成功率的死源」和「99.8% 的健康源」在 order() 里完全等价。
+        现在同一趟把 ok/n 也算出来。读取用**tail 定量字节**（HIST_TAIL_BYTES），
+        不 readlines 整个文件 —— 审计日志会一直增长，O(文件大小) 的读法在百万行时
+        会拖慢每一次 Guard 初始化；O(窗口) 才与规模无关。
+        """
+        agg = defaultdict(lambda: [0, 0, 0.0])      # label -> [n, ok, sum_ms]
+        # 时间戳是定宽字符串（%F %T），直接做**字典序**比较即可，不 strptime（20000 行
+        # strptime 要 60ms+，而定宽字符串比较是免费的）。只统计最近 HIST_RECENT_H 小时。
+        cutoff = time.strftime("%F %T", time.localtime(time.time() - HIST_RECENT_H * 3600))
         try:
-            with open(LOG, encoding="utf-8") as f:
-                for line in f.readlines()[-2000:]:
-                    try:
-                        r = json.loads(line)
-                        if r.get("dur_ms"):
-                            agg[r.get("label")].append(r["dur_ms"])
-                    except Exception:                                  # noqa: BLE001
-                        pass
-        except Exception:                                          # noqa: BLE001
+            size = os.path.getsize(LOG)
+            with open(LOG, "rb") as f:
+                if size > HIST_TAIL_BYTES:
+                    f.seek(size - HIST_TAIL_BYTES)
+                    f.readline()                     # 丢掉被截断的半行
+                blob = f.read().decode("utf-8", "ignore")
+            lines = blob.splitlines()[-HIST_LINES:]
+        except Exception:                                      # noqa: BLE001
             return
-        for label, arr in agg.items():
-            if label in self.states and arr:
-                self.states[label].avg_ms = sum(arr) / len(arr)
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:                                  # noqa: BLE001
+                continue
+            label = r.get("label")
+            if label not in self.states:
+                continue
+            if str(r.get("ts") or "") < cutoff:      # 只认最近窗口，定宽字符串字典序
+                continue
+            slot = agg[label]
+            slot[0] += 1
+            try:
+                status = int(r.get("status") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            # status<=0 = 连应答都没有（连接失败/被墙）：这在配额上同样是白烧，
+            # 必须计成失败，否则「打不通的源」会拿到 100% 的假成功率。
+            if 200 <= status < 300:
+                slot[1] += 1
+            try:
+                if r.get("dur_ms"):
+                    slot[2] += float(r["dur_ms"])
+            except (TypeError, ValueError):
+                pass
+        for label, (n, ok, ms) in agg.items():
+            st = self.states[label]
+            st.hist_n = int(n)
+            st.hist_ok = int(ok)
+            if n:
+                st.avg_ms = float(ms) / n
 
     def _seed_health(self):
         """把别的进程记下的「这个源正在熔断」搬进本会话。
@@ -578,14 +638,23 @@ class Guard:
 
     # ---------- 调度 ----------
     def order(self):
-        """负载均衡：可用源按 (连续失败, -成功率, 本会话已请求数) 排序，轮转起点偏移"""
+        """负载均衡：可用源按 (连续失败, -历史成功率, 历史延迟, 本会话请求数) 排序。
+
+        2026-11-23：**死源不参与轮转起点偏移**。原来整个可用列表一起轮转，
+        8 个源里那个 1.3% 成功率的死源每个进程会被排到第一位 1/8 次 —— 等于每天
+        主动把配额喂给一个 6 天没成功的源。现在分两段：健康段轮转保公平，
+        死源段（score < DEAD_SCORE）追加在最后，只有健康源都用不了时才会碰它，
+        下一次任何一次成功都会把它拉回健康段（自愈不留人工）。
+        """
         usable = [s for s in self.states.values() if s.usable]
         usable.sort(key=lambda s: (s.fails, -s.score, s.avg_ms, s.count))
-        if usable:
-            k = self._rr % len(usable)
-            usable = usable[k:] + usable[:k]
+        alive = [s for s in usable if s.score >= DEAD_SCORE]
+        dead = [s for s in usable if s.score < DEAD_SCORE]
+        if alive:
+            k = self._rr % len(alive)
+            alive = alive[k:] + alive[:k]
             self._rr += 1
-        return usable
+        return alive + dead
 
     # ---------- 请求 ----------
     def get(self, st, path, search=False, timeout=25):
@@ -777,14 +846,28 @@ def main():
         agg = defaultdict(lambda: [0, 0])
         today = time.strftime("%F")
         for line in open(LOG, encoding="utf-8"):
-            r = json.loads(line)
-            if not r["ts"].startswith(today):
+            try:
+                r = json.loads(line)
+            except Exception:                                  # noqa: BLE001
+                continue
+            if not str(r.get("ts", "")).startswith(today):
                 continue
             agg[r["label"]][0] += 1
-            agg[r["label"]][1] += 1 if 200 <= r["status"] < 300 else 0
+            agg[r["label"]][1] += 1 if 200 <= int(r.get("status") or 0) < 300 else 0
         print("今日各源请求：")
         for k, (n, ok) in sorted(agg.items(), key=lambda x: -x[1][0]):
             print("  %-24s %3d 次  成功率 %.0f%%" % (k, n, ok * 100.0 / n))
+        # 2026-11-23：调度实际用的权重（历史窗口）+ 死源判定必须能一眼看到，
+        # 否则「谁被排到最后」只能靠读代码猜。
+        g = Guard(verbose=False)
+        print("\n调度权重（审计窗口 %d 行 / 最近 %.0fh，样本 >= %d 才生效）："
+              % (HIST_LINES, HIST_RECENT_H, HIST_MIN_N))
+        rows = sorted(g.states.values(), key=lambda s: -s.score)
+        for st in rows:
+            tag = "死源→排最后" if st.score < DEAD_SCORE else ""
+            print("  %-24s score=%.3f (n=%d) avg=%5.0fms %s"
+                  % (st.label, st.score, st.hist_n, st.avg_ms, tag))
+        print("\n本轮探测顺序：%s" % " → ".join(s.label for s in g.order()))
         now = time.time()
         cool = {k: v for k, v in _health_load().items()
                 if isinstance(v, dict) and float(v.get("cool_until") or 0) > now}
