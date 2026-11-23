@@ -276,6 +276,44 @@ def restore_dup(job):
     return "restored:%d" % len(moved)
 
 
+def drop_superseded_dup(job, dup_rel):
+    """洗版成功后删掉旧版字节 + 旧版 sidecar。
+
+    2026-11-23（E198）：改名成 .dup 只是「让 Emby 看不见」，不是「删掉」。
+    upgrade lane 原来只改名不删除，实测积累 14 个 .dup（19.6 GB TG 配额），
+    而且旧条目在 Emby 里要等下一次整库扫描才消失 —— 期间 Emby 集数 > 文件数，
+    lib_reconcile 常驻 converged=False（daily_ops 天天红）。
+
+    判据：新文件已在 Emby 里、旧路径已不在，才删。drop_old.py 自带
+    「同季同集还有更大文件」的安全闸，这里不绕过它；拒绝就留着，不影响入库。
+    """
+    if os.environ.get("EMBYTG_KEEP_DUP") == "1" or not dup_rel:
+        return ""
+    try:
+        r = run([sys.executable, os.path.join(HERE, "drop_old.py"),
+                 "--path", dup_rel], timeout=900)
+        if r.returncode != 0:
+            print("  ⚠ 旧版未删除 rc=%d（保留，不影响入库）：%s"
+                  % (r.returncode, dup_rel), file=sys.stderr)
+            return ""
+        # drop_old 只删视频本体，sidecar 后缀要自己收
+        dup_abs = target_abs(dup_rel)
+        stem = os.path.splitext(dup_abs)[0]
+        for suf in NS.SUFFIXES[1:]:
+            for cand in (stem + suf, dup_abs + suf):
+                try:
+                    if os.path.exists(cand):
+                        os.remove(cand)
+                except OSError:
+                    pass
+        write_journal(job, "old_dropped", {"dup_rel": dup_rel})
+        return dup_rel
+    except Exception as e:                                   # noqa: BLE001
+        print("  ⚠ 删旧版异常（保留，不影响入库）：%s" % str(e)[:120],
+              file=sys.stderr)
+        return ""
+
+
 def wait_td_path_gone(rel, timeout=180):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -713,6 +751,13 @@ def main():
                     timeout=1800)
             if r.returncode != 0:
                 raise RuntimeError("resource_state 失败 rc=%d" % r.returncode)
+            # 洗完就把旧版字节删掉（E198）：改名只是让 Emby 看不见，
+            # 不删会一直占 TG 配额，还让 Emby 集数 > 文件数（对账常驻 False）。
+            # 放在 resource_state --scan 之后：drop_old 的体积安全闸要读到新文件台账行。
+            if job.get("upgrade"):
+                drop_superseded_dup(job, dup_rel or
+                                    ((str(job.get("old_rel") or "") + ".dup")
+                                     if job.get("old_rel") else ""))
 
             con = sqlite3.connect("file:%s?mode=ro" % A.TGDB, uri=True, timeout=30)
             keyrow = con.execute("select k from state_key where k=?",

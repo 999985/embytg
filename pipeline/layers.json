@@ -66,6 +66,7 @@
   "stall_watch.py",
   "tdprobe.py",
   "tg_common.py",
+  "timer_audit.py",
   "upload_health.py"
  ],
  "rule": "prod=systemd/timer/run_one 可达；cron=Hermes cron 点名；tool=有 CLI 入口；legacy=无入口也无人调用",
