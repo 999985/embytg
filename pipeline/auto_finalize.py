@@ -758,7 +758,7 @@ def pack(snap, audit, checks):
                 checks["备份关键文档齐(无 docs/ 缺失)"] = False
                 log("  !! 关键文档缺失 %d 项：%s" % (len(_crit), ", ".join(_crit[:6])))
             else:
-                checks.setdefault("备份关键文档齐(无 docs/ 缺失)", True)
+                checks["备份关键文档齐(无 docs/ 缺失)"] = True
             mb = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
             mi = tarfile.TarInfo(os.path.join(name, "manifest.json"))
             mi.size = len(mb)

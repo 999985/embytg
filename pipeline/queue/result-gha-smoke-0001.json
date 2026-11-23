@@ -1,9 +1,0 @@
-{
- "run_id": "gha-smoke-0001",
- "ok": false,
- "reason": "invalid literal for int() with base 10: '4413117262,4302394874,4399400532'",
- "core": "smoke-test",
- "dry": false,
- "size": 2000000,
- "secs": 0.7
-}
