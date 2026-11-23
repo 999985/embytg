@@ -78,7 +78,14 @@ release_leases() {
   local k
   for k in "${RUN_KEYS[@]:-}"; do
     [ -n "$k" ] || continue
-    ssh_o "cd /opt/embytg/pipeline && $SYSPY -c \"import gha_state as G; G.abandon_run('$k')\"" >/dev/null 2>&1 || true
+    # 已经落地 manifest = 上传成功，只是登记/收尾失败 → **保留 claim** 交给下一轮
+    # FINISH 重试（PC 今天 7 次 ssh 超时都靠这条恢复）。此时只还 session 租约，
+    # 不释放条目 claim，否则同一集会被重新领走、重复上传一份。
+    if [ -n "${WORK:-}" ] && [ -f "$WORK/manifest.path" ]; then
+      ssh_o "cd /opt/embytg/pipeline && $SYSPY -c \"import gha_state as G; G.release_slot_by_run('$k')\"" >/dev/null 2>&1 || true
+    else
+      ssh_o "cd /opt/embytg/pipeline && $SYSPY -c \"import gha_state as G; G.abandon_run('$k')\"" >/dev/null 2>&1 || true
+    fi
     rm -f "$BASE/run/$k.hb" 2>/dev/null || true
   kill "${RUN_HB_PID:-0}" 2>/dev/null || true
   done
@@ -147,7 +154,8 @@ ssh_o() {
     return $?
   fi
   ssh -i "$ORACLE_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-      -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+      -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=12 \
+      -o ConnectionAttempts=3 -o TCPKeepAlive=yes \
       -p "$ORACLE_PORT" "$ORACLE_USER@$ORACLE_HOST" "$@"
 }
 cancel_claim() {
