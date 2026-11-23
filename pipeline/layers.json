@@ -177,6 +177,9 @@
   "web_lookup.py",
   "check_caps.py",
   "catalog_sync.py",
-  "gha_run_now.py"
+  "gha_run_now.py",
+  "forward_import.py",
+  "merge_parts_fix.py",
+  "movie_catalog_sync.py"
  ]
 }

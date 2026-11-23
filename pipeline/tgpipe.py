@@ -1348,6 +1348,7 @@ async def apply(items, state, dry=False, c=None, dst=None):
     for it in items:
         try:
             if too_low_quality(it):
+                it["err"] = "画质不达标(%s)" % it.get("qual")
                 print(f'  - 画质不达标跳过 {it.get("title")} m{it.get("msg")}'
                       f'（{it.get("qual")} 但码率过低）', flush=True)
                 continue
@@ -1355,6 +1356,7 @@ async def apply(items, state, dry=False, c=None, dst=None):
             parts = it.get("parts") or [it["msg"]]
             lib = it.get("lib") or ("其他片" if it["kind"] == "movie" else "国产剧")
         except Exception as e:
+            it["err"] = "脏条目: %s" % str(e)[:80]
             print(f'  ! 跳过脏条目 {it.get("ch")}/m{it.get("msg")}: {e}', file=sys.stderr, flush=True)
             continue
         if dry:
@@ -1365,6 +1367,16 @@ async def apply(items, state, dry=False, c=None, dst=None):
         # 单条容错：任何一条限流耗尽 / 源消息失效 / 登记异常只跳过该条，
         # 不中断 4 小时无人值守常驻循环（cursor 断点续传 + existing_index 保证不重不漏）
         try:
+            # 2026-11-24（用户口径，最终版）：
+            #   **频道只做「秒转」——转发即完成。不能秒转的，不如去源站下高质量。**
+            # 判据：parts > 1 = 多段独立封装。转发只能拿到碎片，登记成多 part 拼出的
+            # 是非法容器（播不出来、时长只读第一段）；修它必须下载+合并+重传，
+            # 那就不是秒转、也没有质量优势 → 一律跳过，缺口交给 fill/upgrade 走源站。
+            if len(parts) > 1:
+                it["err"] = "多段封装(%d段)，非秒转→跳过，走源站" % len(parts)
+                print(f'  - 跳过多段 {it.get("title")} m{it.get("msg")}（{len(parts)} 段，非秒转）',
+                      file=sys.stderr, flush=True)
+                continue
             if it["kind"] == "movie":
                 base_dir = ensure_folder(lib, MOVIES_DIR)
                 parent = base_dir if len(parts) == 1 else ensure_folder(folder, base_dir)
