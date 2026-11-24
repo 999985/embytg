@@ -27,6 +27,26 @@ LANES = ("new", "fill", "upgrade")
 # PC 不在线时本机仍会轮到 new（1/4 班次），P0 不会彻底停。
 SEQUENCE = tuple(os.getenv("EMBYTG_LANE_SEQUENCE", "fill,upgrade,fill,new").split(","))
 
+# 2026-11-25（E2xx）：**份额化轮转**。
+#
+# 事故形状：11-23 把 _order 改成「按欠活量排序」后，new 的库存是 3000 部、
+# fill 读的是一个错误台账（.nfo_gap.json 是「占位集名」台账，最后一版 11-19；
+# .gap_report.json 根本不存在），于是 new 的 pressure 永远最大 —— 四条 lane
+# 全部把 new 排第一，谁先领到谁干 new，fill/upgrade 24 小时 0 条产出
+# （lane_state: fill 45h、upgrade 61h 没有 last_success），3192 集补集队列空转。
+#
+# 排序只能决定「同一次尝试里先试谁」，决定不了份额：只要有活，第一条永远成功，
+# 后面的永远轮不到。份额必须显式写在调度里。
+# 口径（用户 11-23：重点是 new 和 fill，upgrade 降权）：new 55% / fill 40% / upgrade 5%。
+TARGET_WHEEL = ("new",) * 11 + ("fill",) * 8 + ("upgrade",) * 1
+
+PIPELINE = os.getenv("EMBYTG_PIPELINE", "/opt/embytg/pipeline")
+QUEUE_FILE = {
+    "new": ".gha_queue_new.json",
+    "fill": ".gha_queue_fill.json",
+    "upgrade": ".gha_queue_upgrade.json",
+}
+
 
 def _default():
     return {
@@ -79,82 +99,68 @@ def _save(data):
     os.replace(tmp, STATE)
 
 
-def _pressure():
-    """每条 lane 有多「欠」活。缺文件就退回 1，保证永远有 lane 可选。
+def _queue_len(lane):
+    """真实库存（条）：-1 = 文件读不到（未知，不当成 0）。"""
+    path = os.path.join(PIPELINE, QUEUE_FILE.get(lane, ""))
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+        items = d.get("items") if isinstance(d, dict) else d
+        return len(items or [])
+    except Exception:                                      # noqa: BLE001
+        return -1
 
-    2026-11-21：用户指出「按固定顺序轮转」等于把 worker 钉死在 lane 上——
-    某条 lane 没活就空转，某条堆几千集也只有一个 worker 啃。
-    改成按欠活量排序：谁欠得多谁先干。
+
+def _pressure():
+    """每条 lane 有多「欠」活 —— 唯一来源是 build_three_queues 产出的三个队列。
+
+    2026-11-25：原来 fill 读 .gap_report.json / .nfo_gap.json、upgrade 读
+    .lowq_library.json —— 三个都是别的脚本的副产品，两个 11-19 就停更、
+    一个从来没生成过。调度依据的台账必须就是领活用的台账，
+    否则「欠活量」是幻觉：new 永远第一，fill/upgrade 排到天荒地老。
+
+    权重：upgrade 要重下一整集（单位流量产出最低），压力折半；
+    new 每条相当于 0.3 集落库（一部剧会长出很多集），按 0.3 折算。
     """
-    pipe = os.getenv("EMBYTG_PIPELINE", "/opt/embytg/pipeline")
-    p = {}
-    # fill 的真实来源：.nfo_gap.json（缺口台账）；.gap_report.json 是另一脚本产物，可能不存在
-    p["fill"] = 0
-    for cand, getter in (((".gap_report.json"), lambda g: g.get("missing_total") or g.get("missing")),
-                         ((".nfo_gap.json"), lambda g: len(g.get("episodes") or g.get("items") or g) if isinstance(g, (dict, list)) else 0)):
-        try:
-            g = json.load(open(os.path.join(pipe, cand), encoding="utf-8"))
-            n = getter(g) if isinstance(g, dict) else len(g)
-            if isinstance(n, list):
-                n = len(n)
-            p["fill"] = max(p["fill"], int(n or 0))
-        except Exception:                                  # noqa: BLE001
-            continue
-    try:
-        lo = json.load(open(os.path.join(pipe, ".lowq_library.json"), encoding="utf-8"))
-        items = lo if isinstance(lo, list) else (lo.get("items") or lo.get("episodes") or [])
-        p["upgrade"] = int(len(items) * 0.5)      # 每集要重传，成本高，权重折半
-    except Exception:                                      # noqa: BLE001
-        p["upgrade"] = 0
-    # 2026-11-22：new 的真实库存 = .gha_queue_new.json（源站目录比对后的新剧）。
-    # 原来读 tg_state.json 的 queue，那是旧的手工清单，永远几百条，
-    # 于是 new 的压力算出来只有个位数，调度几乎不排 new。
-    # 实测 catalog_sync 一跑，源站有 7556 部不在库的剧 → 队列 9922 条。
-    p["new"] = 1
-    for fname, scale in ((".gha_queue_new.json", 0.3),):
-        try:
-            d = json.load(open(os.path.join(pipe, fname), encoding="utf-8"))
-            items = d.get("items") if isinstance(d, dict) else d
-            n = len(items or [])
-            if n:
-                p["new"] = max(1, int(n * scale))
-        except Exception:                                  # noqa: BLE001
-            continue
-    try:
-        st = json.load(open(os.path.join(pipe, "tg_state.json"), encoding="utf-8"))
-        q = st.get("queue") or st.get("pending") or []
-        if isinstance(q, list) and q:
-            p["new"] = max(p["new"], int(len(q) * 0.3))
-    except Exception:                                      # noqa: BLE001
-        pass
+    p = {"new": 1, "fill": 0, "upgrade": 0}
+    n = _queue_len("new")
+    if n > 0:
+        p["new"] = max(1, int(n * 0.3))
+    f = _queue_len("fill")
+    if f > 0:
+        p["fill"] = f
+    u = _queue_len("upgrade")
+    if u > 0:
+        p["upgrade"] = int(u * 0.5)
     return {k: max(0, v) for k, v in p.items()}
 
 
 def _order(data):
+    """返回本次尝试的 lane 顺序：**第一条是份额指定的主力 lane**。
+
+    排序决定不了份额（第一条永远成功、后面永远轮不到），所以主力 lane 由
+    rotation 计数器在 TARGET_WHEEL 上走；其余 lane 按欠活量兜底，
+    保证主力 lane 冷却/空队列时不会空转。
+    """
     active = [lane for lane in LANES if not data["lanes"][lane]["done"]]
     if not active:
         return ["new"]
     now = int(time.time())
     ready = [lane for lane in active
              if int(data["lanes"][lane].get("backoff_until") or 0) <= now]
-    # A lane that just returned no_job is not useful to scan again immediately.
-    # Keep all lanes visible, but put cooling lanes last; when every lane is
-    # cooling, try the one whose cooldown expires first.
     if not ready:
         return []
-    # 按欠活量排序（原来按 SEQUENCE 轮转，绑死了 worker）
-    #
-    # 2026-11-23（用户口径）：**重点先放在 new 和 fill**，upgrade 降权。
-    # upgrade 是「重下一整集」的活，单位流量产出最低；new/fill 是净增长。
-    # 这里给 upgrade 乘 0.05 —— 不是禁用它，而是让 new/fill 有活时先干它们，
-    # 只有当 new/fill 都冷却/空了，upgrade 才会浮上来。
-    _W = {"new": 1.0, "fill": 1.0, "upgrade": 0.05}
     pres = _pressure()
-    ready_sorted = sorted(
-        ready,
-        key=lambda l: pres.get(l, 0) * _W.get(l, 1.0),
-        reverse=True)
-    return ready_sorted
+    _W = {"new": 1.0, "fill": 1.0, "upgrade": 0.05}
+    wheel = TARGET_WHEEL
+    primary = wheel[int(data.get("rotation") or 0) % len(wheel)]
+    # 主力 lane 必须真的能领：未完成、未冷却、队列非空（-1=读不到，仍算可用）
+    if primary not in ready or _queue_len(primary) == 0:
+        primary = None
+    rest = sorted([lane for lane in ready if lane != primary],
+                  key=lambda l: pres.get(l, 0) * _W.get(l, 1.0),
+                  reverse=True)
+    return ([primary] if primary else []) + rest
 
 
 def _select_claim(path):
@@ -219,7 +225,10 @@ def main():
         print(" ".join(order))
         return 0
     if a.cmd == "advance":
-        data["rotation"] = (int(data.get("rotation") or 0) + 1) % len(SEQUENCE)
+        # 2026-11-25：按 TARGET_WHEEL 长度取模，不是按 SEQUENCE（4）——
+        # 按 4 取模时 rotation 永远落在 0..3，而 new 占 wheel 前 11 格，
+        # 于是主力 lane 恒为 new，份额化等于没做（实测 20 次全 new）。
+        data["rotation"] = (int(data.get("rotation") or 0) + 1) % len(TARGET_WHEEL)
         _save(data)
         return 0
     if a.cmd == "status":

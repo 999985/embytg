@@ -374,6 +374,13 @@ else
   done
 fi
 log "START mode=$MODE candidates=$LANES_ORDER"
+# 2026-11-25（E206）：轮转必须在**选完道就走一格**，不能等收尾。
+# 上传断流闸门一按住（连续零进展），run_one 在持有判断处就 exit 0，
+# 永远走不到下面第 546 行的 advance —— 实测 rotation 卡在 0，
+# 四条 lane 全拿 new 打头，份额化形同虚设。
+if [ "$MODE" = "auto" ]; then
+  policy advance
+fi
 
 # 2026-11-19（E182）：**上传断流闸门**，必须在领 claim 之前问。
 # 03:42–05:41 那两小时：每条 claim 都先把整集从源站下完（配额硬顶），
@@ -541,10 +548,6 @@ for L in $LANES_ORDER; do
       ;;
   esac
 done
-
-if [ "$MODE" = "auto" ]; then
-  policy advance
-fi
 
 if [ "$SELECTED" != "1" ]; then
   # 预算闸门要求等待：直接按闸门给的秒数睡，别落进「no_job 睡 180/900」那套

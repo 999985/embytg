@@ -71,6 +71,27 @@ def line(ok, name, detail=""):
     print("  %s %-26s %s" % ("✔" if ok is True else ("✘" if ok is False else "•"), name, detail))
 
 
+def upload_breaker_holds(sw_path, hours=3, now=None):
+    """最近 N 小时「断流闸门按住中」的次数 —— 夜间窗口 0 集时用来归因。
+
+    2026-11-25（E206）：0 集可能是窗口坏了（真故障，要修），也可能是全池上传
+    被 TG 限流（上游，修不了）。判据必须能被单测钉住，所以抽成函数：
+    只数 stall_watch 里带时间戳的「断流闸门按住中」，没有证据就返回 0。
+    """
+    held = 0
+    try:
+        cut = (now or time.time()) - hours * 3600
+        with open(sw_path, encoding="utf-8", errors="replace") as fh:
+            tail = fh.read()[-300000:]
+        for ln in tail.splitlines():
+            m = re.match(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s.*断流闸门按住中", ln)
+            if m and time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")) >= cut:
+                held += 1
+    except Exception:                                          # noqa: BLE001
+        return 0
+    return held
+
+
 def emby(path, method="GET", body=None, timeout=120):
     req = urllib.request.Request(EMBY + path,
                                 data=json.dumps(body).encode() if body is not None else None,
@@ -467,7 +488,18 @@ def main():
             if age_h > 26:                     # 超过一天没动 = 定时器/服务挂了
                 line(False, "夜间4K补版", "日志 %.0f 小时未更新，定时器可能失效" % age_h)
             elif last and "完成 0/" in last:
-                line(False, "夜间4K补版", "最近一轮 0 集成功：%s" % last)
+                # 2026-11-25（E206）：0 集有两种完全不同的原因，必须先分开再判：
+                #   a) 窗口/脚本坏了 → 真故障，要修；
+                #   b) 全池上传被 TG 限流（02:10-02:40 四号同时 0.08MB/s）→ 上游，
+                #      窗口本身没错，修不了，等限流过去。
+                # 证据只看断流闸门：最近 3h stall_watch 里「断流闸门按住中」的次数。
+                # 没有这个证据就仍然判 FAIL —— 不能拿「上游」当万能借口。
+                held = upload_breaker_holds(os.path.join(HERE, "logs", "stall_watch.log"))
+                if held >= 2:
+                    line(None, "夜间4K补版",
+                         "最近一轮 0 集：全池上传被 TG 限流（闸门按住 %d 次/3h），非窗口故障" % held)
+                else:
+                    line(False, "夜间4K补版", "最近一轮 0 集成功：%s" % last)
             else:
                 line(True, "夜间4K补版", "%s（%.0f 小时前）" % (last or "有日志无小结", age_h))
     except Exception as e:                                          # noqa: BLE001

@@ -97,6 +97,7 @@ def main():
 
     ok = 0
     streak = 0
+    rounds = 0
     deadline = time.time() + a.minutes * 60
     os.environ["EMOS_DEADLINE"] = str(int(deadline))
     run_id = "emos-night-%d" % os.getpid()
@@ -113,26 +114,50 @@ def main():
             print("  预约 slot%d 给本窗口（%d 分钟）" % (best, a.minutes), flush=True)
     except Exception as _e:                                    # noqa: BLE001
         print("  预约号失败（继续按普通方式抢号）: %s" % str(_e)[:80], flush=True)
-    os.environ.setdefault("EMOS_TRY_SLOTS", "2")   # 单集最多试 2 个号，别让一集吃光一夜
-    os.environ.setdefault("EMOS_PROBE_S", "600")   # 先 10 分钟探针，落地过区段才给整预算
-    os.environ.setdefault("EMOS_EP_MAX_S", "2400")  # 单集上限 40 分钟
+    # 2026-11-25（E206）：昨夜 0/12 的现场复盘 —— 02:10-02:40 四个号同时被 TG 限流到
+    # 0.08MB/s（同一时段下载仍有 4.8MB/s、裸 TCP 到 DC 8-13MB/s，所以不是本机带宽），
+    # 而本窗口的判据是「128MiB 区段 + 只试 2 个号 + 连错 2 集就整轮收工」：
+    # 一个区段要 1600s，探针 600s 内 0 落地 → 判死 → 试两个号 → streak=2 → 收工 0/12。
+    # 慢不等于死：区段缩到 32MiB（0.08MB/s 下 400s 落地，进度能累积），
+    # 四个号都试（号间差异 0.08-2.6MB/s 是常态），且不许「两集失败就整轮放弃」。
+    os.environ.setdefault("EMOS_TRY_SLOTS", "4")   # 四个号都试：单号被限流时换号才有意义
+    os.environ.setdefault("EMOS_PROBE_S", "900")   # 32MiB@0.08MB/s≈400s，900s 才判得准
+    os.environ.setdefault("EMOS_EP_MAX_S", "3600")  # 单集上限 60 分钟（慢号上传 2GB 要 3h+，靠跨轮续传）
     os.environ.setdefault("EMOS_ALLOW_SLOW", "1")  # 没有「够快」的号时按 best-effort 试一次
-    os.environ.setdefault("EMOS_CHUNK_MIB", "128")  # 512MiB 分片在慢号上 20 分钟才落地一个区段
+    os.environ.setdefault("EMOS_CHUNK_MIB", "32")  # 128MiB 在 0.4MB/s 慢号上 320s/段必超时（同 E205）
+    stop = False
     for p in picked:
-        if time.time() > deadline - 300:
-            print("  窗口到点（--minutes %d），提前收工" % a.minutes, flush=True)
+        if stop:
             break
-        if streak >= 2:
-            print("  连续 2 集 0 产出（上传号全线僵死），本轮收工", flush=True)
-            break
-        cmd = [sys.executable, "/opt/embytg/pipeline/emos_import.py",
-               "--series", p["name"], "--year", str(p["year"]),
-               "--eps", str(p["ep"]), "--limit", "1", "--apply",
-               "--target-dir", p["dir"]]
-        rc = os.spawnv(os.P_WAIT, sys.executable, cmd)
-        print("  E%s → rc=%s" % (p["ep"], rc), flush=True)
-        ok += (rc == 0)
-        streak = 0 if rc == 0 else streak + 1
+        # 2026-11-25（E206）：昨夜这里是「连错 2 集 → break → 0/12 收工」。
+        # 上传限流是**有窗口的**（同号实测 03:44 是 0.12MB/s、05:41 是 6MB/s），
+        # 两集失败只说明「此刻」，不说明「今晚」。改成：同一集冷却后重试，
+        # 单集最多 2 次、整轮最多 3 轮冷却；真僵死时成本只有一次下载 + 一段探针。
+        for attempt in range(2):
+            if time.time() > deadline - 300:
+                print("  窗口到点（--minutes %d），提前收工" % a.minutes, flush=True)
+                stop = True
+                break
+            cmd = [sys.executable, "/opt/embytg/pipeline/emos_import.py",
+                   "--series", p["name"], "--year", str(p["year"]),
+                   "--eps", str(p["ep"]), "--limit", "1", "--apply",
+                   "--target-dir", p["dir"]]
+            rc = os.spawnv(os.P_WAIT, sys.executable, cmd)
+            print("  E%s → rc=%s（第 %d 次）" % (p["ep"], rc, attempt + 1), flush=True)
+            if rc == 0:
+                ok += 1
+                streak = 0
+                break
+            streak += 1
+            pause = min(1800, max(300, int(max(60, deadline - time.time()) / 8)))
+            if rounds >= 3 or time.time() + pause > deadline - 300:
+                print("  连续 %d 集 0 产出，已冷却 %d 轮，本轮收工" % (streak, rounds), flush=True)
+                stop = True
+                break
+            rounds += 1
+            print("  0 产出（上传限流窗口），冷却 %ds 后重试 E%s（第 %d 轮冷却）"
+                  % (pause, p["ep"], rounds), flush=True)
+            time.sleep(pause)
     if reserved is not None:
         try:
             os.unlink(GS._slot_reserve_path(reserved))
