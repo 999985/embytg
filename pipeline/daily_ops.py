@@ -588,7 +588,12 @@ select count(*) from tree
         _diff = _td - _em
         line(_diff <= 3, "电影可见性",
              "teldrive=%d Emby=%d | %s" % (_td, _em,
-                                           "差 %d 部" % _diff if _diff > 0 else "齐"))
+                                           "缺 %d 部（跑 notify_replay.py）" % _diff if _diff > 3 else "齐"))
+        # 反方向：Emby 条目多于 teldrive 文件 = 幽灵（drop_old 洗版后没删 Movie 条目，
+        # 2026-11-24 实测 227 条）。五账只数 Episode，这个方向以前完全不可见。
+        _ghost = _em - _td
+        line(_ghost <= 5, "幽灵电影条目",
+             "Emby 多出 %d 条（clean_ghost_movies.py --apply）" % _ghost if _ghost > 5 else "无")
         _pend = os.path.join(HERE, "notify_pending.jsonl")
         _n = 0
         if os.path.exists(_pend):

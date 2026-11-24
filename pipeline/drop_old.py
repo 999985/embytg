@@ -146,7 +146,7 @@ def main():
         from embytg_conf import cfg as _cfg
         _b = _cfg("emby_url").rstrip("/")
         _t = _cfg("emby_token")
-        _full = PREFIX + "/" + rel.lstrip("/") if "PREFIX" in globals() else "/mnt/embytg/" + rel.lstrip("/")
+        _full = "/mnt/embytg/" + rel.lstrip("/")
         _hit = []
         try:
             _q = _up.urlencode({"Recursive": "true", "IncludeItemTypes": "Episode,Movie",
