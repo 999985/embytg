@@ -155,6 +155,27 @@ def ledger_teldrive():
     return out
 
 
+def nfo_tree():
+    """teldrive 文件树里所有 `*.nfo` 侧车的相对路径集合。
+
+    2026-11-24：`no_nfo` 判据原来是 `bool(scraped_at)`，而 scraped_at 只是
+    「刮削步骤跑过」的记账，不等于侧车真的落了盘。实测 国产剧/新网球王子 U-17世界杯篇
+    S01E13 09:33 入库、scraped_at 有值、盘上没有 .nfo，reconcile 一路报「差异 0」，
+    直到 16:45 巡检的 post_ingest 抽样才发现（滞后 7h）。
+
+    这里直接查 teldrive 自己的文件表：一次 PG 递归查询（5.1 万行 ≈2s），
+    不碰 FUSE（rclone 挂起时不会把对账拖进 D 状态），查完是集合查表 O(1)。
+    """
+    sql = ("with recursive down as ("
+           " select id, name::text as path from files"
+           " where parent_id is null and kind='folder' and deleted_at is null"
+           " union all"
+           " select f.id, d.path || '/' || f.name::text from files f"
+           " join down d on f.parent_id = d.id where f.deleted_at is null)"
+           " select path from down where lower(path) like '%.nfo'")
+    return {p.strip() for p in psql(sql).splitlines() if p.strip()}
+
+
 def ledger_tgdb():
     """④ tg.db resource_state：我们这一侧的处理状态。"""
     out = {}
@@ -288,6 +309,28 @@ def reconcile(lib_filter=None):
     for k, v in tg.items():
         if not v["has_nfo"]:
             add("no_nfo", k, "tg.db scraped_at 为空")
+
+    # 5b) 侧车真实性（2026-11-24）：scraped_at 有值 ≠ `.nfo` 真的在文件树上
+    #     5) 只信记账时间戳，而时间戳可能先写、侧车没落盘（S01E13 就是这样藏了 7 小时）。
+    #     窗口内（默认 168h，RECONCILE_NFO_WINDOW_H）最近入库的集逐个查 teldrive 树，
+    #     成本 = 一次 PG 查询 + O(窗口内条数) 的集合查表，与库大小无关。
+    _win = float(os.environ.get("RECONCILE_NFO_WINDOW_H", "168"))
+    _cut = time.time() - _win * 3600
+    _recent = [(k, v) for k, v in tg.items()
+               if v["has_nfo"] and float(v.get("landed_at") or 0) >= _cut]
+    if _recent:
+        try:
+            _nfos = nfo_tree()
+        except Exception as e:                              # noqa: BLE001
+            _nfos = None
+            print("  ! NFO 侧车核对跳过（teldrive 查询失败：%s）" % str(e)[:60],
+                  file=sys.stderr)
+        if _nfos is not None:
+            for k, v in _recent:
+                # rel 与 teldrive 树同为 "TV/<lib>/..."（ledger_teldrive 只在 key_of 里剥 TV/）
+                if os.path.splitext(v["rel"])[0] + ".nfo" not in _nfos:
+                    add("no_nfo", k, "侧车 .nfo 不在 teldrive 文件树"
+                                     "（scraped_at 有值但盘上没有）")
 
     # 6) 整剧级：挂载目录存在、Emby 无 Series
     sdirs = {}
@@ -551,6 +594,41 @@ def repair(gaps, only=None, cooldown_h=12):
                 print("  ✗ 同 Path 重复清理失败：%s" % str(e)[:120])
         elif todo:
             print("  · 同 Path 重复 %d 组在冷却期内，跳过" % len(todo))
+
+    # no_nfo 自愈（2026-11-24）：侧车 .nfo 不在 teldrive 树上时按剧补一次，
+    # 再把 NFO 标题同步成 Emby Name（否则 post_ingest 抽样会报 name_mismatch）。
+    # 有界：每轮最多 3 部剧、每部 12h 冷却（与其它类共用 st），超时 240s。
+    if not only or "no_nfo" in only:
+        _todo = [g for g in gaps if g.get("kind") == "no_nfo" and g.get("series")]
+        if _todo:
+            _by_tmdb = {}
+            for g in _todo:
+                m = re.search(r"\{tmdb=(\d+)\}", g["series"])
+                if m:
+                    _by_tmdb.setdefault(m.group(1), (g.get("lib") or "", g["series"]))
+            _ran = 0
+            for _tmdb, (_lib, _sdir) in sorted(_by_tmdb.items()):
+                if _ran >= 3:
+                    break
+                if not allow("nfo_fix:%s" % _tmdb):
+                    continue
+                try:
+                    r = subprocess.run(
+                        [sys.executable, os.path.join(HERE, "nfo_episodes.py"),
+                         "--series", _tmdb, "--workers", "4"],
+                        capture_output=True, text=True, timeout=240)
+                    _tail = (r.stdout or "").strip().splitlines()
+                    subprocess.run(
+                        [sys.executable, os.path.join(HERE, "nfo_name_to_emby.py"),
+                         "--apply", "--series-dir",
+                         "%s/TV/%s/%s" % (PREFIX, _lib, _sdir), "--workers", "4"],
+                        capture_output=True, text=True, timeout=240)
+                    done["no_nfo"] += 1
+                    _ran += 1
+                    print("  ✓ 补侧车 NFO tmdb=%s：%s"
+                          % (_tmdb, _tail[-1] if _tail else ""))
+                except Exception as e:                      # noqa: BLE001
+                    print("  ✗ 补侧车 NFO tmdb=%s 失败：%s" % (_tmdb, str(e)[:120]))
 
     save_state(st)
     return done

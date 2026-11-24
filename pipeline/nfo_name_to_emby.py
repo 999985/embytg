@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import threading
 import time
 import urllib.parse
@@ -116,6 +117,11 @@ def run(apply=False, lib=None, workers=8, series_dirs=None):
     stats, lock = {}, threading.Lock()
     t0 = time.time()
     filters = [x.rstrip("/") for x in (series_dirs or []) if x]
+    # 宿主路径（/opt/embytg/mnt/embytg/...）与容器路径（/mnt/embytg/...）都收：
+    # Emby 的 Item.Path 是容器路径，传宿主路径会静默匹配 0 条（2026-11-24 踩过一次，
+    # 看着「定向集=0」以为没缺口，实际是根本没查）。
+    filters = [f.replace(HOST, CTR, 1) if f.startswith(HOST) else f for f in filters]
+    _matched = 0
     for L in libs():
         name = L.get("Name")
         if lib and name != lib:
@@ -124,6 +130,7 @@ def run(apply=False, lib=None, workers=8, series_dirs=None):
         if filters:
             eps = [e for e in eps
                    if any(d in (e.get("Path") or "") for d in filters)]
+            _matched += len(eps)
             print("== %-8s 定向集=%d（过滤 %d 剧目录）" % (
                 name, len(eps), len(filters)), flush=True)
         if not eps:
@@ -134,7 +141,10 @@ def run(apply=False, lib=None, workers=8, series_dirs=None):
             for r in res:
                 stats[r] = stats.get(r, 0) + 1
         print("== %-8s 集=%-5d 累计=%s  %.0fs" % (name, len(eps), stats, time.time() - t0), flush=True)
-    print("\n结果: %s  耗时 %.0fs" % (stats, time.time() - t0))
+    if filters and _matched == 0:
+        print("! 过滤目录一条都没匹配上（Emby Item.Path 是容器路径 %s/...）：%s"
+              % (CTR, filters), file=sys.stderr)
+    print("\n结果: %s  耗时 %.0fs" % (stats, time.time() - t0), flush=True)
 
 
 if __name__ == "__main__":
