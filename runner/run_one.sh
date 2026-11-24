@@ -74,8 +74,17 @@ RUN_KEY=""
 # TTL（3h）或孤儿判定才回收 —— 3 次上传之后三个号全占满，之后每次领单都报
 # no_session（近 2 小时 37 次，是最大的错误源）。退出时统一释放。
 RUN_KEYS=()
+# 2026-11-24（E2xx）：心跳子进程必须逐个记账。
+# 原来只存最后一个 PID（RUN_HB_PID），一个 run_one 跑过 3 条 lane 就漏 2 个心跳；
+# 更致命的是心跳子进程继承了 fd 9（slot 锁），子进程不死 → 锁永不释放。
+RUN_HB_PIDS=()
 release_leases() {
   local k
+  # 无论有没有 claim，心跳都必须收掉：它是 slot 锁的持有者
+  for k in "${RUN_HB_PIDS[@]:-}"; do
+    [ -n "$k" ] || continue
+    kill "$k" 2>/dev/null || true
+  done
   for k in "${RUN_KEYS[@]:-}"; do
     [ -n "$k" ] || continue
     # 已经落地 manifest = 上传成功，只是登记/收尾失败 → **保留 claim** 交给下一轮
@@ -87,7 +96,6 @@ release_leases() {
       ssh_o "cd /opt/embytg/pipeline && $SYSPY -c \"import gha_state as G; G.abandon_run('$k')\"" >/dev/null 2>&1 || true
     fi
     rm -f "$BASE/run/$k.hb" 2>/dev/null || true
-  kill "${RUN_HB_PID:-0}" 2>/dev/null || true
   done
 }
 trap release_leases EXIT
@@ -202,6 +210,13 @@ cleanup() {
     cancel_claim "runner_exit_rc_${rc}"
   fi
   log "EXIT ${RUN_KEY:-none} rc=$rc"
+  # 2026-11-24（E2xx）：这里原本是 `trap cleanup EXIT`，把上面第 93 行的
+  # `trap release_leases EXIT` **整个覆盖掉** —— 于是 release_leases 从来没执行过：
+  #   · session 租约从不释放 → 领单报 no_session（37 次的真因）
+  #   · 心跳子进程从不回收 → 它继承的 fd 9 让 slot 锁永不释放
+  #     → 每个 slot 之后所有 run_one 都秒退 "already active"（2026-11-24 静默停摆 8h）
+  # 两个收尾必须串在同一个 EXIT 里，缺一个就是上面两种事故之一。
+  release_leases
 }
 trap cleanup EXIT
 
@@ -379,8 +394,12 @@ for L in $LANES_ORDER; do
   RUN_KEYS+=("$RUN_KEY")
   # 心跳：上传进程 argv 里没有 run_id，判活只能靠它（gha_state._hb_fresh）
   mkdir -p "$BASE/run"
-  ( while :; do date +%s >"$BASE/run/$RUN_KEY.hb" 2>/dev/null || exit 0; sleep 30; done ) &
+  # 2026-11-24：心跳子进程**必须关掉 fd 9/8**（slot 锁与恢复锁）。
+  # 这是结构闸：即使哪天又漏了 kill，泄漏的子进程也拿不住 slot 锁，
+  # 最坏只是留下一个 .hb 文件，不会把整条 lane 锁死 8 小时。
+  ( exec 9>&- 8>&-; while :; do date +%s >"$BASE/run/$RUN_KEY.hb" 2>/dev/null || exit 0; sleep 30; done ) &
   RUN_HB_PID=$!
+  RUN_HB_PIDS+=("$RUN_HB_PID")
   WORK="$BASE/work/$RUN_KEY"
   JOB="$WORK/job.json"
   mkdir -p "$WORK"
