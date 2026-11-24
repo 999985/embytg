@@ -31,7 +31,7 @@ MODE="${SYSTEM_LANE:-${LANE:-auto}}"
 MAX_ACTIVE="${TG_MAX_ACTIVE:-99}"
 SOURCE_ALLOW="${GHA_SOURCE_ALLOW:-}"
 export PYTHONUNBUFFERED=1
-export TG_CHUNK_MIB=128
+export TG_CHUNK_MIB="${TG_CHUNK_MIB:-32}"   # 2026-11-24 E205：128MiB 在 0.4MB/s 慢号上要 320s，必超时
 if [ "$SLOT" = "3" ]; then
   export TG_UPLOAD_JOBS="${TG_UPLOAD_JOBS_SLOT3:-1}"
 else
@@ -58,6 +58,15 @@ unset _l _v _n_sess
 export TG_SESSION_WEIGHTS="${TG_SESSION_WEIGHTS:-1,7}"
 export TG_WORKER_TIMEOUT="${TG_WORKER_TIMEOUT:-3600}"
 export TG_UPLOAD_TIMEOUT="${TG_UPLOAD_TIMEOUT:-7200}"
+# 2026-11-24（E205）：单分片 RPC 超时 90s → 240s。
+# 32MiB 分片在 0.4MB/s 的慢号上要 84 秒，90s 只有 6 秒余量，
+# 实测日志反复出现「part 13 RPC 超时 90s，重试 1/6」——
+# 那是把"慢"误判成"僵死"。240s 给足 3 倍余量，真正僵死仍由 6 次重试兜底。
+# 2026-11-24（E205）：上传分片 512MiB → 128MiB。
+# 实测慢号只有 0.4-1.1MB/s，512MiB 一片要 500-1300 秒，一抖动就整片超时，
+# 表现为 ZERO_PROGRESS（一个分片都没落地）、白占 30 分钟 + 一次下载配额。
+# 128MiB 在 0.4MB/s 下 320 秒可完成，进度能持续累积，慢号也能出片。
+export TG_PART_RPC_TIMEOUT="${TG_PART_RPC_TIMEOUT:-240}"
 export TG_DOWNLOAD_TIMEOUT="${TG_DOWNLOAD_TIMEOUT:-7200}"
 UPLOAD_OUTER_TIMEOUT=$((TG_UPLOAD_TIMEOUT + 1800))
 export TG_DOWNLOAD_RETRIES="${TG_DOWNLOAD_RETRIES:-3}"

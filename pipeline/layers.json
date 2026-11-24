@@ -186,6 +186,7 @@
   "provision_pending_bots.py",
   "make_bots.py",
   "make_bots2.py",
-  "prewarm.py"
+  "prewarm.py",
+  "watch_lanes.py"
  ]
 }

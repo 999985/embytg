@@ -1268,6 +1268,22 @@ def _is_local_run(run_id):
 
 
 def _orphan_evidence(run_id):
+    """心跳是权威判据（2026-11-24 E206）。
+
+    这里曾经只认「进程查不到 + claim 不存在」两条同时成立。但 claim 行是
+    旧时代的存活代理：run 死了、心跳停了，claim 还挂在库里 →
+    `_orphan_evidence` 永远 False → 租约只能等 TTL(3h) 到期 →
+    四个号被死租约钉死、全线 no_session（今天 10:20 又复现一次）。
+
+    现在：只要该 run 有心跳文件且已过期（>180s），就直接认定孤儿。
+    没有心跳文件时才退回旧规则（兼容没有心跳的历史 run）。
+    """
+    try:
+        hb = os.path.join(HB_DIR, "%s.hb" % run_id)
+        if os.path.exists(hb):
+            return not _hb_fresh(run_id)
+    except Exception:                                       # noqa: BLE001
+        pass
     """有没有**足够证据**判定这条租约是孤儿（可以安全回收）。
 
     2026-11-15（E103/E106）两次踩坑后定下的规则：
