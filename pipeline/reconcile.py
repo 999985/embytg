@@ -528,6 +528,30 @@ def repair(gaps, only=None, cooldown_h=12):
             except Exception:                               # noqa: BLE001
                 pass
 
+    # dup_path（同 Path 多条目）自愈（2026-11-24）：原先 --repair 只覆盖
+    # series_missing_emby / episode_missing_emby，dup_path 没有任何自动修的路，
+    # 于是库里只要留着一组历史重复（例：11-18 的同志亦凡人 S02E03，两条同秒创建、
+    # 同 Size），status_now 就永远挂「条目级 1 条超 30min 未愈」——它不是真裂缝，
+    # 是没人擦的索引瑕疵，红线却一直是红的。
+    # 有界：只动「已存在 ≥30 分钟」的组（正在写入的扫描不抢），每次最多 50 组，
+    # 与其它类共用 cooldown；清理走 library.db 行删除（不碰文件、不走 API DELETE）。
+    if not only or "dup_path" in only:
+        todo = [g for g in gaps if g.get("kind") == "dup_path" and g.get("path")
+                and float(g.get("age_min") or 0) >= 30]
+        if todo and allow("dup_path_clean"):
+            try:
+                import clean_dup_items as _cdi
+                r = _cdi.apply_for_paths([g["path"] for g in todo][:50])
+                done["dup_path"] += int(r.get("items_deleted") or 0)
+                print("  ✓ 同 Path 重复清理：%d 组 / 删 %s 行 / 剩余 %s 组%s"
+                      % (len(todo), r.get("items_deleted"), r.get("left"),
+                         "（备份 %s）" % r["backup"] if r.get("backup") else
+                         "（%s）" % r.get("skipped", "")))
+            except Exception as e:                          # noqa: BLE001
+                print("  ✗ 同 Path 重复清理失败：%s" % str(e)[:120])
+        elif todo:
+            print("  · 同 Path 重复 %d 组在冷却期内，跳过" % len(todo))
+
     save_state(st)
     return done
 

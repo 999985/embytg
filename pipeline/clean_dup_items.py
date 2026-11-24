@@ -68,6 +68,87 @@ def _has(con, table):
                             (table,)).fetchone())
 
 
+LOCK = "/opt/embytg/pipeline/logs/.clean_dup.lock"
+
+
+def apply_for_paths(paths=None, max_groups=50, settle=15):
+    """清「同 Path 重复」多余行；paths=None 清全库，否则只清给定 Path。
+
+    给 reconcile.py --repair 当自愈钩子用（2026-11-24）：--repair 原先只管
+    series/episode 两类差异，dup_path 只能等人工跑本脚本 → 条目级差异会挂在
+    status_now 上「超 30 分钟未愈」永不消。这里返回统计供调用方记账。
+
+    安全语义与 CLI 一致：停容器 → 含 WAL 备份 → 只删 library.db 行（绝不碰文件、
+    绝不走 API DELETE）→ 起容器 → 复核。并发保护用 flock，抢不到直接 skip。
+    """
+    import fcntl
+    lk = None
+    try:
+        os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+        lk = open(LOCK, "a+")
+        fcntl.flock(lk.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:                                       # noqa: BLE001
+        return {"skipped": "locked", "groups": 0, "items_deleted": 0}
+    try:
+        con = connect(ro=True)
+        todo = plan(con)
+        con.close()
+        if paths is not None:
+            want = set(paths)
+            todo = [t for t in todo if t[0] in want]
+        todo = todo[:max_groups]
+        if not todo:
+            return {"groups": 0, "items_deleted": 0, "ref_rows": 0, "left": 0}
+
+        os.makedirs(BK, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        subprocess.run(["docker", "stop", "emby"], capture_output=True, timeout=120)
+        time.sleep(3)
+        for ext in ("", "-wal", "-shm"):
+            src = DB + ext
+            if os.path.exists(src):
+                shutil.copy2(src, "%s/library.db.%s%s" % (BK, stamp, ext))
+
+        con = connect()
+        n_items = n_ref = 0
+        try:
+            for path, keep, kill in todo:
+                for i in kill:
+                    con.execute("delete from MediaItems where Id=?", (i,))
+                    n_items += 1
+                    for t in REFS:
+                        if not _has(con, t):
+                            continue
+                        for col in ("ItemId", "Id"):
+                            cols = [r[1] for r in
+                                    con.execute("pragma table_info(%s)" % t).fetchall()]
+                            if col in cols and not (t == "MediaItems"):
+                                try:
+                                    n_ref += con.execute(
+                                        "delete from %s where %s=?" % (t, col), (i,)).rowcount
+                                except sqlite3.Error:
+                                    pass
+                                break
+            con.commit()
+            con.execute("pragma wal_checkpoint(TRUNCATE)")
+        finally:
+            con.close()
+
+        subprocess.run(["docker", "start", "emby"], capture_output=True, timeout=180)
+        time.sleep(settle)
+        con = connect(ro=True)
+        left = len(dups(con))
+        con.close()
+        return {"groups": len(todo), "items_deleted": n_items, "ref_rows": n_ref,
+                "left": left, "backup": "library.db." + stamp}
+    finally:
+        try:
+            import fcntl
+            fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
+        finally:
+            lk.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
@@ -83,50 +164,10 @@ def main():
         print("  （dry-run，加 --apply 执行）")
         return 0
 
-    os.makedirs(BK, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    subprocess.run(["docker", "stop", "emby"], capture_output=True, timeout=120)
-    time.sleep(3)
-    for ext in ("", "-wal", "-shm"):
-        src = DB + ext
-        if os.path.exists(src):
-            shutil.copy2(src, "%s/library.db.%s%s" % (BK, stamp, ext))
-    print("  已备份 library.db.%s（含 WAL）" % stamp)
-
-    con = connect()
-    n_items = n_ref = 0
-    try:
-        for path, keep, kill in todo:
-            for i in kill:
-                con.execute("delete from MediaItems where Id=?", (i,))
-                n_items += 1
-                for t in REFS:
-                    if not _has(con, t):
-                        continue
-                    for col in ("ItemId", "Id"):
-                        cols = [r[1] for r in con.execute("pragma table_info(%s)" % t).fetchall()]
-                        if col in cols and not (t == "MediaItems"):
-                            try:
-                                n_ref += con.execute(
-                                    "delete from %s where %s=?" % (t, col), (i,)).rowcount
-                            except sqlite3.Error:
-                                pass
-                            break
-        con.commit()
-        con.execute("pragma wal_checkpoint(TRUNCATE)")
-    finally:
-        con.close()
-    print("  已删 Items %d 条，附属行 %d 条" % (n_items, n_ref))
-
-    subprocess.run(["docker", "start", "emby"], capture_output=True, timeout=180)
-    print("  容器已启动，等它索引稳定…")
-    time.sleep(30)
-    con = connect(ro=True)
-    left = len(dups(con))
-    total = con.execute("select count(*) from MediaItems where Path is not null and Path!=''"
-                        ).fetchone()[0]
-    con.close()
-    print("  复核：剩余重复组 %d，库内带路径条目 %d" % (left, total))
+    r = apply_for_paths(None, max_groups=10000, settle=30)
+    print("  已删 Items %s 条，附属行 %s 条（备份 %s）"
+          % (r.get("items_deleted"), r.get("ref_rows"), r.get("backup")))
+    print("  复核：剩余重复组 %s" % r.get("left"))
     return 0
 
 
