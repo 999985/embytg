@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -38,7 +39,14 @@ ENV = os.path.join(RUNNER, "runner.env")
 # emos_import 的换号重试用的是 `except Exception`，而 SystemExit 继承 BaseException
 # → 超时直接掀掉整个进程，换号/续传一次都没跑到（昨夜 8 个尝试里 7 个这样废掉）。
 class UploadTimeout(RuntimeError):
-    pass
+    """progress = 本次尝试真正落地的区段数（None = 从输出里看不出来）。
+
+    「慢但活着」和「僵死」必须分开：前者换号只会丢掉已传字节，后者换号才有意义。
+    """
+
+    def __init__(self, msg, progress=None):
+        super().__init__(msg)
+        self.progress = progress
 
 
 def _ensure_session_env():
@@ -164,6 +172,11 @@ def upload(env, slot, path):
         _sz = 0
     _jobs = int(os.environ.get("TG_UPLOAD_JOBS", "8") or 8)
     _budget = upload_budget(_sz, slot_mbps(slot), _jobs)
+    # 探针预算：第一个「没验证过今天还活着」的号，只给 EMOS_PROBE_S（默认 600s）。
+    # 落地任何区段=活着，继续给它整预算；一个字节都没落地=死号，立刻换下一个。
+    _probe = int(os.environ.get("EMOS_PROBE_S", "0") or 0)
+    if _probe > 0:
+        _budget = min(_budget, _probe)
     # 2026-11-24：夜间窗口（EMOS_DEADLINE=epoch）不能把单次上传预算开到窗口之外，
     # 否则 systemd 到点 SIGTERM 连人带文件一起砍，日志里连「完成 x/y」都等不到。
     _dl = (os.environ.get("EMOS_DEADLINE") or "").strip()
@@ -183,7 +196,16 @@ def upload(env, slot, path):
         if isinstance(_tail, bytes):
             _tail = _tail.decode("utf-8", "ignore")
         print("  上传超时（%ds，%.2fGB）：%s" % (_budget, _sz / 1e9, str(_tail)[-300:]), flush=True)
-        raise UploadTimeout("上传超时（%ds，%.2fGB，slot%s）" % (_budget, _sz / 1e9, slot))
+        # 从输出里判断这次到底是「慢但活着」还是「一个字节都没落地」
+        _prog = None
+        _m = re.search(r"已完成\s*(\d+)", str(_tail))
+        _exist = len(re.findall(r"区段\s*\d+/\d+\s*已存在", str(_tail)))
+        if _m:
+            _prog = max(int(_m.group(1)), _exist)
+        elif _exist:
+            _prog = _exist
+        raise UploadTimeout("上传超时（%ds，%.2fGB，slot%s）" % (_budget, _sz / 1e9, slot),
+                            progress=_prog)
     out = (r.stdout or "") + (r.stderr or "")
     mani = ""
     for line in out.splitlines():

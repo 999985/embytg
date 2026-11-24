@@ -95,12 +95,19 @@ def main():
         return 0
 
     ok = 0
+    streak = 0
     deadline = time.time() + a.minutes * 60
     os.environ["EMOS_DEADLINE"] = str(int(deadline))
     os.environ.setdefault("EMOS_TRY_SLOTS", "2")   # 单集最多试 2 个号，别让一集吃光一夜
+    os.environ.setdefault("EMOS_PROBE_S", "600")   # 先 10 分钟探针，落地过区段才给整预算
+    os.environ.setdefault("EMOS_EP_MAX_S", "2400")  # 单集上限 40 分钟
+    os.environ.setdefault("EMOS_ALLOW_SLOW", "1")  # 没有「够快」的号时按 best-effort 试一次
     for p in picked:
         if time.time() > deadline - 300:
             print("  窗口到点（--minutes %d），提前收工" % a.minutes, flush=True)
+            break
+        if streak >= 2:
+            print("  连续 2 集 0 产出（上传号全线僵死），本轮收工", flush=True)
             break
         cmd = [sys.executable, "/opt/embytg/pipeline/emos_import.py",
                "--series", p["name"], "--year", str(p["year"]),
@@ -109,6 +116,7 @@ def main():
         rc = os.spawnv(os.P_WAIT, sys.executable, cmd)
         print("  E%s → rc=%s" % (p["ep"], rc), flush=True)
         ok += (rc == 0)
+        streak = 0 if rc == 0 else streak + 1
     print("  完成 %d/%d 集（窗口 %d 分钟）" % (ok, len(picked), a.minutes), flush=True)
     return 0 if ok else 1
 

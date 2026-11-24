@@ -320,9 +320,19 @@ def _remaining():
 
 
 def pool_rows():
-    """{slot: (实测单 worker MB/s, 是否冷却)}，直接读上传池，不猜速度。"""
-    return {int(r["slot"]): (float(r.get("mbps") or 0), bool(r.get("cooling")))
-            for r in TC.pool_snapshot()}
+    """{slot: (实测单 worker MB/s, 是否冷却)}，直接读上传池，不猜速度。
+
+    2026-11-24：平滑值会滞后（slot2 表里 1.09，last_mbps 只有 0.02 —— 闸门据此算出
+    「8×1.09≈8.7MB/s」很乐观，实际 18 分钟一个区段都没落地）。排序用「平滑值」和
+    「最近一次实测」的较小者，避免总是先撞上已经半死的号。
+    """
+    out = {}
+    for r in TC.pool_snapshot():
+        mb = float(r.get("mbps") or 0)
+        last = float(r.get("last_mbps") or 0)
+        samples = [x for x in (mb, last) if x > 0]
+        out[int(r["slot"])] = (min(samples) if samples else 0.0, bool(r.get("cooling")))
+    return out
 
 
 def slot_order(rows):
@@ -362,6 +372,15 @@ def acquire_slot(run_id, jobs):
             print("  slot%d 实测 %.2fMB/s×%d≈%.1f < %.1f，不占它"
                   % (n, mb, jobs, est, floor), flush=True)
         if datetime.datetime.now() >= deadline:
+            if os.environ.get("EMOS_ALLOW_SLOW") == "1":
+                # best-effort：闸门是「别把整夜押在慢号上」，不是「宁可不跑」。
+                # 探针（EMOS_PROBE_S）会在 10 分钟内判定它到底活不活。
+                rows2 = pool_rows()
+                for n in slot_order(rows2):
+                    if GS.slot_lease(n, run_id, ttl=7200):
+                        print("  没有够快的空闲 slot，best-effort 用 slot%d（实测 %.2fMB/s）"
+                              % (n, rows2.get(n, (0.0, False))[0]), flush=True)
+                        return n
             print("  没有够快的空闲 slot：全线 < %.1fMB/s，已过 %s，本轮不起跑"
                   % (floor, dl), flush=True)
             return 0
@@ -511,24 +530,41 @@ def main():
             tries = [slot] + [x for x in order if x != slot]
             if _cap > 0:
                 tries = tries[:_cap]
+            ep_t0 = time.time()
+            ep_cap = float(os.environ.get("EMOS_EP_MAX_S", "0") or 0)
             for try_slot in tries:
                 if try_slot != slot and not GS.slot_lease(try_slot, run_id, ttl=7200):
                     continue
-                if _remaining() < 300:
-                    print("  E%s 剩余预算 < 300s，不再开新号，留到下一轮" % ep, flush=True)
-                    if try_slot != slot:
-                        GS.slot_release(try_slot, run_id)
-                    break
-                try:
-                    parts = TC.upload(env, try_slot, dest)
-                except (Exception, SystemExit) as ex:
-                    print("  slot%d 上传失败: %s" % (try_slot, str(ex)[:100]), flush=True)
-                    if try_slot != slot:
-                        GS.slot_release(try_slot, run_id)
-                    continue
+                for _att in range(2):        # 每号最多两次：探针（短）→ 整预算续传
+                    if _remaining() < 300:
+                        print("  E%s 剩余预算 < 300s，不再开新号，留到下一轮" % ep, flush=True)
+                        break
+                    if ep_cap and time.time() - ep_t0 > ep_cap:
+                        print("  E%s 单集已耗 %ds > %ds，放弃换号，留到下一轮"
+                              % (ep, int(time.time() - ep_t0), int(ep_cap)), flush=True)
+                        break
+                    try:
+                        parts = TC.upload(env, try_slot, dest)
+                    except (Exception, SystemExit) as ex:
+                        print("  slot%d 上传失败: %s" % (try_slot, str(ex)[:100]), flush=True)
+                        # 探针判定：落地过区段 = 慢但活着（续传不丢字节，别再换号）；
+                        # 0 区段 = 死号，换下一个。
+                        _prog = getattr(ex, "progress", None)
+                        if _prog and _att == 0:
+                            os.environ.pop("EMOS_PROBE_S", None)
+                            print("  slot%d 探针落地 %s 个区段（活着），给整预算续传"
+                                  % (try_slot, _prog), flush=True)
+                            continue
+                        if not _prog:
+                            print("  slot%d 0 区段落地（死号）" % try_slot, flush=True)
+                        break
+                    else:
+                        os.environ.pop("EMOS_PROBE_S", None)
+                        break
                 if try_slot != slot:
                     GS.slot_release(try_slot, run_id)   # 借来的号用完立刻还，别占 2h
-                break
+                if parts:
+                    break
             if not parts:
                 print("  全部 slot 上传失败，保留文件: %s" % dest, flush=True)
                 continue
