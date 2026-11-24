@@ -557,6 +557,47 @@ def main():
     except Exception as e:                                          # noqa: BLE001
         line(False, "对账", str(e)[:60])
 
+    # 4.685) 电影可见性 + 通知失败队列（2026-11-24 日终新增）
+    #
+    # 根因：五账（reconcile.py）只比 Episode，电影漏建**完全不可见**。
+    # 2026-11-24 实测 15 条 notify_pending 里有 4 部电影不在 Emby，而所有检查全绿。
+    # 判据：① teldrive Movies 子树媒体文件数 ≤ Emby Movie 数（差 ≤3 视为在途）
+    #       ② notify_pending.jsonl 未清空 → 说明有片子通知失败还没补进 Emby（每 15min 重放）
+    sec("4.685) 电影可见性 + 通知队列")
+    try:
+        _q = r"""
+with recursive root as (
+  select id from teldrive.files
+   where status='active' and name='Movies' and parent_id is null limit 1
+),
+tree as (
+  select f.id, f.name::text as name from teldrive.files f join root r on f.parent_id=r.id
+   where f.status='active'
+  union all
+  select f.id, f.name::text from teldrive.files f join tree t on f.parent_id=t.id
+   where f.status='active'
+)
+select count(*) from tree
+ where lower(name) ~ '\.(mp4|mkv|mov|avi|ts|m2ts|iso|wmv|flv|rmvb|webm)$';
+"""
+        _p = subprocess.run(["docker", "exec", "-i", "teldrive-postgres", "psql",
+                             "-U", "teldrive", "-d", "teldrive", "-At"],
+                            input=_q, capture_output=True, text=True, timeout=180)
+        _td = int((_p.stdout or "0").strip().splitlines()[-1]) if (_p.stdout or "").strip() else 0
+        _em = int(emby("/Items?Recursive=true&IncludeItemTypes=Movie&Limit=1").get("TotalRecordCount", 0))
+        _diff = _td - _em
+        line(_diff <= 3, "电影可见性",
+             "teldrive=%d Emby=%d | %s" % (_td, _em,
+                                           "差 %d 部" % _diff if _diff > 0 else "齐"))
+        _pend = os.path.join(HERE, "notify_pending.jsonl")
+        _n = 0
+        if os.path.exists(_pend):
+            _n = sum(1 for _l in open(_pend, encoding="utf-8", errors="ignore") if _l.strip())
+        line(_n == 0, "通知失败队列",
+             "%d 条待重放（notify_replay.py 每 15min 一轮）" % _n if _n else "空")
+    except Exception as e:                                          # noqa: BLE001
+        line(None, "电影可见性", str(e)[:60])
+
     # 4.70) 回归测试（2026-11-14 新增）
     #
     # 2026-11-14 一天修了 15 个真实 bug，几乎全是"线上出问题才发现"的。

@@ -135,21 +135,33 @@ def main():
     print("  台账 %d 行 / state_key %d 行" % (n1, n2))
 
     # ④ Emby 条目
-    # Emby 条目：按路径找到后逐条删（teldrive 行已先删，DELETE 的级联软删无副作用）
+    # 2026-11-24 根因修复：这里原来只查 IncludeItemTypes=Episode，**洗掉的是电影时
+    # Emby 的 Movie 条目永远不会被删** → 227 条幽灵电影（点开播放失败），而五账只数
+    # Episode，一直看不见。改成「先按精确 Path 查（O(1)），查不到再按文件名扫」，
+    # 类型用 Episode,Movie，并且不再依赖 20000 条的枚举上限。
     try:
-        import json as _json
         import urllib.parse as _up
         import urllib.request as _ur
         sys.path.insert(0, HERE)
         from embytg_conf import cfg as _cfg
         _b = _cfg("emby_url").rstrip("/")
         _t = _cfg("emby_token")
-        _want = os.path.basename(rel)
-        _q = _up.urlencode({"Recursive": "true", "IncludeItemTypes": "Episode",
-                            "Fields": "Path", "Limit": "20000"})
-        with _ur.urlopen("%s/Items?%s&api_key=%s" % (_b, _q, _t), timeout=180) as _f:
-            _items = (json.loads(_f.read()) or {}).get("Items") or []
-        _hit = [i["Id"] for i in _items if (i.get("Path") or "").endswith("/" + _want)]
+        _full = PREFIX + "/" + rel.lstrip("/") if "PREFIX" in globals() else "/mnt/embytg/" + rel.lstrip("/")
+        _hit = []
+        try:
+            _q = _up.urlencode({"Recursive": "true", "IncludeItemTypes": "Episode,Movie",
+                                "Fields": "Path", "Limit": "10", "Path": _full})
+            with _ur.urlopen("%s/Items?%s&api_key=%s" % (_b, _q, _t), timeout=60) as _f:
+                _hit = [i["Id"] for i in (json.loads(_f.read()) or {}).get("Items") or []]
+        except Exception:                                    # noqa: BLE001
+            _hit = []
+        if not _hit:
+            _want = os.path.basename(rel)
+            _q = _up.urlencode({"Recursive": "true", "IncludeItemTypes": "Episode,Movie",
+                                "Fields": "Path", "Limit": "20000"})
+            with _ur.urlopen("%s/Items?%s&api_key=%s" % (_b, _q, _t), timeout=180) as _f:
+                _items = (json.loads(_f.read()) or {}).get("Items") or []
+            _hit = [i["Id"] for i in _items if (i.get("Path") or "").endswith("/" + _want)]
         for _i in _hit:
             _req = _ur.Request("%s/Items/%s?api_key=%s" % (_b, _i, _t), method="DELETE")
             try:

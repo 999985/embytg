@@ -238,9 +238,11 @@ def emby_media_updated(paths):
         import emby_scan
         res = emby_scan.scan_paths(paths)
         ok = int(res.get("Created", 0)) + int(res.get("Refreshed", 0))
-        if res.get("Failed") or res.get("PathNotFound"):
+        # 2026-11-24：ParentNotFound 也算失败——父目录当时还没被 Emby 看见（VFS 列目录滞后），
+        # 这一条以前被当成「成功」，片子永远不进 Emby。凡是没拿到 Created/Refreshed 的都落队列重放。
+        if res.get("Failed") or res.get("PathNotFound") or res.get("ParentNotFound"):
             fail.extend(paths)
-            print(f"  ! ScanPaths 部分失败: {res}", file=sys.stderr, flush=True)
+            print(f"  ! ScanPaths 未全部成功: {res}", file=sys.stderr, flush=True)
         else:
             print(f"# 送扫 {len(paths)} 条 → Created={res.get('Created')} "
                   f"Refreshed={res.get('Refreshed')} skipped={res.get('skipped', 0)}", flush=True)
