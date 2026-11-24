@@ -102,7 +102,10 @@ def upload_budget(size_bytes, mbps, jobs):
         mbps = float(mbps or 0)
     except (TypeError, ValueError):
         mbps = 0.0
-    chunk = 512 * 1024 * 1024
+    try:
+        chunk = max(32, int(os.environ.get("EMOS_CHUNK_MIB") or 512)) * 1024 * 1024
+    except ValueError:
+        chunk = 512 * 1024 * 1024
     if mbps <= 0:
         per_chunk = 1800
     else:
@@ -160,6 +163,12 @@ async def fetch_one(env, slot, channel, msg_id, dest):
 def upload(env, slot, path):
     cmd = [os.path.join(RUNNER, "venv/bin/python"), os.path.join(RUNNER, "pc_upload.py"),
            path, "--session-slot", str(slot), "--store-ch", env["TG_STORE_CH"].split(",")[0]]
+    # 2026-11-24：512MiB 分片在 0.4MB/s/worker 的号上要 20 分钟才落地第一个区段，
+    # 而外层预算 ≤37 分钟 ——「看得出来在传但一个区段都没有」，和僵死无法区分。
+    # 夜间窗口按 EMOS_CHUNK_MIB 用 128MiB：同样吞吐下 5 分钟一个区段，探针才判得准。
+    _chunk = (os.environ.get("EMOS_CHUNK_MIB") or "").strip()
+    if _chunk.isdigit():
+        cmd += ["--chunk-mib", _chunk]
     env2 = dict(os.environ)
     env2.update({k: v for k, v in env.items()})
     print("  上传: %s" % " ".join(cmd[1:]), flush=True)

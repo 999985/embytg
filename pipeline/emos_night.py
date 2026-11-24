@@ -102,6 +102,7 @@ def main():
     os.environ.setdefault("EMOS_PROBE_S", "600")   # 先 10 分钟探针，落地过区段才给整预算
     os.environ.setdefault("EMOS_EP_MAX_S", "2400")  # 单集上限 40 分钟
     os.environ.setdefault("EMOS_ALLOW_SLOW", "1")  # 没有「够快」的号时按 best-effort 试一次
+    os.environ.setdefault("EMOS_CHUNK_MIB", "128")  # 512MiB 分片在慢号上 20 分钟才落地一个区段
     for p in picked:
         if time.time() > deadline - 300:
             print("  窗口到点（--minutes %d），提前收工" % a.minutes, flush=True)

@@ -104,13 +104,13 @@ FAIL_WINDOW = int(os.getenv("EMBYTG_SRC_FAIL_WINDOW", "600"))          # 10min �
 HOST_BAD_FILE = os.getenv("EMBYTG_SRC_HOSTBAD_FILE") or os.path.join(HERE, "cache", "src_hosts_bad.json")
 HOST_BAD_TTL = int(os.getenv("EMBYTG_SRC_HOSTBAD_TTL", str(6 * 3600)))
 # 2026-11-24（自省）：**超时/连不上也是「这个镜像坏了」**，但它是可恢复的，
-# 所以走指数退避而不是 6h 一棍子打死。
+# 所以走指数退避（2min→2h）而不是 6h 一棍子打死。
 #   实测 8 天 1185 次 status=0（源站根本没应答）= 372 分钟纯等待，其中 329 分钟
 #   全在 `aaa.yusen6.ccwu.cc` 的 5 个镜像上：一个搜索要挨个撞 5 个死镜像、
 #   每个 25s 超时，125 秒一次，而它**一天被搜几十次** —— 因为旧代码只把
 #   「200 非 JSON」记成坏镜像，超时只记在源级健康表上（惩罚整个 label，
 #   5 个镜像里 1 个坏会连坐 4 个好的，同时下一次搜索又把 5 个全撞一遍）。
-HOST_BAD_BASE_TTL = int(os.getenv("EMBYTG_SRC_HOSTBAD_BASE_TTL", str(10 * 60)))
+HOST_BAD_BASE_TTL = int(os.getenv("EMBYTG_SRC_HOSTBAD_BASE_TTL", "120"))
 HOST_BAD_TIMEOUT_TTL = int(os.getenv("EMBYTG_SRC_HOSTBAD_TTL_TIMEOUT", str(2 * 3600)))
 HOST_BAD_REFRESH = float(os.getenv("EMBYTG_SRC_HOSTBAD_REFRESH", "20"))
 # 401 = 我们存的 token 被拒，重试一万次也不会成功（只有人能换 token）。
@@ -368,7 +368,7 @@ def _host_bad_ttl(rec):
     """这条坏镜像记录该记多久。
 
     · ``non_json``（200 + 登录页）= 6h：这个 url 走错了，短时间不会自己好；
-    · ``timeout``（status=0：连接被拒/超时/TLS）= 指数退避 10min → 2h：
+    · ``timeout``（status=0：连接被拒/超时/TLS）= 指数退避 2min → 2h：
       可恢复，但不能每次搜索都拿 25s 去撞一遍。
     """
     why = str((rec or {}).get("why") or "")
@@ -418,13 +418,29 @@ def _host_bad_write(d):
         pass
 
 
+def _host_bad_read_raw():
+    """读**未过滤**的原始表（用于累计失败次数：过期记录也带着它当年的 n）。"""
+    try:
+        with open(HOST_BAD_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:                                          # noqa: BLE001
+        return {}
+
+
 def _host_bad_mark(label, host, why="non_json", bump=False):
-    """记一个坏镜像（跨进程）；``bump=True`` 时同一条记录累加失败次数（用于退避）。"""
+    """记一个坏镜像（跨进程）；``bump=True`` 时同一条记录累加失败次数（用于退避）。
+
+    ``n`` 必须从**未过滤**的表里取：``_host_bad_load()`` 会把过期记录滤掉，
+    若从它取 n，退避永远停在第一档（10min），指数增长形同虚设。
+    """
     key = _host_bad_key(label, host)
     now = time.time()
     d = _host_bad_load()
-    prev = d.get(key) or {}
-    n = (int(prev.get("n") or 0) + 1) if bump else 1
+    if bump:
+        n = int((_host_bad_read_raw().get(key) or {}).get("n") or 0) + 1
+    else:
+        n = 1
     d[key] = {"ts": now, "why": str(why)[:40], "n": n}
     _host_bad_write(d)
     return d
@@ -616,7 +632,7 @@ class Guard:
     def _drop_bad_hosts(self):
         """把别的进程记下的「这个镜像 url 是登录页/HTML」从轮转里摘掉。
 
-        只摘 ``non_json``（6h、这个 url 本身走错）。``timeout`` 是 10min→2h
+        只摘 ``non_json``（6h、这个 url 本身走错）。``timeout`` 是 2min→2h
         的指数退避，**不能在进程启动时就永久摘掉** —— 否则一个 25s 抖动
         会让这个镜像在整个进程生命周期里消失。超时类改由 ``_bad_hosts()``
         按 TTL 逐次跳过（见 ``get``）。
@@ -763,7 +779,7 @@ class Guard:
                 break
             hk = _host_bad_key(st.label, host)
             if hk in _bad and not _force:
-                # 这个镜像刚超时/连不上过（10min→2h 退避）。**不再拿 25s 去撞它**，
+                # 这个镜像刚超时/连不上过（2min→2h 退避）。**不再拿 25s 去撞它**，
                 # 换下一个；一个搜索本来要挨个撞 5 个死镜像 = 125 秒。
                 _skipped += 1
                 if self.verbose:
@@ -854,7 +870,7 @@ class Guard:
                 st.fails += 1
                 last_error = e
                 # status==0 = 源站压根没应答（连接被拒/超时/TLS/代理挂）。
-                # 2026-11-24（自省）：记在**这个镜像**上（10min→2h 指数退避），
+                # 2026-11-24（自省）：记在**这个镜像**上（2min→2h 指数退避），
                 # 不再一上来就惩罚整个源 —— 5 个镜像里 1 个死，不该连坐另外 4 个；
                 # 源级冷却只留到「这一次每个镜像都没应答」那一刻（见函数末尾）。
                 if status == 0:

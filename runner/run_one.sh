@@ -397,7 +397,16 @@ for L in $LANES_ORDER; do
   # 2026-11-24：心跳子进程**必须关掉 fd 9/8**（slot 锁与恢复锁）。
   # 这是结构闸：即使哪天又漏了 kill，泄漏的子进程也拿不住 slot 锁，
   # 最坏只是留下一个 .hb 文件，不会把整条 lane 锁死 8 小时。
-  ( exec 9>&- 8>&-; while :; do date +%s >"$BASE/run/$RUN_KEY.hb" 2>/dev/null || exit 0; sleep 30; done ) &
+  # 2026-11-24（E203）：**心跳必须跟着 run_one 的命走。**
+  # 原来写的是 `while :` —— run_one 退出、被 kill、甚至整条 lane 崩掉，
+  # 心跳子进程照样每 30 秒刷一次时间戳。结果：gha_state._hb_fresh 永远判"活着"，
+  # 那个 session 租约永远不会被回收 → 四个号全被"僵尸心跳"钉死 →
+  # 所有 lane 刷 no_session（实测 09:00-09:33 有 13 次/半小时）。
+  # 现在用 `kill -0 $$` 跟父进程绑定：父进程一没，心跳自己退出并删掉自己的文件。
+  ( exec 9>&- 8>&-; while kill -0 $$ 2>/dev/null; do
+      date +%s >"$BASE/run/$RUN_KEY.hb" 2>/dev/null || break
+      sleep 30
+    done; rm -f "$BASE/run/$RUN_KEY.hb" 2>/dev/null ) &
   RUN_HB_PID=$!
   RUN_HB_PIDS+=("$RUN_HB_PID")
   WORK="$BASE/work/$RUN_KEY"

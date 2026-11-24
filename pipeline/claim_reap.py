@@ -200,6 +200,32 @@ def no_work_dir(claim):
     return not os.path.isdir(os.path.join(WORK_ROOT, rid))
 
 
+def sweep_heartbeats(max_age=3600):
+    """清掉过期心跳文件（2026-11-24）。
+
+    事故后遗留：进程被 kill -9 / trap 未执行时，run/<key>.hb 会留下，
+    实测攒了 14 个（89 分钟前）。判活只看 mtime ≤180s，陈旧文件本身不会
+    造成误判，但会一直堆着，且排查时干扰判断。超过 1 小时的一律删。
+    """
+    d = "/opt/embytg-runner/run"
+    n = 0
+    try:
+        now = __import__("time").time()
+        for name in os.listdir(d):
+            if not name.endswith(".hb"):
+                continue
+            p = os.path.join(d, name)
+            try:
+                if now - os.path.getmtime(p) > max_age:
+                    os.remove(p)
+                    n += 1
+            except OSError:
+                pass
+    except Exception:                                       # noqa: BLE001
+        pass
+    return n
+
+
 def main():
     # 条目级 claim 的过期清理（2026-11-20）：TTL 到期的 key 必须放回去，
     # 否则某一集会被永久锁住、谁也领不了。
@@ -209,6 +235,12 @@ def main():
         print("  条目级 claim 过期清理: %d 条" % _n)
     except Exception as _e:                                   # noqa: BLE001
         print("  claim 清理跳过: %s" % str(_e)[:50])
+    try:
+        _h = sweep_heartbeats()
+        if _h:
+            print("  陈旧心跳清理: %d 个" % _h)
+    except Exception as _e:                                   # noqa: BLE001
+        print("  心跳清理跳过: %s" % str(_e)[:50])
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--aggressive", action="store_true")

@@ -406,7 +406,20 @@ def session_slot(active, run_id=None):
     _res = reserved_slots()
     # 预留槽不参与上传（E081：tgpipe 独占某个账号做转存）
     _cand = [x for x in range(1, n_sess + 1) if x not in _res]
-    order = sorted(_cand, key=lambda s: (counts.get(s, 0), s))
+    # 2026-11-24：**先试自己编号的槽。** 每条 lane 自带 EMBYTG_RUN_SLOT，
+    # 优先租同号槽可避免「slot3 的进程租到 slot4 的号」这种交叉占用 ——
+    # 交叉会让收尾时按 run_id 释放别人的号，增加 no_session 抖动
+    # （实测 09:00-09:33 有 13 次 no_session，四个号全在忙时尤其明显）。
+    _mine = 0
+    try:
+        _mine = int(os.environ.get("EMBYTG_RUN_SLOT") or 0)
+    except Exception:                                      # noqa: BLE001
+        _mine = 0
+    if _mine and _mine in _cand:
+        order = [_mine] + [s for s in sorted(_cand, key=lambda s: (counts.get(s, 0), s))
+                           if s != _mine]
+    else:
+        order = sorted(_cand, key=lambda s: (counts.get(s, 0), s))
     # 2026-11-15（E134）：先按「最闲」排，再把被 TG 限速的账号压到队尾。
     try:
         _before = list(order)

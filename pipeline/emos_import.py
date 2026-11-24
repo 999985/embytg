@@ -319,6 +319,23 @@ def _remaining():
     return (dl - time.time()) if dl else 1e9
 
 
+def _mani_parts(name):
+    """这条文件已经落地的区段数（读 pc_upload 的 manifest，跨尝试单调递增）。
+
+    探针判活必须用「本次尝试新增」而不是输出里的「已完成 N」——后者把上次已存在的
+    区段也数进去（2026-11-24 实测：slot4 一个字节没传，输出仍写着「已完成 2」，
+    只看它就会把死号判成活着，白等 37 分钟）。
+    """
+    import glob
+    for p in glob.glob("/opt/embytg-runner/_manifests*/%s.json" % name):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return len((json.load(f) or {}).get("parts") or [])
+        except Exception:                                  # noqa: BLE001
+            continue
+    return 0
+
+
 def pool_rows():
     """{slot: (实测单 worker MB/s, 是否冷却)}，直接读上传池，不猜速度。
 
@@ -543,20 +560,23 @@ def main():
                         print("  E%s 单集已耗 %ds > %ds，放弃换号，留到下一轮"
                               % (ep, int(time.time() - ep_t0), int(ep_cap)), flush=True)
                         break
+                    _before = 0
                     try:
+                        _before = _mani_parts(name)
                         parts = TC.upload(env, try_slot, dest)
                     except (Exception, SystemExit) as ex:
                         print("  slot%d 上传失败: %s" % (try_slot, str(ex)[:100]), flush=True)
-                        # 探针判定：落地过区段 = 慢但活着（续传不丢字节，别再换号）；
-                        # 0 区段 = 死号，换下一个。
-                        _prog = getattr(ex, "progress", None)
-                        if _prog and _att == 0:
+                        # 探针判定用 manifest 增量：本次新增区段 = 慢但活着（续传不丢字节）；
+                        # 0 新增 = 死号，换下一个。
+                        _prog = _mani_parts(name) - _before
+                        if _prog > 0 and _att == 0:
                             os.environ.pop("EMOS_PROBE_S", None)
-                            print("  slot%d 探针落地 %s 个区段（活着），给整预算续传"
+                            print("  slot%d 探针新增 %d 个区段（活着），给整预算续传"
                                   % (try_slot, _prog), flush=True)
                             continue
-                        if not _prog:
-                            print("  slot%d 0 区段落地（死号）" % try_slot, flush=True)
+                        print("  slot%d 本次新增 %d 个区段（%s）"
+                              % (try_slot, _prog, "活着但不快" if _prog else "死号"),
+                              flush=True)
                         break
                     else:
                         os.environ.pop("EMOS_PROBE_S", None)
