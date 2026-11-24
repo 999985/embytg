@@ -392,6 +392,15 @@ BUDGET_WAIT=600
 for L in $LANES_ORDER; do
   RUN_KEY="$(date -u +%Y%m%d_%H%M%S)-slot${SLOT}-${L}-$(openssl rand -hex 3)"
   RUN_KEYS+=("$RUN_KEY")
+  # 2026-11-24（E204）：**换 lane 重试前必须先收掉上一次的心跳。**
+  # 否则一个 run_one 跑 3 条 lane 就留 3 个心跳，各自刷自己的 .hb →
+  # 那几个 run 的 session 租约永远"活着" → 四个号被钉死 → 全线 no_session。
+  # （实测 09:35 那批 152 秒还在刷的心跳，就是前几次尝试遗留的。）
+  if [ -n "${RUN_HB_PID:-}" ]; then
+    kill "$RUN_HB_PID" 2>/dev/null || true
+    rm -f "$BASE/run/${RUN_HB_KEY:-}.hb" 2>/dev/null || true
+  fi
+  RUN_HB_KEY="$RUN_KEY"
   # 心跳：上传进程 argv 里没有 run_id，判活只能靠它（gha_state._hb_fresh）
   mkdir -p "$BASE/run"
   # 2026-11-24：心跳子进程**必须关掉 fd 9/8**（slot 锁与恢复锁）。

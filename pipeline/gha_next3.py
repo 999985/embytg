@@ -415,6 +415,12 @@ def session_slot(active, run_id=None):
         _mine = int(os.environ.get("EMBYTG_RUN_SLOT") or 0)
     except Exception:                                      # noqa: BLE001
         _mine = 0
+    if not _mine:
+        # 兜底：run_id 里就带着 slotN（run_one.sh 生成），不依赖环境变量是否传进来。
+        import re as _re2
+        _m2 = _re2.search(r"slot(\d+)", str(run_id or ""))
+        if _m2:
+            _mine = int(_m2.group(1))
     if _mine and _mine in _cand:
         order = [_mine] + [s for s in sorted(_cand, key=lambda s: (counts.get(s, 0), s))
                            if s != _mine]

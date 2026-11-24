@@ -371,6 +371,22 @@ def acquire_slot(run_id, jobs):
     这种自欺 —— 昨夜 7 集白烧就是这么发生的：先领号，后看速度。
     """
     floor = float(os.environ.get("EMOS_MIN_OVERALL_MBPS", "2.5"))
+    # 2026-11-24：夜间窗口先立预约旗（emos_night 做的），lane 交完当前集就不再领这个号。
+    # 否则 lane 是「收尾立刻领下一集」，释放到再 claim 之间只有亚秒级间隙 —— 轮询永远抢不到，
+    # 白天实测 4 个号全被 lane 占着，一轮都起不来。
+    _rsv = (os.environ.get("EMOS_RESERVED_SLOT") or "").strip()
+    if _rsv.isdigit():
+        _n = int(_rsv)
+        while True:
+            if GS.slot_lease(_n, run_id, ttl=10800):
+                print("  用预约号 slot%d（本窗口已立旗）" % _n, flush=True)
+                return _n
+            # 旗只保证「交完当前这集就不再领」，不抢别人正在传的那一集（会丢字节）。
+            if _remaining() < 600:
+                print("  预约号 slot%d 仍被上一集占着，预算不足，本轮不起跑" % _n, flush=True)
+                return 0
+            print("  预约号 slot%d 正被上一集使用，等 20s" % _n, flush=True)
+            time.sleep(20)
     dl = os.environ.get("EMOS_WAIT_DEADLINE", "07:30")
     hh, mm = [int(x) for x in dl.split(":")]
     deadline = datetime.datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -457,7 +473,7 @@ def main():
             print("   [dry] E%s %s %s %.2fGB" % (it.get("IndexNumber"), q, h, (ms.get("Size") or 0)/1e9))
         return 0
 
-    run_id = "emos-%d" % os.getpid()
+    run_id = os.environ.get("EMOS_RUN_ID") or ("emos-%d" % os.getpid())
     # 目标目录：只允许落在**台账里已存在的、带 {tmdb=} 锚点**的剧目录。
     # 旧代码缺省写到 `TV/国漫/<剧名>`，于是 Emby 另建同名剧、state_key 缺失（2026-11-21 事故）。
     if a.target_dir:

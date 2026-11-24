@@ -23,6 +23,7 @@ import time
 
 sys.path.insert(0, "/opt/embytg/pipeline")
 import emos_import as EI                                   # noqa: E402
+import gha_state as GS                                     # noqa: E402
 
 # 夜间补版清单：剧名 -> (年份, tmdb, 目标目录)
 TARGETS = [
@@ -98,6 +99,20 @@ def main():
     streak = 0
     deadline = time.time() + a.minutes * 60
     os.environ["EMOS_DEADLINE"] = str(int(deadline))
+    run_id = "emos-night-%d" % os.getpid()
+    os.environ["EMOS_RUN_ID"] = run_id
+    # 预约一个号给整个窗口：lane 收尾后不再领它，我们才拿得到（否则 4 个号全天被 lane 填满）。
+    reserved = None
+    try:
+        rows = EI.pool_rows()
+        best = max(rows, key=lambda n: (0 if rows[n][1] else 1, rows[n][0])) if rows else None
+        best = int(os.environ.get("EMOS_RESERVE_SLOT") or (best or 1))
+        if GS.slot_reserve(best, run_id, ttl=a.minutes * 60 + 900):
+            reserved = best
+            os.environ["EMOS_RESERVED_SLOT"] = str(best)
+            print("  预约 slot%d 给本窗口（%d 分钟）" % (best, a.minutes), flush=True)
+    except Exception as _e:                                    # noqa: BLE001
+        print("  预约号失败（继续按普通方式抢号）: %s" % str(_e)[:80], flush=True)
     os.environ.setdefault("EMOS_TRY_SLOTS", "2")   # 单集最多试 2 个号，别让一集吃光一夜
     os.environ.setdefault("EMOS_PROBE_S", "600")   # 先 10 分钟探针，落地过区段才给整预算
     os.environ.setdefault("EMOS_EP_MAX_S", "2400")  # 单集上限 40 分钟
@@ -118,6 +133,12 @@ def main():
         print("  E%s → rc=%s" % (p["ep"], rc), flush=True)
         ok += (rc == 0)
         streak = 0 if rc == 0 else streak + 1
+    if reserved is not None:
+        try:
+            os.unlink(GS._slot_reserve_path(reserved))
+        except OSError:
+            pass
+        print("  撤预约旗 slot%d" % reserved, flush=True)
     print("  完成 %d/%d 集（窗口 %d 分钟）" % (ok, len(picked), a.minutes), flush=True)
     return 0 if ok else 1
 
