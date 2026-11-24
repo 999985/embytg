@@ -49,6 +49,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import sys
 import time
 
@@ -59,13 +60,30 @@ LOCK = STATE + ".lock"
 
 ZERO_RCS = (3, 6)          # 3=QuotaRest（按秒休息）/ 6=零进展（一个分片都没落地）
 TRIP_FAILS = 3             # 连续多少次零进展失败开闸
-TRIP_WINDOW_SEC = 90 * 60  # 这些失败必须发生在多长的窗口内
+TRIP_WINDOW_SEC = 90 * 60  # **最近 TRIP_FAILS 次**失败必须落在多长的窗口内（滑动窗口）
 TRIP_MIN_LANES = 2         # 至少来自几条不同 lane
 HOLD_BASE_SEC = 600        # 首次按住 10 分钟
 HOLD_MAX_SEC = 1800
 PROBE_GAP_SEC = 180        # 到期后每 3 分钟放一条 lane 探一次
 RECENT_SEC = 6 * 3600      # 只保留/只看最近 6 小时的记录
 MAX_LINES = 4000
+
+# --- 槽位级闸门（2026-11-25，E207）-------------------------------------
+# 事故：近 6h slot1 0/12、slot3 0/6、slot4 0/7 零进展，slot2 却 38/12 正常。
+# 全局闸门按「≥2 条 lane」判，于是 slot2 的成功把三条坏槽位一起放行：
+# 每个 claim 都先从源站下完整集（1.4–2.5GB 硬顶配额）→ 上传 0 分片 → 释放 → 再领。
+# 判据错在两处：①窗口用 first→last 跨度（连续滴漏 2.6h > 90min 就判 window_expired，
+# 哪怕最近三次只隔 10 分钟）；②只看 lane，不看 slot，一条好 lane 掩盖三条死槽位。
+# 会话是**按槽位**坏的（每个槽位一个独立 session），所以判据也必须按槽位。
+SLOT_TRIP_FAILS = 2        # 同一槽位连续多少次零进展就按住它自己
+SLOT_WINDOW_SEC = 90 * 60  # 且最后一次必须发生在这么久之内（否则是旧账）
+SLOT_HOLD_BASE_SEC = 600   # 首次 10 分钟，逐次翻倍
+SLOT_HOLD_MAX_SEC = 1800
+# 全局按住（停整个池子）只在**整池都传不上去**时成立：45 分钟内只要有任何一条
+# 槽位成功过，就说明通道还在，坏的只是某几个会话 —— 那是上面槽位级闸门的活。
+# 否则一条好槽位的产出会被三条死槽位的失败拖停（11-25 07:00 实况：slot2 近 6h
+# 38 成功，若按旧全局判据仍会整池按住 30 分钟，白丢约 7 集产能）。
+GLOBAL_OK_GRACE_SEC = 45 * 60
 
 
 # ------------------------------------------------------------------ 基础 IO
@@ -170,15 +188,92 @@ def trip_decision(records, now=None):
            "hold_sec": 0, "reason": "not_tripped"}
     if len(zero) < TRIP_FAILS:
         return out
-    if zero[-1]["ts"] - zero[0]["ts"] > TRIP_WINDOW_SEC:
+    # E207：窗口必须看**最近 TRIP_FAILS 次**（滑动），不能用 first→last 跨度。
+    # 旧判据在「连续滴漏」下永远 window_expired：11-25 07:00 实况 7 次连续零进展
+    # 跨 2.6h → 判过期 → 全体槽位放行，于是三条死槽位继续每单烧一整集源站配额。
+    tail = zero[-TRIP_FAILS:]
+    if tail[-1]["ts"] - tail[0]["ts"] > TRIP_WINDOW_SEC:
         out["reason"] = "window_expired"
         return out
-    if len(lanes) < TRIP_MIN_LANES:
+    if len({str(r.get("lane") or "?") for r in tail}) < TRIP_MIN_LANES:
         out["reason"] = "single_lane"
+        return out
+    # E207：整池还有成功 → 只可能是部分会话坏，交给槽位级闸门，别停全池。
+    last_ok = max([r["ts"] for r in recs if r.get("result") == "ok"], default=0.0)
+    if last_ok and now - last_ok <= GLOBAL_OK_GRACE_SEC:
+        out["reason"] = "some_slot_ok"
         return out
     n = len(zero) - TRIP_FAILS
     out["hold_sec"] = min(HOLD_MAX_SEC, HOLD_BASE_SEC * (2 ** min(n, 4)))
     out["reason"] = "tripped"
+    return out
+
+
+def _slot_of(r):
+    """记录属于哪个槽位：优先显式字段，旧台账从 claim 名里抠 `-slotN-`。"""
+    try:
+        s = int(r.get("slot") or 0)
+    except (TypeError, ValueError):
+        s = 0
+    if s:
+        return s
+    m = re.search(r"-slot(\d+)-", str(r.get("claim") or ""))
+    return int(m.group(1)) if m else 0
+
+
+def slot_trip(records, slot, now=None):
+    """单个槽位自己的「连续零进展」判决（E207）。与全局闸门互不影响。
+
+    只看这个槽位**自己上次成功之后**的零进展失败：会话是按槽位的（每槽一个
+    session），一条 lane 好不代表另一条槽位没死；反过来，死槽位的账也不能
+    拖住好槽位。返回 {slot, n, last_ts, hold_sec, reason}。
+    """
+    now = _now(now)
+    out = {"slot": int(slot or 0), "n": 0, "last_ts": 0.0,
+           "hold_sec": 0, "reason": "ok"}
+    if not slot:
+        return out
+    recs = [r for r in records if r.get("ts", 0) >= now - RECENT_SEC]
+    mine = [r for r in recs if _slot_of(r) == int(slot)]
+    last_ok = max([r["ts"] for r in mine if r.get("result") == "ok"], default=0.0)
+    zero = [r for r in mine
+            if r.get("result") == "fail" and int(r.get("rc") or 0) in ZERO_RCS
+            and r["ts"] > last_ok]
+    out["n"] = len(zero)
+    if len(zero) < SLOT_TRIP_FAILS:
+        return out
+    out["last_ts"] = zero[-1]["ts"]
+    if now - zero[-1]["ts"] > SLOT_WINDOW_SEC:
+        out["reason"] = "slot_window_expired"
+        return out
+    n = len(zero) - SLOT_TRIP_FAILS
+    out["hold_sec"] = min(SLOT_HOLD_MAX_SEC, SLOT_HOLD_BASE_SEC * (2 ** min(n, 4)))
+    out["reason"] = "tripped"
+    return out
+
+
+def _slot_gate(out, records, state, slot, now):
+    """把槽位级判决叠加到 out 上（只在全局已放行时生效）。"""
+    st = slot_trip(records, slot, now)
+    if not slot:
+        return out
+    su = state.get("slot_until")
+    if not isinstance(su, dict):
+        su = {}
+        state["slot_until"] = su
+    key = str(int(slot))
+    out["slot_n"] = st["n"]
+    out["slot_reason"] = st["reason"]
+    if st["reason"] == "tripped":
+        want = st["last_ts"] + st["hold_sec"]
+        if want > float(su.get(key) or 0):
+            su[key] = want
+    until = float(su.get(key) or 0)
+    if until and now < until:
+        out.update(allow=False, reason="slot_holding",
+                   wait_sec=int(until - now) + 20, slot_until=until)
+    elif until:
+        su.pop(key, None)          # 到期即清，旧的失败账不许无限按住
     return out
 
 
@@ -197,7 +292,7 @@ def gate_decision(records, state, slot=0, now=None):
         if state.get("open_until"):
             state["open_until"] = 0
         out["reason"] = d["reason"]
-        return out
+        return _slot_gate(out, records, state, slot, now)
 
     # 开闸时刻 = 最后一次零进展失败 + hold。状态里记 open_until，跨进程一致。
     open_until = float(state.get("open_until") or 0)
@@ -220,17 +315,19 @@ def gate_decision(records, state, slot=0, now=None):
         return out
     state["probe_ts"] = now
     out.update(allow=True, reason="probe")
-    return out
+    return _slot_gate(out, records, state, slot, now)
 
 
 # ------------------------------------------------------------------ 落盘入口
 
-def record(result, rc=0, nbytes=0, claim="", lane="", err="", now=None, path=None):
+def record(result, rc=0, nbytes=0, claim="", lane="", err="", now=None, path=None,
+           slot=0):
     """记一条上传结果，并顺手维护闸门状态。返回写入的记录。"""
     now = _now(now)
     rec = {"ts": round(now, 3), "result": result, "rc": int(rc or 0),
            "bytes": int(nbytes or 0), "claim": str(claim or "")[:80],
-           "lane": str(lane or "")[:24], "err": str(err or "")[:200]}
+           "lane": str(lane or "")[:24], "err": str(err or "")[:200],
+           "slot": int(slot or 0)}
     path = path or LEDGER
     _ensure_dir(path)
     try:
@@ -346,7 +443,7 @@ def main():
     a = ap.parse_args()
 
     if a.record:
-        rec = record(a.record, a.rc, a.nbytes, a.claim, a.lane, a.err)
+        rec = record(a.record, a.rc, a.nbytes, a.claim, a.lane, a.err, slot=a.slot)
         print(json.dumps(rec, ensure_ascii=False))
         return 0
     if a.reset:

@@ -112,7 +112,12 @@ async def main():
     else:
         raise SystemExit("缺少 TG_SESSION_STRING 或 TG_SESSION_FILE")
     c = TelegramClient(StringSession(session_str), API_ID, API_HASH,
-                       proxy=PROXY, connection_retries=4, timeout=180)
+                       proxy=PROXY, connection_retries=4, timeout=180,
+                       # E207：telethon 默认把客户端级重试耗尽后的真实异常吞成
+                       # `ValueError: Request was unsuccessful N time(s)`，
+                       # 11-24→11-25 的 42 次 ZERO_PROGRESS 因此查了两天只能靠猜。
+                       # 打开它，upload.log 里留下 RpcCallFail/TimedOut/FloodWait 的类型。
+                       raise_last_call_error=True)
     await c.connect()
     res = await c(GetChannelsRequest([InputChannel(STORE_CH, 0)]))
     ch = res.chats[0]

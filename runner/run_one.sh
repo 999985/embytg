@@ -703,7 +703,7 @@ if [ "$UPLOAD_OK" != "1" ]; then
 fi
 if [ "$UPLOAD_OK" = "1" ]; then
   "$SYSPY" "$PIPELINE_DIR/upload_health.py" --record ok --rc 0 --bytes "$UP_BYTES" \
-    --claim "$RUN_KEY" --lane "${ACTIVE_LANE:-$MODE}" --err="" \
+    --claim "$RUN_KEY" --lane "${ACTIVE_LANE:-$MODE}" --slot "$SLOT" --err="" \
     >>"$BASE/logs/upload_health.err" 2>&1 || true
 fi
 if [ "$UPLOAD_OK" != "1" ]; then
@@ -711,7 +711,7 @@ if [ "$UPLOAD_OK" != "1" ]; then
   UP_ERR=$(grep -a -E "ZERO_PROGRESS|worker 超时|FloodWait|RPC 超时|QuotaRest|no manifest" "$WORK/upload.log" \
             | tail -1 | tr -d '\r' | cut -c1-180)
   "$SYSPY" "$PIPELINE_DIR/upload_health.py" --record fail --rc "$UPLOAD_RC" --bytes "$UP_BYTES" \
-    --claim "$RUN_KEY" --lane "${ACTIVE_LANE:-$MODE}" --err="$UP_ERR" \
+    --claim "$RUN_KEY" --lane "${ACTIVE_LANE:-$MODE}" --slot "$SLOT" --err="$UP_ERR" \
     >>"$BASE/logs/upload_health.err" 2>&1 || true
   # E157：源文件不要跟着 media.slotN 一起被 rm 掉。留到 _keep，下一单硬链接复用；
   # 同一份字节第二次仍失败 → 判为坏件，删掉不再复用（否则会无限重传同一坏文件）。

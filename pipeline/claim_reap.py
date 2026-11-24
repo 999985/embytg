@@ -226,6 +226,50 @@ def sweep_heartbeats(max_age=3600):
     return n
 
 
+def sweep_slot_leases(apply=False, grace=180, now=None):
+    """回收「持有者已死」的 session 租约（2026-11-25 E206c）。
+
+    事故形状：run_one 被 systemd 重启/SIGKILL 后，`.gha_slots/slotN.lock`
+    还留着、TTL 写着 10800s —— 三个小时内所有 lane 领活都 `no_session`。
+    实测 06:40 重启四个 runner，两分钟内 slot2/slot3 就开始刷 no_session。
+
+    判活只看心跳（run_one.sh 每 30s 写 run/<run_id>.hb）：租约里的 run_id
+    没有新鲜心跳 = 持有者已死，直接释放。心跳新鲜的一律不碰。
+    """
+    import gha_state as GS
+    out = []
+    base = now or time.time()
+    try:
+        names = sorted(os.listdir(GS.SLOT_DIR))
+    except Exception:                                          # noqa: BLE001
+        return out
+    for name in names:
+        if not (name.startswith("slot") and name.endswith(".lock")):
+            continue
+        pth = os.path.join(GS.SLOT_DIR, name)
+        try:
+            with open(pth, encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+        except Exception:                                      # noqa: BLE001
+            continue
+        run_id = str(d.get("run_id") or "")
+        if not run_id:
+            continue
+        if base - float(d.get("ts") or 0) < grace:             # 太新，可能是正在起的
+            continue
+        if GS._hb_fresh(run_id, max_age=grace):                # 持有者活着
+            continue
+        freed = False
+        if apply:
+            try:
+                os.unlink(pth)
+                freed = True
+            except Exception:                                  # noqa: BLE001
+                freed = False
+        out.append((name, run_id, freed))
+    return out
+
+
 def main():
     # 条目级 claim 的过期清理（2026-11-20）：TTL 到期的 key 必须放回去，
     # 否则某一集会被永久锁住、谁也领不了。
@@ -246,6 +290,15 @@ def main():
     ap.add_argument("--aggressive", action="store_true")
     ap.add_argument("--age-min", type=float, default=0)
     a = ap.parse_args()
+
+    try:
+        _leases = sweep_slot_leases(apply=a.apply)
+        for _nm, _rid, _freed in _leases:
+            print("  僵尸租约 %s run=%s → %s" % (_nm, _rid, "已释放" if _freed else "可释放"))
+        if not _leases:
+            print("  僵尸租约: 0 个")
+    except Exception as _e:                                   # noqa: BLE001
+        print("  租约回收跳过: %s" % str(_e)[:50])
 
     print("  本机槽位=%s（systemd 实际在管；slot 是锁槽不是机器编号）"
           % (",".join(sorted(_LOCAL_SLOTS)) or "?（systemctl 查询失败，只按时间判）"))
