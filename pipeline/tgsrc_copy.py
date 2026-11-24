@@ -80,6 +80,11 @@ def upload_budget(size_bytes, mbps, jobs):
 
     昨夜实测 0.14-0.23MB/s（8 并发 → 整体约 1.1-1.8MB/s），1.3GB 在 1200s 里
     连一个 512MiB 区段都传不完：8 个尝试 7 个被杀，manifest 0 个区段。
+
+    2026-11-24 修正：外层预算必须 ≥ pc_upload 自己的单区段预算
+    （auto_worker_timeout：floor 1800 / cap 2700），否则「区段还在正常落地、
+    外层先到 900s SIGKILL」——1.66GB 在 slot2 实测连续两轮都是这么废掉的。
+    区段是并发跑的，整轮墙钟 ≈ 一个区段 + md5/登记开销。
     """
     try:
         jobs = max(1, int(jobs))
@@ -89,8 +94,12 @@ def upload_budget(size_bytes, mbps, jobs):
         mbps = float(mbps or 0)
     except (TypeError, ValueError):
         mbps = 0.0
-    overall = mbps * jobs if mbps > 0 else 8.0
-    budget = int(float(size_bytes) / (max(0.3, overall * 0.6) * 1e6) + 240)
+    chunk = 512 * 1024 * 1024
+    if mbps <= 0:
+        per_chunk = 1800
+    else:
+        per_chunk = int(min(2700, max(1800, (chunk / 1e6) / max(0.05, mbps) * 1.8 + 180)))
+    budget = per_chunk + 420
     return max(900, min(3600, budget))
 
 
@@ -155,6 +164,18 @@ def upload(env, slot, path):
         _sz = 0
     _jobs = int(os.environ.get("TG_UPLOAD_JOBS", "8") or 8)
     _budget = upload_budget(_sz, slot_mbps(slot), _jobs)
+    # 2026-11-24：夜间窗口（EMOS_DEADLINE=epoch）不能把单次上传预算开到窗口之外，
+    # 否则 systemd 到点 SIGTERM 连人带文件一起砍，日志里连「完成 x/y」都等不到。
+    _dl = (os.environ.get("EMOS_DEADLINE") or "").strip()
+    if _dl:
+        try:
+            _rem = float(_dl) - time.time()
+        except ValueError:
+            _rem = None
+        if _rem is not None:
+            if _rem < 300:
+                raise UploadTimeout("窗口预算不足 300s，不做上传（slot%s）" % slot)
+            _budget = max(300, int(min(_budget, _rem - 60)))
     try:
         r = subprocess.run(cmd, env=env2, capture_output=True, text=True, timeout=_budget)
     except subprocess.TimeoutExpired as _te:

@@ -74,7 +74,7 @@ RUN_KEY=""
 # TTL（3h）或孤儿判定才回收 —— 3 次上传之后三个号全占满，之后每次领单都报
 # no_session（近 2 小时 37 次，是最大的错误源）。退出时统一释放。
 RUN_KEYS=()
-# 2026-11-24（E2xx）：心跳子进程必须逐个记账。
+# 2026-11-24（E202）：心跳子进程必须逐个记账。
 # 原来只存最后一个 PID（RUN_HB_PID），一个 run_one 跑过 3 条 lane 就漏 2 个心跳；
 # 更致命的是心跳子进程继承了 fd 9（slot 锁），子进程不死 → 锁永不释放。
 RUN_HB_PIDS=()
@@ -210,7 +210,7 @@ cleanup() {
     cancel_claim "runner_exit_rc_${rc}"
   fi
   log "EXIT ${RUN_KEY:-none} rc=$rc"
-  # 2026-11-24（E2xx）：这里原本是 `trap cleanup EXIT`，把上面第 93 行的
+  # 2026-11-24（E202）：这里原本是 `trap cleanup EXIT`，把上面第 93 行的
   # `trap release_leases EXIT` **整个覆盖掉** —— 于是 release_leases 从来没执行过：
   #   · session 租约从不释放 → 领单报 no_session（37 次的真因）
   #   · 心跳子进程从不回收 → 它继承的 fd 9 让 slot 锁永不释放

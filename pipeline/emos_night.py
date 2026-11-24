@@ -19,6 +19,7 @@ import argparse
 import os
 import sqlite3
 import sys
+import time
 
 sys.path.insert(0, "/opt/embytg/pipeline")
 import emos_import as EI                                   # noqa: E402
@@ -49,6 +50,8 @@ def local_4k(tmdb):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=12)
+    ap.add_argument("--minutes", type=int, default=330,
+                    help="整轮墙钟预算（分钟），到点前 5 分钟起不再开新集；比 unit 的 TimeoutStartSec 短")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--series", default="")
     a = ap.parse_args()
@@ -92,7 +95,13 @@ def main():
         return 0
 
     ok = 0
+    deadline = time.time() + a.minutes * 60
+    os.environ["EMOS_DEADLINE"] = str(int(deadline))
+    os.environ.setdefault("EMOS_TRY_SLOTS", "2")   # 单集最多试 2 个号，别让一集吃光一夜
     for p in picked:
+        if time.time() > deadline - 300:
+            print("  窗口到点（--minutes %d），提前收工" % a.minutes, flush=True)
+            break
         cmd = [sys.executable, "/opt/embytg/pipeline/emos_import.py",
                "--series", p["name"], "--year", str(p["year"]),
                "--eps", str(p["ep"]), "--limit", "1", "--apply",
@@ -100,7 +109,7 @@ def main():
         rc = os.spawnv(os.P_WAIT, sys.executable, cmd)
         print("  E%s → rc=%s" % (p["ep"], rc), flush=True)
         ok += (rc == 0)
-    print("  完成 %d/%d 集" % (ok, len(picked)))
+    print("  完成 %d/%d 集（窗口 %d 分钟）" % (ok, len(picked), a.minutes), flush=True)
     return 0 if ok else 1
 
 

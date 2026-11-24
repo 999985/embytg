@@ -136,7 +136,7 @@ def runner_stats(since_ts=None):
     旧版把这些一起计数，得出「80% 失败率」的假信号。
     since_ts 之后的失败另记 job_fail_new —— 巡检只对新失败告警。
 
-    2026-11-24（E199）：**没有领到活的 EXIT 也不是失败。**
+    2026-11-24（E202）：**没有领到活的 EXIT 也不是失败。**
     上一版仍把 `[slot3] NOJOB … IDLE_WITH_ERRORS` 后的 `EXIT rc=1` 当成整单失败，
     于是「三个号都被租约占住、一条 lane 领不到单」这种调度状态又变成告警
     （06:49 的「整单失败×5」里 4 条就是它）。现在按 slot 记账：
@@ -232,7 +232,7 @@ def _paused():
     return False
 
 
-SILENCE_SEC = int(os.environ.get("TIMER_AUDIT_SILENCE_SEC", 3 * 3600))
+SILENCE_SEC = int(os.environ.get("TIMER_AUDIT_SILENCE_SEC", 2 * 3600))
 LOCK_STUCK_NEW = int(os.environ.get("TIMER_AUDIT_LOCK_SPAM", 40))
 
 

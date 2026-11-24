@@ -305,6 +305,20 @@ def parse_eps(spec):
     return out
 
 
+def _deadline():
+    """夜间窗口的硬截止（epoch 秒）。无 EMOS_DEADLINE 时返回 0 = 不设限。"""
+    v = os.environ.get("EMOS_DEADLINE", "").strip()
+    try:
+        return float(v) if v else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _remaining():
+    dl = _deadline()
+    return (dl - time.time()) if dl else 1e9
+
+
 def pool_rows():
     """{slot: (实测单 worker MB/s, 是否冷却)}，直接读上传池，不猜速度。"""
     return {int(r["slot"]): (float(r.get("mbps") or 0), bool(r.get("cooling")))
@@ -432,9 +446,19 @@ def main():
     if not slot:
         return 2
     order = slot_order(pool_rows())
+    # 2026-11-24：窗口是有墙钟的（systemd TimeoutStartSec=6h）。以前一个 1.6GB 的集
+    # 会挨个号硬试（每个 900–2400s 预算），4 个号烧掉 87 分钟仍 0 产出，
+    # 首个集就把整夜吃掉。现在：单集最多试 EMOS_TRY_SLOTS 个号（默认不限，夜间设 2），
+    # 且每次尝试前先看剩余预算，不够 300s 就不起。
+    _cap = int(os.environ.get("EMOS_TRY_SLOTS", "0") or 0)
+    done = 0
+    attempted = 0
     try:
         env = TC.load_env()
         for it in todo:
+            if _remaining() < 420:
+                print("  窗口预算只剩 %ds，本轮提前收工" % max(0, int(_remaining())), flush=True)
+                break
             url, ms = e.direct_url(it["Id"])
             if not url:
                 print("  E%s 无直链，跳过" % it.get("IndexNumber")); continue
@@ -483,9 +507,18 @@ def main():
             os.replace(tmp, dest)
             parts = None
             # 快的号先试；超时要换号续传（manifest 认已完成区段），不能一失败就丢集
-            for try_slot in [slot] + [x for x in order if x != slot]:
+            attempted += 1
+            tries = [slot] + [x for x in order if x != slot]
+            if _cap > 0:
+                tries = tries[:_cap]
+            for try_slot in tries:
                 if try_slot != slot and not GS.slot_lease(try_slot, run_id, ttl=7200):
                     continue
+                if _remaining() < 300:
+                    print("  E%s 剩余预算 < 300s，不再开新号，留到下一轮" % ep, flush=True)
+                    if try_slot != slot:
+                        GS.slot_release(try_slot, run_id)
+                    break
                 try:
                     parts = TC.upload(env, try_slot, dest)
                 except (Exception, SystemExit) as ex:
@@ -506,6 +539,13 @@ def main():
             write_nfo(os.path.join("/opt/embytg/mnt/embytg", tdir), name, it, season=a.season)
             scan_one(os.path.join("/mnt/embytg", tdir, name))
             os.remove(dest)
+            done += 1
+            print("  E%d 入库完成（本轮 %d/%d）" % (ep, done, attempted), flush=True)
+        if attempted and not done:
+            # 以前这里无条件 return 0 → 上层把「上传全失败、库里根本没有这一集」
+            # 也计成成功（2026-11-24 E43：4 个号全超时，rc=0）。
+            print("  本轮 %d 集全部上传失败，0 集入库" % attempted, flush=True)
+            return 3
         return 0
     finally:
         GS.slot_release(slot, run_id)
