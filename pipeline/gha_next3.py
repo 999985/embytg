@@ -40,6 +40,81 @@ import lane_queue as LQ         # noqa: E402
 import quality_gate as QG       # noqa: E402 —— 画质判据唯一入口（两条线：STOCK/ADMIT）
 
 LOCK = os.path.join(HERE, ".gha_next.lock")
+
+# --- lane 锁看门狗 + 阶段标记（2026-11-25，E211） -------------------------
+# 事故：fill 的 selector 卡在一个**没有超时**的 TLS 读上（ESTAB 到源站，
+# 3h20m 零字节、无子进程），期间一直持有 `.gha_next.fill.lock`。三条 fill lane
+# 每轮等满 --lock-wait 900s 后以 `reason=busy` 退出 —— 洗版整条线 3 小时
+# 一次活都没领到，而 loop.log 里只有「GLOBAL_STOP reason=busy」，看不出是谁
+# 卡住、卡在哪一步。判据错在「锁拿到就一直算健康」：锁没有租期、没有持有者、
+# 没有阶段。现在三件事补齐：
+#   ① socket 默认超时（兜住无 timeout 的裸读，任何一次读不再能挂死整条 lane）；
+#   ② 看门狗写 `.gha_next.<lane>.lock.holder`（pid/持有秒数/阶段），超过
+#      EMBYTG_LANE_LOCK_MAX_SEC 主动退出交回锁（flock 随进程退出释放）；
+#   ③ timer_audit 读这个文件，持有超时 = 告警（不再等人去 fuser）。
+LANE_LOCK_MAX_SEC = int(os.getenv("EMBYTG_LANE_LOCK_MAX_SEC", "1200"))
+LANE_LOCK_BEAT_SEC = int(os.getenv("EMBYTG_LANE_LOCK_BEAT_SEC", "15"))
+_STAGE = {"name": "init"}
+
+
+def stage(name):
+    """记录当前阶段，写进 holder 健康文件 —— 出事时一眼看出卡在哪。"""
+    _STAGE["name"] = name
+
+
+def _start_lock_watchdog(lane):
+    import threading
+    holder = os.path.join(HERE, ".gha_next.%s.lock.holder" % lane)
+    t0 = time.time()
+
+    def _beat():
+        while True:
+            held = time.time() - t0
+            st = _STAGE["name"]
+            try:
+                with open(holder, "w", encoding="utf-8") as fh:
+                    json.dump({"pid": os.getpid(), "lane": lane,
+                               "start": int(t0), "updated": int(time.time()),
+                               "held_sec": int(held), "stage": st,
+                               "max_sec": LANE_LOCK_MAX_SEC}, fh)
+            except Exception:                            # noqa: BLE001
+                pass
+            # claim 已经写盘后再退出只会让 runner 空等，那时宁可让它跑完。
+            if held > LANE_LOCK_MAX_SEC and st != "claim_written":
+                print("  ! lane=%s 锁持有 %ds 超过上限 %ds（stage=%s）"
+                      " → 主动退出把锁交回池子"
+                      % (lane, held, LANE_LOCK_MAX_SEC, st),
+                      file=sys.stderr, flush=True)
+                os._exit(3)
+            time.sleep(LANE_LOCK_BEAT_SEC)
+
+    th = threading.Thread(target=_beat, daemon=True)
+    th.start()
+    return holder
+
+
+def lock_holder_health(path=None):
+    """给巡检用：返回 {"lane":..,"held_sec":..,"stage":..,"alive":bool} 或 None。"""
+    try:
+        if path is None:
+            return None
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+        pid = int(d.get("pid") or 0)
+        alive = False
+        if pid:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        d["alive"] = alive
+        d["stale_sec"] = int(time.time() - float(d.get("updated") or 0))
+        return d
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
 # 2026-11-13 软租约改造后，源解析不再整源排除被占用的源（那会让第 4/5 台
 # 机器永远 NOJOB）。这里保留一个模块级硬排除集合，留空；将来若某个源彻底
 # 不可用需要全局禁用，就往这里加，不要再用「被 claim 占用」当排除理由。
@@ -156,6 +231,8 @@ def clear_held_lease():
 
 
 def emit(obj):
+    stage("claim_written" if (isinstance(obj, dict) and obj.get("ok") and obj.get("job"))
+          else "emit_%s" % (obj.get("reason") if isinstance(obj, dict) else "?"))
     print(json.dumps(obj, ensure_ascii=False), flush=True)
 
 
@@ -2148,6 +2225,15 @@ def main():
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
 
+    # E211：裸 socket 读没有超时会把整条 lane 挂死（实测 3h20m）。
+    # 只在缺省值上兜底，不覆盖各请求自己声明的 timeout。
+    try:
+        import socket as _socket
+        _socket.setdefaulttimeout(float(os.getenv("EMBYTG_SOCKET_TIMEOUT_SEC", "60")))
+    except Exception:                                    # noqa: BLE001
+        pass
+    stage("argparse")
+
     # 2026-11-20：**锁按 lane 分，不再全进程独占。**
     # 原来是单文件 .gha_next.lock，谁抢到谁独占整个「选片+扫描」过程——
     # 5 台机器排队等一把锁，加机器等于没加。lane 之间没有共享可变状态
@@ -2164,6 +2250,9 @@ def main():
                 emit({"ok": False, "reason": "busy"})
                 return 0
             time.sleep(2)
+
+    stage("lock_acquired")
+    _start_lock_watchdog(a.lane)
 
     if os.path.exists(PAUSE_FILE) and not a.force:
         try:
@@ -2497,6 +2586,7 @@ def main():
     # 否则一次 NOJOB 就把唯一的 session 锁死 3 小时，整条链路停摆。
     # 成功领片时租约随 claim 走，由 gha_cancel/gha_finish 在收尾时归还。
     hold_lease(slot, _rid)
+    stage("lease_held")
     # 2026-11-14：先把「点名源当前可用」的条目排到最前。
     # 起因：加了 hint_source_busy 短路后，一轮 30 次尝试里 24 次是"源不可用"直接跳过——
     # 便宜但没产出。队列 6000 条散在 9 个源上，而节流时只有 1-2 个源可用，

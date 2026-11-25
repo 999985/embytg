@@ -240,6 +240,41 @@ def _paused():
 
 SILENCE_SEC = int(os.environ.get("TIMER_AUDIT_SILENCE_SEC", 2 * 3600))
 LOCK_STUCK_NEW = int(os.environ.get("TIMER_AUDIT_LOCK_SPAM", 40))
+LANE_HOLD_WARN_SEC = int(os.environ.get("TIMER_AUDIT_LANE_HOLD_SEC", 1200))
+
+
+def lane_lock_health():
+    """E211：lane 选择锁被单个进程长期持有 = 该 lane 整条线领不到活。
+
+    事故（2026-11-25）：fill 的 selector 卡在没有超时的 TLS 读上 3h20m，
+    一直持有 `.gha_next.fill.lock`。三条 fill lane 每轮等满 900s 后
+    `reason=busy` 退出 —— 洗版 3 小时零领取，而旧巡检只看得见「runner 没产出」，
+    看不出是「锁被谁占着」。判据：holder 文件里的 held_sec 超过阈值且进程还活着。
+    """
+    import glob
+    out = []
+    for p in sorted(glob.glob(os.path.join(HERE, ".gha_next.*.lock.holder"))):
+        try:
+            with open(p, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except Exception:                                # noqa: BLE001
+            continue
+        pid = int(d.get("pid") or 0)
+        alive = False
+        if pid:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        held = int(d.get("held_sec") or 0)
+        if not alive:
+            continue                                     # 进程已死，flock 已释放
+        if held >= LANE_HOLD_WARN_SEC:
+            out.append({"lane": d.get("lane"), "pid": pid, "held_sec": held,
+                        "stage": d.get("stage")})
+    return out
+
 
 
 def main():
@@ -279,13 +314,19 @@ def main():
             lock_new = cur_lock
     lock_stuck = lock_new >= LOCK_STUCK_NEW and not paused
 
-    problems = bool(new_fail) or bool(job_fail_new) or silent or lock_stuck
+    # E211：lane 选择锁持有超时 —— 一条 lane 整线领不到活，日志只有 reason=busy。
+    lane_hold = [] if paused else lane_lock_health()
+
+    problems = (bool(new_fail) or bool(job_fail_new) or silent or lock_stuck
+                or bool(lane_hold))
 
     report = {"ts": int(time.time()), "services": svc, "runner": run,
               "new_fail": new_fail, "problems": problems,
               "silent": silent, "lock_stuck": lock_stuck,
+              "lane_hold": lane_hold,
               "lock_new": lock_new, "lock_total": cur_lock,
               "cursors": new_cursors}
+
 
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
@@ -317,6 +358,10 @@ def main():
             _rs = {}
         for k, v in _rs.items():
             print("   %-24s %d" % (k, v))
+        if lane_hold:
+            for x in lane_hold:
+                print("   ! lane=%s 选择锁已被 pid=%d 持有 %d 分钟（stage=%s）"
+                      % (x["lane"], x["pid"], x["held_sec"] // 60, x.get("stage")))
 
     try:
         with open(STATE, "w", encoding="utf-8") as fh:
@@ -336,8 +381,15 @@ def main():
                 top = (top + "，" if top else "") + "runner 静默 %d 分钟零收尾" % (int(silent_sec or 0) // 60)
             if lock_stuck:
                 top = (top + "，" if top else "") + "抢锁空转 +%d 次（slot 锁可能未释放）" % lock_new
+            if lane_hold:
+                top = (top + "，" if top else "") + "lane 选择锁持有超时：%s" % ", ".join(
+                    "%s/%dmin(pid=%d,stage=%s)" % (x["lane"], x["held_sec"] // 60,
+                                                   x["pid"], x.get("stage"))
+                    for x in lane_hold[:3])
             code = "timer_silent" if (silent or lock_stuck) and not (new_fail or job_fail_new) else "timer_audit"
-            A.alert("P1" if (silent or lock_stuck) else "warn", code,
+            if lane_hold and not (new_fail or job_fail_new or silent or lock_stuck):
+                code = "lane_lock_stuck"
+            A.alert("P1" if (silent or lock_stuck or lane_hold) else "warn", code,
                     "定时任务异常：%s" % top)
         except Exception:                                   # noqa: BLE001
             pass
