@@ -14,7 +14,7 @@ import sys
 HERE = "/opt/embytg-runner"
 SRC = os.path.join(HERE, "media.busan/釜山行2：半岛 (2020) {tmdb=581392} - 720p.mp4")
 NAME = "釜山行2：半岛 (2020) {tmdb=581392} - 720p.mp4"
-PIECES = 4
+PIECES = int(os.environ.get("PIECES", "6"))
 
 env = {}
 for line in open(os.path.join(HERE, "runner.env"), encoding="utf-8"):
@@ -37,6 +37,7 @@ async def main():
         e = dict(env)
         e["TG_SESSION_STRING"] = SESSIONS[i % len(SESSIONS)]
         e["TG_CHUNK_MIB"] = "1800"
+        e["TG_CHUNK_DEADLINE"] = os.environ.get("TG_CHUNK_DEADLINE", "5400")
         jobs.append((i, off, ln, e))
 
     async def run(i, off, ln, envv):

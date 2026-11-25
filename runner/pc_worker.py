@@ -119,8 +119,31 @@ async def main():
                        # 打开它，upload.log 里留下 RpcCallFail/TimedOut/FloodWait 的类型。
                        raise_last_call_error=True)
     await c.connect()
-    res = await c(GetChannelsRequest([InputChannel(STORE_CH, 0)]))
-    ch = res.chats[0]
+    # E208（2026-11-25）：并发上传时 res.chats 会空。
+    # pc_upload 起多个 worker 共用一个 session 时，GetChannelsRequest 并发
+    # 会撞 FloodWait/内部错误，返回的 chats 为空 → res.chats[0] 直接
+    # IndexError，上层只看到「worker 未返回 MSG」。实测 jobs=2/4 必崩、
+    # jobs=1 正常，就是这条。改成重试 + 兜底 get_entity + 明确报错。
+    ch = None
+    for _i in range(5):
+        try:
+            res = await c(GetChannelsRequest([InputChannel(STORE_CH, 0)]))
+            if getattr(res, "chats", None):
+                ch = res.chats[0]
+                break
+        except Exception as _e:                              # noqa: BLE001
+            print("  [store-ch] 第 %d 次解析异常: %s" % (_i + 1, type(_e).__name__), flush=True)
+        if ch is None:
+            try:
+                ent = await c.get_entity(STORE_CH)
+                if ent is not None:
+                    ch = ent
+                    break
+            except Exception:                                # noqa: BLE001
+                pass
+        await asyncio.sleep(2 + 2 * _i)
+    if ch is None:
+        raise SystemExit("存储频道解析失败: %s（GetChannels 返回空且 get_entity 也失败）" % STORE_CH)
     peer = InputPeerChannel(ch.id, ch.access_hash)
 
     pc = (a.length + MTPART - 1) // MTPART
