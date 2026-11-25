@@ -95,6 +95,42 @@ def episode_key_of(rel):
     return (series, int(m.group(1)) if m else 0, int(m.group(2)) if m else 0)
 
 
+def load_fallback_index(path, keys=None):
+    """读兜底账 → {(series, season, ep): [mbps,...]}。
+
+    2026-11-26 根因修复：**不做时间过滤**。
+    log_fallback 的 ts 是「准入决定时刻」，而台账 landed_at 是「上传落库时刻」，
+    中间隔着下载+排队+上传（实测同一集可差 8 小时）。原来用 25h 窗口去对 24h 台账，
+    等于拿两个不同时钟相减：黎明之前 E1、骄阳伴我 E1/E2 明明有账（backfill 记录），
+    却因为 ts 比 landed_at 早 8h 掉出窗口被判「漏网」。
+    判据本来就不该看时间：一集被记为兜底就是兜底，重复下载同一集也只会再写一条账。
+    keys 非空时只保留候选 key（本轮低于线的条目），内存与库规模无关。
+    """
+    idx = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    j = json.loads(ln)
+                except Exception:                                   # noqa: BLE001
+                    continue
+                try:
+                    k = (str(j.get("series") or ""), int(j.get("season") or 0),
+                         int(j.get("ep") or 0))
+                    v = float(j.get("mbps") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if keys is not None and k not in keys:
+                    continue
+                idx.setdefault(k, []).append(v)
+    except OSError:
+        pass
+    return idx
+
+
 def classify_bitrate(rows, fb_index, tol=0.12):
     """把低于码率线的条目分成「兜底已记账」与「漏网」。
 
@@ -482,22 +518,9 @@ def main():
                 _r3.append(dict(rel=_it.get("Path") or "", size=_sz3, dur=_d3,
                                 w=(_vs[0].get("Width") or 0) if _vs else 0,
                                 h=(_vs[0].get("Height") or 0) if _vs else 0))
-        # 兜底账（25h 窗口，比 24h 宽一点防跨轮边界）
-        _fb3 = {}
-        try:
-            for _ln in open(os.path.join(_base3, "logs", "quality_fallback.jsonl"),
-                            encoding="utf-8"):
-                try:
-                    _j = json.loads(_ln)
-                except Exception:                                   # noqa: BLE001
-                    continue
-                if float(_j.get("ts") or 0) < _now3 - 90000:
-                    continue
-                _k = (str(_j.get("series") or ""), int(_j.get("season") or 0),
-                      int(_j.get("ep") or 0))
-                _fb3.setdefault(_k, []).append(float(_j.get("mbps") or 0))
-        except OSError:
-            pass
+        # 兜底账：全历史按 (series,season,ep) 对账，不做时间窗（见 load_fallback_index 注释）。
+        _cand3 = {episode_key_of(x.get("rel")) for x in _r3}
+        _fb3 = load_fallback_index(os.path.join(_base3, "logs", "quality_fallback.jsonl"), _cand3)
         _v3 = classify_bitrate(_r3, _fb3)
         line(not _v3["leak"] and _v3["rate"] >= 95, "新入库码率达标",
              "近24h %d 集，达标率 %.1f%%（兜底 %d 已记账｜漏网 %d%s）" % (
