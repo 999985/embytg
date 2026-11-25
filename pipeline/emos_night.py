@@ -162,6 +162,22 @@ def main():
                 stop = True
                 break
             rounds += 1
+            # 2026-11-25（E210）：预约号是「保证有一个号」的手段，不是「只能用它」。
+            # 02:10 那夜预约到 slot1（当时实测最优），之后它被 TG 压到 0.41MB/s，
+            # 而其余三号全被 lane 占着 → 每一集都撞同一堵墙，整夜 0/12。
+            # 0 产出后撤预约旗：下一轮 acquire_slot 会按实测吞吐重新挑，
+            # 等到任何一条 lane 交班就把号接过来（等待有 EMOS_DEADLINE 兜底）。
+            if reserved is not None:
+                try:
+                    os.unlink(GS._slot_reserve_path(reserved))
+                    print("  撤预约旗 slot%d（该号 0 产出，下一轮重新选号）" % reserved,
+                          flush=True)
+                except OSError:
+                    pass
+                except Exception:                              # noqa: BLE001
+                    pass
+                reserved = None
+                os.environ.pop("EMOS_RESERVED_SLOT", None)
             print("  0 产出（上传限流窗口），冷却 %ds 后重试 E%s（第 %d 轮冷却）"
                   % (pause, p["ep"], rounds), flush=True)
             time.sleep(pause)

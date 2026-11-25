@@ -29,6 +29,8 @@ runner 每分钟刷 no_session —— 全都躺在日志里没人看。事故不
   python3 timer_audit.py            # 人读
   python3 timer_audit.py --json     # 机读
   python3 timer_audit.py --quiet    # 只在有失败时输出（给 timer 用）
+  python3 timer_audit.py --no-alert # 人工排查用：只打印+落状态，不往告警队列塞一条
+                                    # （否则「跑一次看看」会把诊断动作本身变成一条告警）
 
 退出码（2026-11-25 E210）：0 = 巡检跑完（有没有事故都是 0），2 = 巡检自身异常。
 事故只走 alert()/本地队列；别再让「报了事故」把 unit 标成 failed，
@@ -243,6 +245,7 @@ LOCK_STUCK_NEW = int(os.environ.get("TIMER_AUDIT_LOCK_SPAM", 40))
 def main():
     as_json = "--json" in sys.argv
     quiet = "--quiet" in sys.argv
+    no_alert = "--no-alert" in sys.argv
     prev = _load_state()
     cursors = prev.get("cursors") if isinstance(prev.get("cursors"), dict) else {}
     since_ts = prev.get("ts")
@@ -321,7 +324,7 @@ def main():
     except Exception:                                       # noqa: BLE001
         pass
 
-    if problems:
+    if problems and not no_alert:
         try:
             sys.path.insert(0, HERE)
             import alert as A

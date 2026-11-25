@@ -92,6 +92,75 @@ def upload_breaker_holds(sw_path, hours=3, now=None):
     return held
 
 
+def _emos_window_fix_ts(now=None):
+    """夜间 4K 窗口三件套（emos_night / emos_import / tgsrc_copy）最后一次提交时间。
+
+    2026-11-25（E210）：02:40 那轮 0/12 是「分片 128MiB + 探针 600s」造的，
+    该行为当天 06:40 就已修掉。daily_ops 若拿修复前的日志继续报 FAIL，
+    等于让一条已经修好的旧事故每天占告警位（E198 同源）。用 git 提交时间
+    判定「这一轮是不是跑在修复之前」——比文件 mtime 可靠（checkout/恢复不改它的语义）。
+    取不到（非 git 仓库、git 缺失）返回 0，调用方退回旧判据，不静默放行。
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", HERE, "log", "-1", "--format=%ct", "--",
+             "emos_night.py", "emos_import.py", "tgsrc_copy.py"],
+            capture_output=True, text=True, timeout=20)
+        return int((r.stdout or "").strip() or 0)
+    except Exception:                                          # noqa: BLE001
+        return 0
+
+
+def _fmt_age(ts, now=None):
+    h = max(0.0, ((now or time.time()) - ts) / 3600.0)
+    if h < 1:
+        return "%.0f 分钟" % (h * 60)
+    if h < 48:
+        return "%.1f 小时" % h
+    return "%.0f 天" % (h / 24)
+
+
+def lib_reconcile_verdict(rec, n_claims):
+    """lib_reconcile 的 JSON 结果 → (ok, detail)。
+
+    2026-11-25（E210）：四路 lane 一直在入库，teldrive 登记完到 Emby 索引完之间
+    每个库都可能短暂「差 1 集」。旧判据只吃 `tail -3`（总数三行），按库的缺口
+    行被切掉，于是这种**在途**状态只能报 FAIL —— 实测 10:2x 连抖两次。
+    现在：缺口按库求和，`0 < 缺 ≤ 活动 claim 数` 判在途；
+    超出 claim 数才算真失配（那说明有集丢了，不是正在传）。
+    """
+    ok = bool(rec.get("converged"))
+    gaps = [x for x in (rec.get("rows") or []) if not x.get("ok")]
+    miss = sum(max(0, int(x.get("td_unique") or 0) - int(x.get("emby_episodes") or 0))
+               for x in gaps)
+    detail = "缺口库 %s" % (rec.get("libs_with_gap") or [])
+    if not ok and 0 < miss <= n_claims:
+        ok = True
+        detail += "（缺 %d 集 ≤ 活动 claim %d，在途/待索引）" % (miss, n_claims)
+    elif not ok:
+        detail += "（缺 %d 集 > 活动 claim %d，真失配）" % (miss, n_claims)
+    return ok, detail
+
+
+def night_window_verdict(last, run_ts, fix_ts, held):
+    """夜间窗口「完成 0/N」的归因 → (ok, text)，ok 用 line() 的 True/False/None。
+
+    三种 0 集必须分开（E206/E210）：
+      · 跑在修复之前（run_ts < fix_ts）→ None：旧现场，不能当现存故障报；
+      · 全池被 TG 限流（断流闸门按住 ≥2 次/3h）→ None：上游；
+      · 其余 → False：真故障，要修。
+    抽成纯函数是为了让判据被单测钉住：只要有人把 fix_ts 判反或让「上游」
+    变成万能借口，测试立刻红。
+    """
+    if fix_ts and run_ts < fix_ts - 60:
+        return None, ("最近一轮 %s 跑在窗口三件套最后一次改动（%s前）之前，"
+                      "属修复前的旧现场，待下次窗口验证" % (last, _fmt_age(fix_ts)))
+    if held >= 2:
+        return None, ("最近一轮 0 集：全池上传被 TG 限流（闸门按住 %d 次/3h），"
+                      "非窗口故障" % held)
+    return False, "最近一轮 0 集成功：%s" % last
+
+
 def emby(path, method="GET", body=None, timeout=120):
     req = urllib.request.Request(EMBY + path,
                                 data=json.dumps(body).encode() if body is not None else None,
@@ -161,15 +230,26 @@ def main():
     # 4) 库一致性 / 命名
     sec("4) 库一致性与命名")
     if not a.quick:
-        rc, out = sh("cd %s && python3 lib_reconcile.py 2>&1 | tail -3" % HERE, timeout=600)
-        ok = "converged = True" in out
-        # 2026-11-13：缺口 ≤ 活动 claim 数时是「正在下载/待索引」，不是失配。
-        # 与 status_now / improve_guard 的 gap_le_claims 同一口径，
-        # 避免五路都在跑时 daily_ops 天天报 FAIL（观测到缺口 2 / claim 5）。
+        # 2026-11-25（E210）：改吃 --json。旧写法 `tail -3` 把**按库**的缺口行切掉了，
+        # 只剩总数三行；于是「某库差 1 集（刚登记进 teldrive、Emby 还没索引完）」
+        # 这种入库途中的正常状态无法归因，只能报 FAIL（实测 10:2x 连续两次抖动）。
+        # 四路 lane 一直在入库，判据必须能认「缺 ≤ 活动 claim 数」= 在途。
+        rc, out = sh("cd %s && python3 lib_reconcile.py --json 2>/dev/null" % HERE,
+                     timeout=600)
+        ok = False
+        _detail = ""
+        try:
+            _rec = json.loads(out[out.index("{"):out.rindex("}") + 1])
+            _ncl = len(glob.glob(os.path.join(HERE, ".gha_claims", "*.json")))
+            ok, _detail = lib_reconcile_verdict(_rec, _ncl)
+        except Exception:                                          # noqa: BLE001
+            # JSON 拿不到就退回文本判据，不许静默放行
+            ok = "converged = True" in (out or "")
+            _detail = (out or "").strip().splitlines()[-1][:70] if (out or "").strip() else ""
         if not ok:
             try:
                 _gap = 0
-                for _l in out.splitlines():
+                for _l in (out or "").splitlines():
                     if "期望区间" in _l:
                         import re as _re
                         _m = _re.search(r"\[(\d+)", _l)
@@ -180,10 +260,11 @@ def main():
                 _ncl = len(_g.glob(os.path.join(HERE, ".gha_claims", "*.json")))
                 if 0 < _gap <= _ncl:
                     ok = True
-                    out = out + "\n缺口 %d 集 ≤ 活动 claim %d 个，属正在下载/待索引" % (_gap, _ncl)
+                    _detail = (_detail + " " if _detail else "") + \
+                        "缺口 %d 集 ≤ 活动 claim %d 个，属正在下载/待索引" % (_gap, _ncl)
             except Exception:                                  # noqa: BLE001
                 pass
-        line(ok, "lib_reconcile", out.strip().splitlines()[-1][:70] if out.strip() else "")
+        line(ok, "lib_reconcile", _detail[:90])
         rc, out = sh("cd %s && python3 naming_health.py --no-name 2>&1 | tail -6" % HERE, timeout=600)
         fails = [l.strip() for l in out.splitlines() if "FAIL" in l]
         gaps = [l.strip() for l in out.splitlines() if "缺 NFO" in l]
@@ -495,11 +576,17 @@ def main():
                 # 证据只看断流闸门：最近 3h stall_watch 里「断流闸门按住中」的次数。
                 # 没有这个证据就仍然判 FAIL —— 不能拿「上游」当万能借口。
                 held = upload_breaker_holds(os.path.join(HERE, "logs", "stall_watch.log"))
-                if held >= 2:
-                    line(None, "夜间4K补版",
-                         "最近一轮 0 集：全池上传被 TG 限流（闸门按住 %d 次/3h），非窗口故障" % held)
-                else:
-                    line(False, "夜间4K补版", "最近一轮 0 集成功：%s" % last)
+                # 2026-11-25（E210）：还有一种「0 集」既不是上游也不是现存的窗口故障
+                # ——**这一轮跑在修复落地之前**。06:40 把分片 128→32MiB、探针 600→900s、
+                # 四号全试之后，02:40 那轮 0/12 的现场已经不是当前代码能复现的行为了。
+                # 拿它报 FAIL 就是「已经修好的旧事故天天重报」（E198 同源），
+                # 而且会盖住真·新故障。判据：该轮日志的收尾时间早于窗口三件套的
+                # 最后一次提交 → 只报「上一轮早于修复，待下次窗口验证」，不计 FAIL。
+                # 这不可能变成永久免死金牌：下一轮一定在修复之后跑，届时 0 集即 FAIL。
+                fix_ts = _emos_window_fix_ts()
+                run_ts = os.path.getmtime(elog)
+                ok, txt = night_window_verdict(last, run_ts, fix_ts, held)
+                line(ok, "夜间4K补版", txt)
             else:
                 line(True, "夜间4K补版", "%s（%.0f 小时前）" % (last or "有日志无小结", age_h))
     except Exception as e:                                          # noqa: BLE001
