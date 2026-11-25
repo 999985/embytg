@@ -57,6 +57,13 @@ def main():
     ap.add_argument("--series", default="")
     a = ap.parse_args()
 
+    # 2026-11-25（E208）：开窗前先把「字节已在 teldrive、Emby 没建出条目」的集补扫一遍。
+    # 这些集以前被记成「入库完成」，实际 Emby 里没有 → 缺口不缩小且不会再被选中。
+    try:
+        EI.pending_flush()
+    except Exception as _e:                                    # noqa: BLE001
+        print("  待扫队列处理失败（不影响本轮）: %s" % str(_e)[:80], flush=True)
+
     todo = [t for t in TARGETS if not a.series or t[0] == a.series]
     picked = []
     for name, year, tmdb, tdir in todo:

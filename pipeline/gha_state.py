@@ -27,6 +27,11 @@ CLAIM_TTL = int(os.getenv("GHA_CLAIM_TTL", str(24 * 3600)))
 BUDGET_FILE = os.path.join(HERE, ".gha_src_budget.json")
 BUDGET_LOCK = os.path.join(HERE, ".gha_src_budget.lock")
 BURST_WINDOW = 20 * 60
+# 2026-11-25（自省）：源站延迟只在这里落一份 EMA（跨日保留）。
+# 判据不是"慢就罚"，而是"同一件事，慢源要花 20 倍墙钟"：aaa.yusen6 平均
+# 11.3s/次、8 天 1597 次 ≈ 5 小时纯等待，而 bangumi 只有 0.47s。
+# 3s 是实测分界（本项目 8 个源里快源 0.5-0.7s，慢源 9.6-11.3s），中间没有样本。
+SRC_SLOW_MS = float(os.environ.get("EMBYTG_SRC_SLOW_MS") or 3000)
 DEFAULT_BUDGET = {
     "daily": int(os.getenv("GHA_SRC_DAILY", "300")),
     "burst_20m": int(os.getenv("GHA_SRC_BURST_20M", "60")),
@@ -819,6 +824,33 @@ def _source_yield_bonus(rec, now):
     return 1.0
 
 
+def _source_yield_tier(rec):
+    """命中率档位：0 = 主力 / 1 = 一般 / 2 = 低效 / 3 = 今天一集没出。
+
+    2026-11-25（自省）：原来排序里只有 `zero_yield` 一个**二值**（`ok == 0` 才
+    算坏），于是 4.4% 命中率的 yuntv 与 99% 的 bangumi 在轮转里**完全等价** ——
+    两个源都"有产出"，谁近 20 分钟用得少谁先上。实测 8 天：yuntv 780 次请求
+    只出 34 集（22.9 次/集，全源平均 5.57），aaa 11.3s/次拿了 1597 次，
+    而 99% 的产出压在 bangumi 一个源上。**命中率是"多少"，不是"有没有"。**
+
+    分档依据（不是拍脑袋，是实测分布）：bangumi 196% / emos 11% 属主力；
+    0 产出的 6 个源全部落在第 3 档。`day < 20` 一律 0 档 —— 新源必须先给
+    探索位，否则永远没机会证明自己（E104 的自封死锁同一个教训）。
+    """
+    day = int(rec.get("day") or 0)
+    ok = int(rec.get("ok") or 0)
+    if day < 20:
+        return 0
+    if ok <= 0:
+        return 3
+    rate = ok / float(day)
+    if rate >= 0.10:
+        return 0
+    if rate >= 0.03:
+        return 1
+    return 2
+
+
 def eligible_sources(labels, leased=None, load=None):
     """Return a rotated, least-used source order allowed by the shared budget.
 
@@ -877,9 +909,13 @@ def eligible_sources(labels, leased=None, load=None):
             # 实测 emby.chapanda.site day=67/ok=0 却被选中，
             # 而 39.96.113.82-mirror day=185/ok=10 反而轮不到。
             # day>=20 才算"试过"，避免把新源（day=0,ok=0）误伤。
-            zero_yield = 1 if (int(rec.get("day") or 0) >= 20
-                               and int(rec.get("ok") or 0) == 0) else 0
-            rows.append((busy, zero_yield, len(rec["events"]),
+            #
+            # 2026-11-25（自省）：二值升为**档位**（见 `_source_yield_tier`），
+            # 并把实测延迟作为同档内次序。原因见该函数 docstring：
+            # 4.4% 与 99% 命中率被当等价，8 天白烧 ~745 次请求。
+            tier = _source_yield_tier(rec)
+            slow = 1 if float(rec.get("lat_ms") or 0) >= SRC_SLOW_MS else 0
+            rows.append((tier, busy, slow, len(rec["events"]),
                          int(rec.get("day") or 0),
                          float(rec.get("last") or 0), label))
         rows.sort()
@@ -1046,6 +1082,17 @@ def charge_guard(guard):
             elif oks_now:
                 rec["fails"] = 0
                 rec["cooldown_until"] = 0
+            # 2026-11-25（自省）：每源实测延迟落一份 EMA，供 `eligible_sources`
+            # 在同命中率档位内把慢源后置。`lat_ms` 不在 `_DAILY_REC_KEYS` 里，
+            # 所以跨日保留 —— 延迟是源站属性，不是"今天的状态"，每天清零会让
+            # 慢源在 00:00 之后重新排到最前面（与 E144 把 disabled 日切掉同一类错）。
+            try:
+                _ms = float(getattr(st, "avg_ms", 0) or 0)
+            except (TypeError, ValueError):
+                _ms = 0.0
+            if _ms > 0:
+                _old = float(rec.get("lat_ms") or 0)
+                rec["lat_ms"] = round(_ms if _old <= 0 else _old * 0.7 + _ms * 0.3, 1)
             cool = float(getattr(st, "cool_until", 0) or 0)
             if cool > now:
                 rec["cooldown_until"] = max(

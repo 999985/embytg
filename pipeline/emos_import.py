@@ -288,10 +288,126 @@ def scan_one(file_path):
     try:
         import emby_scan
         r = emby_scan.scan_paths([file_path])
-        print("  送扫: Created=%s Refreshed=%s skip=%s" % (
-            r.get("Created"), r.get("Refreshed"), r.get("skipped", 0)), flush=True)
+        # 2026-11-25（E208）：旧打印只有 Created/Refreshed/skip，PathNotFound 被藏起来 ——
+        # E52 就是「Created=0 Refreshed=0」看着像正常跳过，其实是挂载上看不见文件。
+        print("  送扫: Created=%s Refreshed=%s PathNotFound=%s skip=%s" % (
+            r.get("Created"), r.get("Refreshed"), r.get("PathNotFound"), r.get("skipped", 0)),
+            flush=True)
+        return r
     except Exception as ex:
         print("  送扫失败: %s" % str(ex)[:60], flush=True)
+        return {}
+
+
+MNT_HOST = "/opt/embytg/mnt/embytg"
+EMOS_PENDING = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".emos_pending_scan.json")
+
+
+def host_path(p):
+    """容器口径 /mnt/embytg/... → 宿主机口径 /opt/embytg/mnt/embytg/..."""
+    return (MNT_HOST + p[len("/mnt/embytg"):]) if p.startswith("/mnt/embytg/") else p
+
+
+def mount_visible(container_path, timeout=180):
+    """E180/E208：teldrive 登记后字节已在 TG，但 rclone mount 的 DirCache（--dir-cache-time 10m）
+    不失效 → 挂载上读不到这个文件 → ScanPath 报 PathNotFound → Emby 永远建不出条目。
+    实测 2026-11-25 E52：08:39:38 登记完成、送扫 Created=0 Refreshed=0，08:50 Emby 仍无 E52，
+    而 `rclone rc vfs/refresh` 之后文件立刻可见。gha_finish.wait_mount_file 已按此实现
+    （每 10s vfs/forget 父目录再 readdir），这里直接复用，不再重复一遍错。
+    """
+    hp = host_path(container_path)
+    if os.path.exists(hp):
+        return True
+    try:
+        import gha_finish as GF
+        GF.wait_mount_file(hp, timeout=timeout)
+    except Exception as ex:                                    # noqa: BLE001
+        print("  等挂载失败: %s" % str(ex)[:60], flush=True)
+    return os.path.exists(hp)
+
+
+def emby_episode(container_path, dir_rel, timeout=120):
+    """按 Series 取全部 Episode 再核 Path —— `/Items?Path=` 过滤实测恒空（post_ingest 592）。
+
+    dir_rel 是**季目录**（…/Season 01），而 Emby 的 Series.Path 是剧目录，
+    不能带 /Season NN 去比（2026-11-25 E208 实测：带着季目录永远匹配不到 sid）。
+    """
+    hp = host_path(container_path)
+    sdir = re.sub(r"/Season\s*\d+$", "", dir_rel or "")
+    deadline = time.time() + max(0, timeout)
+    while True:
+        try:
+            import gha_finish as GF
+            _sid, eps = GF.emby_episode_paths({"dir": sdir})
+            for p, e in eps or []:
+                if p == hp:
+                    return e
+        except Exception as ex:                                # noqa: BLE001
+            print("  回查 Emby 异常: %s" % str(ex)[:60], flush=True)
+        if time.time() >= deadline:
+            return None
+        time.sleep(6)
+
+
+def scan_and_verify(container_path, dir_rel, rounds=3):
+    """送扫 + 回查：**只有 Emby 真建出这条 Episode 才算入库**（E208 根因）。"""
+    for i in range(1, rounds + 1):
+        if not mount_visible(container_path, timeout=90 if i == 1 else 40):
+            print("  挂载仍看不到该文件（第 %d 轮），清缓存重试" % i, flush=True)
+            continue
+        scan_one(container_path)
+        item = emby_episode(container_path, dir_rel, timeout=45)
+        if item:
+            return item
+        print("  送扫后 Emby 仍无该条目（第 %d 轮）" % i, flush=True)
+    return None
+
+
+def _pending_load():
+    try:
+        with open(EMOS_PENDING, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:                                          # noqa: BLE001
+        return {}
+
+
+def _pending_save(d):
+    try:
+        with open(EMOS_PENDING, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def pending_add(container_path, dir_rel):
+    d = _pending_load()
+    d[container_path] = {"dir": dir_rel, "since": int(time.time())}
+    _pending_save(d)
+
+
+def pending_del(container_path):
+    d = _pending_load()
+    if d.pop(container_path, None) is not None:
+        _pending_save(d)
+
+
+def pending_flush(limit=10):
+    """「字节已在 teldrive、Emby 没建出来」的集，下一轮开窗前重扫；字节在 TG，不必重下。"""
+    d = _pending_load()
+    if not d:
+        return 0
+    healed = 0
+    for p, meta in list(d.items())[:limit]:
+        if not os.path.exists(host_path(p)):
+            d.pop(p, None)        # teldrive 侧也没有（登记失败/被删）→ 交下一轮重下
+            continue
+        if scan_and_verify(p, meta.get("dir") or "", rounds=2):
+            d.pop(p, None)
+            healed += 1
+    _pending_save(d)
+    if healed:
+        print("  待扫队列自愈 %d 条" % healed, flush=True)
+    return healed
 
 
 def parse_eps(spec):
@@ -608,11 +724,22 @@ def main():
             # 旧代码只写 teldrive；不写 tg.db 就是「五账里少一本」，对账只比总数发现不了。
             if tmdb and not register_tgdb(tdir, fid, name, parts, tmdb, lib):
                 print("  tg.db 登记失败：本条留在 teldrive 但不计入台账，需人工复核", flush=True)
-            write_nfo(os.path.join("/opt/embytg/mnt/embytg", tdir), name, it, season=a.season)
-            scan_one(os.path.join("/mnt/embytg", tdir, name))
-            os.remove(dest)
+            write_nfo(os.path.join(MNT_HOST, tdir), name, it, season=a.season)
+            cpath = os.path.join("/mnt/embytg", tdir, name)
+            # 2026-11-25（E208）：旧代码「送扫 → 直接删本地 → 记完成」，不看 Emby 有没有建出条目。
+            # 实测 E52 送扫时挂载还看不见文件（rclone DirCache 10m），Created=0 被当成成功，
+            # Emby 直到 08:50 仍无 E52，而窗口已经报「入库完成」—— 缺口永远不缩小的根因。
+            item = scan_and_verify(cpath, tdir)
+            os.remove(dest)                     # 字节已在 TG/teldrive，本地副本不再需要
+            if not item:
+                pending_add(cpath, tdir)
+                print("  E%d 已进 teldrive，但 Emby 未建出条目（留待扫队列，不计完成）" % ep,
+                      flush=True)
+                continue
+            pending_del(cpath)
             done += 1
-            print("  E%d 入库完成（本轮 %d/%d）" % (ep, done, attempted), flush=True)
+            print("  E%d 入库完成（本轮 %d/%d，Emby=%s）" % (ep, done, attempted, item.get("Id")),
+                  flush=True)
         if attempted and not done:
             # 以前这里无条件 return 0 → 上层把「上传全失败、库里根本没有这一集」
             # 也计成成功（2026-11-24 E43：4 个号全超时，rc=0）。
