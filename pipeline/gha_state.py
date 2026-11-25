@@ -1042,8 +1042,19 @@ def eligible_sources(labels, leased=None, load=None):
 
         if labels_sorted:
             rr = int(d.get("rr") or 0)
-            k = rr % min(3, len(labels_sorted))
-            labels_sorted = labels_sorted[k:] + labels_sorted[:k]
+            # 2026-11-25（自省）：轮转**只能在同档位内**做，原来是整串 `k = rr % 3`。
+            # 实测：3 个源时 `rr%3` 每三次就有两次把 0 产出的源转到第一位 ——
+            # 排序里刚修好的分档被轮转原样抵消（yuntv 8 天 780 次请求就是这么来的）。
+            # 正确做法：只把**首个档位组**轮转，后面的档位保持全部落在其后。
+            head_tier = _source_yield_tier(_source_record(d, labels_sorted[0], now))
+            same = 0
+            for _lab in labels_sorted:
+                if _source_yield_tier(_source_record(d, _lab, now)) != head_tier:
+                    break
+                same += 1
+            head = labels_sorted[:max(1, same)]
+            k = rr % len(head)
+            labels_sorted = head[k:] + head[:k] + labels_sorted[len(head):]
             d["rr"] = rr + 1
             _write_budget_guarded(d)
         return labels_sorted
