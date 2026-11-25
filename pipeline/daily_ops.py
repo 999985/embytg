@@ -230,6 +230,26 @@ def lib_reconcile_verdict(rec, n_claims):
     return ok, detail
 
 
+def _night_round_ts(last, tail_after, mtime):
+    """「完成 X/N」小结**自己**的落笔时间 → (ts, 能否归因)。
+
+    2026-11-26（E212）：以前用日志 mtime 当轮次结束时间。02:10 起新窗口会往同一个
+    日志追加，mtime 永远是「现在」，于是**昨天**那轮 0/12 被当成今天的现场报 FAIL
+    （今晨 06:40 实测：报的 0/12 其实是 11-25 02:10 那轮的收尾，今天那轮还在跑）。
+    现在 emos_night 在小结后写 `@YYYY-MM-DD HH:MM:SS`，直接用它；老日志没有戳
+    但后面已经开了新一轮时，只能归为「无法归因」，不许拿 mtime 冒名。
+    """
+    m = re.search(r"@(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", last or "")
+    if m:
+        try:
+            return time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")), True
+        except ValueError:
+            pass
+    if (tail_after or "").strip():
+        return 0.0, False
+    return float(mtime), True
+
+
 def night_window_verdict(last, run_ts, fix_ts, held):
     """夜间窗口「完成 0/N」的归因 → (ok, text)，ok 用 line() 的 True/False/None。
 
@@ -654,9 +674,13 @@ def main():
             age_h = (time.time() - os.path.getmtime(elog)) / 3600.0
             tail = open(elog, encoding="utf-8", errors="replace").read()[-4000:]
             last = None
-            for ln in tail.splitlines():
+            last_i = -1
+            tl = tail.splitlines()
+            for i, ln in enumerate(tl):
                 if ln.startswith("  完成 "):
                     last = ln.strip()
+                    last_i = i
+            after = "\n".join(tl[last_i + 1:]) if last_i >= 0 else ""
             if age_h > 26:                     # 超过一天没动 = 定时器/服务挂了
                 line(False, "夜间4K补版", "日志 %.0f 小时未更新，定时器可能失效" % age_h)
             elif last and "完成 0/" in last:
@@ -675,9 +699,16 @@ def main():
                 # 最后一次提交 → 只报「上一轮早于修复，待下次窗口验证」，不计 FAIL。
                 # 这不可能变成永久免死金牌：下一轮一定在修复之后跑，届时 0 集即 FAIL。
                 fix_ts = _emos_window_fix_ts()
-                run_ts = os.path.getmtime(elog)
-                ok, txt = night_window_verdict(last, run_ts, fix_ts, held)
-                line(ok, "夜间4K补版", txt)
+                # 2026-11-26（E212）：判「这一轮」要看小结自己的时间，不看日志 mtime ——
+                # 02:10 起新窗口会往同一份日志追加，mtime 永远是现在，昨天那轮 0/12
+                # 就会被当成今天的现场天天报 FAIL。
+                run_ts, attested = _night_round_ts(last, after, os.path.getmtime(elog))
+                if not attested:
+                    line(None, "夜间4K补版",
+                         "%s 无时间戳且后面已开新一轮（旧格式），无法归因；以新小结为准" % last)
+                else:
+                    ok, txt = night_window_verdict(last, run_ts, fix_ts, held)
+                    line(ok, "夜间4K补版", txt)
             else:
                 line(True, "夜间4K补版", "%s（%.0f 小时前）" % (last or "有日志无小结", age_h))
     except Exception as e:                                          # noqa: BLE001

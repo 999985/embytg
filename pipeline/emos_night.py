@@ -178,8 +178,9 @@ def main():
                     pass
                 reserved = None
                 os.environ.pop("EMOS_RESERVED_SLOT", None)
-            print("  0 产出（上传限流窗口），冷却 %ds 后重试 E%s（第 %d 轮冷却）"
-                  % (pause, p["ep"], rounds), flush=True)
+            print("  0 产出（上传限流窗口），冷却 %ds 后%s（第 %d 轮冷却）"
+                  % (pause, ("重试 E%s" % p["ep"]) if attempt == 0 else "换下一集", rounds),
+                  flush=True)
             time.sleep(pause)
     if reserved is not None:
         try:
@@ -187,7 +188,8 @@ def main():
         except OSError:
             pass
         print("  撤预约旗 slot%d" % reserved, flush=True)
-    print("  完成 %d/%d 集（窗口 %d 分钟）" % (ok, len(picked), a.minutes), flush=True)
+    print("  完成 %d/%d 集（窗口 %d 分钟）@%s" % (ok, len(picked), a.minutes,
+                                                time.strftime("%Y-%m-%d %H:%M:%S")), flush=True)
     return 0 if ok else 1
 
 

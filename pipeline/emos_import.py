@@ -20,6 +20,7 @@
 """
 import argparse
 import asyncio
+import atexit
 import datetime
 import json
 import os
@@ -485,34 +486,60 @@ def acquire_slot(run_id, jobs):
     先按实测吞吐从快到慢试租约，领到后再用**这个号**的实测值过闸，不够快立刻还回去。
     否则会出现「闸门看到 slot1 很快（但它被 lane 占着），实际只领到 0.23MB/s 的 slot3」
     这种自欺 —— 昨夜 7 集白烧就是这么发生的：先领号，后看速度。
+
+    2026-11-26（E212）：**抢不到就立旗，不许轮询；等待截止由窗口推，不许写死 07:30。**
+    lane 是「收尾立刻领下一集」，从释放到再 claim 只有亚秒间隙（2026-11-15 实测
+    slot3 连续 30 分钟空闲率 0%）。今晨 02:10 那轮 3h43m 空转就是这么来的：E54
+    的预约旗在 0 产出后撤掉，四个号全被 lane 占着，只剩「没有够快的空闲 slot，
+    等 10 分钟再试」在打转，整窗 0 集 —— 而当时 slot2 实测 2.08MB/s、完全够快，
+    只是被 lane 占着。旧版还把等待截止写死成 07:30（02:10 起跑 = 先空等 5h20m），
+    EMOS_ALLOW_SLOW 的 best-effort 要到窗口最后 10 分钟才生效，等于永不生效。
     """
     floor = float(os.environ.get("EMOS_MIN_OVERALL_MBPS", "2.5"))
-    # 2026-11-24：夜间窗口先立预约旗（emos_night 做的），lane 交完当前集就不再领这个号。
-    # 否则 lane 是「收尾立刻领下一集」，释放到再 claim 之间只有亚秒级间隙 —— 轮询永远抢不到，
-    # 白天实测 4 个号全被 lane 占着，一轮都起不来。
-    _rsv = (os.environ.get("EMOS_RESERVED_SLOT") or "").strip()
-    if _rsv.isdigit():
-        _n = int(_rsv)
+    jobs = max(1, int(jobs or 1))
+
+    def _wait_reserved(n, tag):
+        """等 lane 交班把预约号让出来（20s 一探，窗口预算不足即收手）。"""
         while True:
-            if GS.slot_lease(_n, run_id, ttl=10800):
-                print("  用预约号 slot%d（本窗口已立旗）" % _n, flush=True)
-                return _n
+            if GS.slot_lease(n, run_id, ttl=10800):
+                print(tag % n, flush=True)
+                return n
             # 旗只保证「交完当前这集就不再领」，不抢别人正在传的那一集（会丢字节）。
             if _remaining() < 600:
-                print("  预约号 slot%d 仍被上一集占着，预算不足，本轮不起跑" % _n, flush=True)
+                print("  预约号 slot%d 仍被上一集占着，预算不足，本轮不起跑" % n, flush=True)
                 return 0
-            print("  预约号 slot%d 正被上一集使用，等 20s" % _n, flush=True)
+            print("  预约号 slot%d 正被上一集使用，等 20s" % n, flush=True)
             time.sleep(20)
-    dl = os.environ.get("EMOS_WAIT_DEADLINE", "07:30")
-    hh, mm = [int(x) for x in dl.split(":")]
-    deadline = datetime.datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+    def _pick(rows):
+        """最优先的「够快」号（只按实测吞吐，不管此刻是否空闲）。"""
+        for _n in slot_order(rows):
+            _mb = rows.get(_n, (0.0, False))[0] or 1.5
+            if _mb * jobs >= floor:
+                return _n, _mb
+        return 0, 0.0
+
+    _rsv = (os.environ.get("EMOS_RESERVED_SLOT") or "").strip()
+    if _rsv.isdigit():
+        return _wait_reserved(int(_rsv), "  用预约号 slot%d（本窗口已立旗）")
+
+    # 等待截止：显式 EMOS_WAIT_DEADLINE > 由窗口硬截止推（末尾留 10 分钟）> 不限
+    dl = (os.environ.get("EMOS_WAIT_DEADLINE") or "").strip()
+    if dl:
+        hh, mm = [int(x) for x in dl.split(":")]
+        deadline = datetime.datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+    elif _deadline():
+        deadline = datetime.datetime.fromtimestamp(_deadline() - 600)
+    else:
+        deadline = None
+
     while True:
         rows = pool_rows()
         for n in slot_order(rows):
             if not GS.slot_lease(n, run_id, ttl=7200):
                 continue
-            mb = rows.get(n, (0.0, False))[0] or 1.5      # 无实测按中性 1.5
-            est = mb * max(1, jobs)
+            mb = rows.get(n, (0.0, False))[0] or 1.5
+            est = mb * jobs
             if est >= floor:
                 print("  领到 slot%d（实测 %.2fMB/s×%d≈%.1fMB/s）"
                       % (n, mb, jobs, est), flush=True)
@@ -520,7 +547,24 @@ def acquire_slot(run_id, jobs):
             GS.slot_release(n, run_id)
             print("  slot%d 实测 %.2fMB/s×%d≈%.1f < %.1f，不占它"
                   % (n, mb, jobs, est, floor), flush=True)
-        if datetime.datetime.now() >= deadline:
+
+        # 有快号但被 lane 占着 → 立预约旗让它交班。轮询永远抢不到（见 docstring）。
+        fast, fast_mb = _pick(rows)
+        if fast and _remaining() > 900:
+            ttl = int(min(_remaining(), 10800))
+            if GS.slot_reserve(fast, run_id, ttl=ttl):
+                os.environ["EMOS_RESERVED_SLOT"] = str(fast)
+                # 2026-11-26（E212）：自己立的旗自己撤。父进程（emos_night）只撤它
+                # 自己立的那面，子进程立的旗若没人撤，会挡 lane 到 TTL 到期。
+                atexit.register(GS.slot_unreserve, fast, run_id)
+                print("  没有空闲的快号 → 给 slot%d 立预约旗（实测 %.2fMB/s×%d≈%.1f），"
+                      "等 lane 交班" % (fast, fast_mb, jobs, fast_mb * jobs), flush=True)
+                return _wait_reserved(fast, "  用预约号 slot%d（本窗口已立旗）")
+
+        if _remaining() < 600:
+            print("  窗口剩余不足 10 分钟，本轮不起跑", flush=True)
+            return 0
+        if deadline is not None and datetime.datetime.now() >= deadline:
             if os.environ.get("EMOS_ALLOW_SLOW") == "1":
                 # best-effort：闸门是「别把整夜押在慢号上」，不是「宁可不跑」。
                 # 探针（EMOS_PROBE_S）会在 10 分钟内判定它到底活不活。
@@ -531,7 +575,7 @@ def acquire_slot(run_id, jobs):
                               % (n, rows2.get(n, (0.0, False))[0]), flush=True)
                         return n
             print("  没有够快的空闲 slot：全线 < %.1fMB/s，已过 %s，本轮不起跑"
-                  % (floor, dl), flush=True)
+                  % (floor, dl or "窗口末尾"), flush=True)
             return 0
         print("  没有够快的空闲 slot，等 10 分钟再试", flush=True)
         time.sleep(600)
