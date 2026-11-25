@@ -29,6 +29,10 @@ runner 每分钟刷 no_session —— 全都躺在日志里没人看。事故不
   python3 timer_audit.py            # 人读
   python3 timer_audit.py --json     # 机读
   python3 timer_audit.py --quiet    # 只在有失败时输出（给 timer 用）
+
+退出码（2026-11-25 E210）：0 = 巡检跑完（有没有事故都是 0），2 = 巡检自身异常。
+事故只走 alert()/本地队列；别再让「报了事故」把 unit 标成 failed，
+那会让下一次巡检把 logaudit 自己报成新事故（自激）。
 """
 import json
 import os
@@ -334,7 +338,13 @@ def main():
                     "定时任务异常：%s" % top)
         except Exception:                                   # noqa: BLE001
             pass
-        return 1
+        # 2026-11-25（E210）：**发现事故并已上报 = 本次巡检成功**。
+        # 旧代码 return 1，systemd 于是给 embytg-logaudit.service 记一条
+        # `Failed with result 'exit-code'`，下一次巡检就把它当成「单元新失败」
+        # 再报一遍 —— 巡检报事故这个动作自己造出一条事故，日日自激。
+        # 现在退出码只表达「巡检本身跑没跑成」：0=跑完（无论结论），
+        # 2=巡检自身异常。事故的通道只有 alert.py + 本地队列。
+        return 0
     return 0
 
 

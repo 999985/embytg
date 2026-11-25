@@ -612,7 +612,16 @@ def main():
     jobs = int(os.environ.get("TG_UPLOAD_JOBS", "8") or 8)
     slot = acquire_slot(run_id, jobs)
     if not slot:
-        return 2
+        # 2026-11-25（E210）：「选号闸门主动放弃」不是故障。
+        # acquire_slot 的 0 只有一种含义——按设计不起跑（全线低于 floor、
+        # 已过 EMOS_WAIT_DEADLINE，或预约号仍被上一集占着且预算不足）。
+        # 旧代码把它 return 2，systemd 记 `status=2/INVALIDARGUMENT` +
+        # `Failed with result 'exit-code'`，于是每天 09:10 那条「没快号就不跑」
+        # 的正常决策变成一条 P1 单元失败，占掉告警位（11-25 08:05 就报了它）。
+        # 起跑失败要看 emos_p1.log 的业务行，不要靠退出码表达「今天不跑」。
+        print("  本轮不起跑（选号闸门放弃：无满足条件的空闲 slot），正常结束",
+              flush=True)
+        return 0
     order = slot_order(pool_rows())
     # 2026-11-24：窗口是有墙钟的（systemd TimeoutStartSec=6h）。以前一个 1.6GB 的集
     # 会挨个号硬试（每个 900–2400s 预算），4 个号烧掉 87 分钟仍 0 产出，
