@@ -14,8 +14,12 @@ from embytg_conf import cfg              # noqa: E402
 
 NAME = "釜山行2：半岛 (2020) {tmdb=581392} - 720p.mp4"
 LIB = "Movies/动作片"
-P = json.load(open("/opt/embytg-runner/media.busan/parts.json", encoding="utf-8"))
-parts = [(int(m), int(s)) for m, s in P["parts"]]
+fills = json.load(open("/opt/embytg-runner/media.busan/fill.json", encoding="utf-8"))
+parts = sorted([(int(x["offset"]), int(x["msg"]), int(x["size"])) for x in fills])
+# 之前两次上传侥幸落地的两段（已验证在频道里）
+parts += [(1022793316, 124372, 511396658), (1534189974, 124070, 511396658)]
+parts.sort()
+parts = [(m, s) for _o, m, s in parts]
 print("  parts:", len(parts), "%.2fGB" % (sum(s for _, s in parts) / 1e9))
 
 # 1) 清掉同名旧登记（如果有）

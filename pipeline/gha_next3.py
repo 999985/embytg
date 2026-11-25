@@ -1508,6 +1508,15 @@ def pick_new_episode(item, sources, min_bytes, max_bytes):
         q = c["quality"]["label"]
         if rank_of(q) < 2:
             continue
+        if not c.get("qg_admit"):
+            # 2026-11-25：new 车道漏记兜底账 —— fill/upgrade 早就写了，new 没写，
+            # 于是 daily_ops 把「设计内的兜底入库」数成闸门漏网（近24h 11 条无法归因）。
+            # 兜底本身允许（无更高画质源时保覆盖率），但必须留账，否则无法区分
+            # 「兜底」和「闸门被绕过」。
+            QG.log_fallback("new", {"series": series_name, "season": season,
+                                    "ep": ep, "label": q,
+                                    "mbps": (c.get("qg") or {}).get("mbps"),
+                                    "reason": (c.get("qg") or {}).get("reason")})
         target = target_with_quality(
             item2["lib"], dirname, series_name, season, ep, q, ext_of(c["episode"]))
         key, why = check_existing(item2, season, ep, target, q)

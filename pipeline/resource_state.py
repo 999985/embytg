@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS resource_state(
   poster_at   INTEGER,
   emby_at     INTEGER,
   emby_item   TEXT,
-  width       INTEGER, height INTEGER,
+  width       INTEGER, height INTEGER, dur_sec INTEGER,
   vcodec      TEXT, acodec TEXT, subs INTEGER,
   stage       TEXT,
   note        TEXT
@@ -159,7 +159,7 @@ def emby_index():
     out, start = {}, 0
     while True:
         q = ("/Items?Recursive=true&IncludeItemTypes=Movie,Episode"
-             "&Fields=Path,MediaStreams,DateCreated"
+             "&Fields=Path,MediaStreams,DateCreated,RunTimeTicks"
              "&EnableImages=false&EnableTotalRecordCount=false"
              "&Limit=2000&StartIndex=%d" % start)
         d = api(q)
@@ -175,6 +175,7 @@ def emby_index():
             hp = p.replace("/mnt/embytg/", MNT + "/") if p.startswith("/mnt/embytg/") else p
             streams = it.get("MediaStreams") or []
             out[hp] = {"item": it.get("Id"), "created": it.get("DateCreated"),
+                       "rt": int(it.get("RunTimeTicks") or 0),
                        "streams": streams}
         start += len(items)
         if len(items) < 2000:
@@ -361,12 +362,18 @@ def scan(c):
         poster = max([t for _, t in arts], default=0)
         e = em.get(full)
         w = h = subs = 0
+        dur = 0
         vcodec = acodec = ""
         probed = emby_at = 0
         item = ""
         if e:
             emby_at = parse_ts(e.get("created")) or now
             item = e.get("item") or ""
+            # dur_sec 以前从没写过（全表 NULL），导致 daily_ops/gap_report 只能绕道
+            # Emby 现查。RunTimeTicks 是 100ns 单位；<1s 或 0 视为未知。
+            _rt = int(e.get("rt") or 0)
+            if _rt > 10000000:
+                dur = int(_rt / 10000000)
             if e.get("streams"):
                 w, h, vcodec, acodec, subs = pick_streams(e["streams"])
                 if w and h:
@@ -390,9 +397,9 @@ def scan(c):
             stage = "landed"
         c.execute("""INSERT INTO resource_state_new(
             path, rel, lib, kind, title, tmdb, size, landed_at, probed_at,
-            scraped_at, poster_at, emby_at, emby_item, width, height,
+            scraped_at, poster_at, emby_at, emby_item, width, height, dur_sec,
             vcodec, acodec, subs, stage, note)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(path) DO UPDATE SET
               rel=excluded.rel, lib=excluded.lib, kind=excluded.kind,
               title=excluded.title, tmdb=excluded.tmdb, size=excluded.size,
@@ -400,10 +407,11 @@ def scan(c):
               scraped_at=excluded.scraped_at, poster_at=excluded.poster_at,
               emby_at=excluded.emby_at, emby_item=excluded.emby_item,
               width=excluded.width, height=excluded.height,
+              dur_sec=excluded.dur_sec,
               vcodec=excluded.vcodec, acodec=excluded.acodec,
               subs=excluded.subs, stage=excluded.stage""",
                   (full, rel, lib, kind, title, tmdb, node["size"], node["ts"],
-                   probed, scraped, poster, emby_at, item, w, h,
+                   probed, scraped, poster, emby_at, item, w, h, dur,
                    vcodec, acodec, subs, stage, ""))
         cnt += 1
         if cnt % 5000 == 0:
