@@ -655,16 +655,17 @@ def sense():
         _scan_audit(scan)
         f["scan_minutes"] = 0.0
         f["scan_stuck"] = False
-        if scan.get("State") == "Running":
-            from datetime import datetime as _dt, timezone as _tz
-            try:
-                st_iso = (scan.get("LastExecutionResult") or {}).get("StartTimeUtc")
-                if st_iso:
-                    st_dt = _dt.fromisoformat(st_iso.replace("Z", "+00:00"))
-                    f["scan_minutes"] = round((_dt.now(_tz.utc) - st_dt).total_seconds() / 60, 1)
-                    f["scan_stuck"] = f["scan_minutes"] > SCAN_LIMIT_MIN
-            except Exception:                                      # noqa: BLE001
-                pass
+        # 2026-11-26（E218）：时长必须用「我们观测到的首次 Running」，
+        # 不能用 LastExecutionResult.StartTimeUtc —— 运行中该字段是上一次执行的结果
+        # （实测把 23 分钟的扫描算成 10281.7 分钟，误报 P1 并取消了正常扫描）。
+        try:
+            import scan_watch as _SW
+            _obs = _SW.observe(scan)
+            if _obs.get("minutes") is not None:
+                f["scan_minutes"] = _obs["minutes"]
+            f["scan_stuck"] = bool(_obs.get("stuck"))
+        except Exception as e:                                 # noqa: BLE001
+            audit("sense_error", where="scan_observe", err=str(e)[:120])
         f["scan_state"] = scan.get("State")
         f["scan_pct"] = round(scan.get("CurrentProgressPercentage") or 0, 1)
         f["sessions"] = len([s for s in emby("/Sessions") if s.get("NowPlayingItem")])
@@ -822,6 +823,7 @@ def analyze(f, st=None):
         out.append(("P1", "disk_warn", "磁盘剩 %.1f GB" % f["disk_free_gb"], "deep_clean"))
     if f.get("scan_stuck"):
         out.append(("P1", "scan_stuck", "全库扫描已跑 %s 分钟（>%d）" % (f.get("scan_minutes"), SCAN_LIMIT_MIN), "stop_scan"))
+
     # 2026-11-14（E086）：**产出停滞必须主动告警，不能等人发现**。
     # 当天实测：两个 claim 卡在 post_ingest 占满 session 槽，
     # 上传停了 2 小时 50 分钟，直到用户问「频道很久没新的了」才暴露。
@@ -857,7 +859,10 @@ def analyze(f, st=None):
         pass
     try:
         r = json.loads(run("python3 %s/scan_watch.py --json" % HERE, timeout=60)[1] or "{}")
-        if r.get("stuck"):
+        # 2026-11-26（E218）：时长判据已在 sense() 里用观测值算过（同一份数据），
+        # 这里再判一次会让同一次扫描连发两条 P1（20:40:21 实测 2 条）。
+        # 只保留一个入口：时长/卡死 → sense().scan_stuck；进度停滞 → scan_stalled()。
+        if r.get("stuck") and not f.get("scan_stuck"):
             out.append(("P1", "scan_stuck", "全库扫描已跑 %s 分钟（>%d）" % (r.get("minutes"), SCAN_LIMIT_MIN), "alert"))
     except Exception:                                              # noqa: BLE001
         pass
@@ -890,7 +895,7 @@ def analyze(f, st=None):
     # 扫描被挂死的 ffprobe 堵住时全静默 → 索引冻结无人知。改成真判据。
     if st is not None:
         stall = scan_stalled(f, st)
-        if stall:
+        if stall and not f.get("scan_stuck"):
             pct, stall_s = stall
             out.append(("P1", "scan_stuck",
                         "库扫描卡在 %.1f%% 已 %.0f 分钟（索引冻结，新片不入库）" % (pct, stall_s / 60),
