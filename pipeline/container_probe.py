@@ -42,8 +42,11 @@ def check(tok, fid, size, name):
     ext = os.path.splitext(name)[1].lower()
     if ext not in (".mp4", ".mov", ".m4v", ".mkv", ".webm"):
         return None                                  # 不认识的容器不判
+    # 头读 2MB 而不是 64KB：实测「红楼梦 S01E02」这类片 moov 在头 64KB 之外，
+    # 只读 64KB 会把正常片判成 no_moov（2026-11-27 假阳性 165 条，ffprobe 本地
+    # 明明能读出时长）。2MB 仍然很便宜，远小于一遍下载。
     try:
-        head = rng(tok, fid, 0, 65535)
+        head = rng(tok, fid, 0, 2 * 1024 * 1024 - 1, timeout=60)
     except Exception as e:                            # noqa: BLE001
         return ("head_read_fail", str(e)[:40])
     if ext in (".mkv", ".webm"):
@@ -55,12 +58,14 @@ def check(tok, fid, size, name):
     # 尾读只取 256KB，超时按 unknown 处理 —— 冷读 30kB/s 时 1MB 要 33 秒，
     # 拿超时当「坏文件」会得出 79% 全是坏的假结论（2026-11-26 实测 2133/2704）。
     try:
-        tail = rng(tok, fid, max(0, size - 262144), size - 1, timeout=90)
+        # 尾读 4MB：moov 头可能落在离文件尾 1-4MB 的位置（实测红楼梦 S01E02
+        # 读 256KB/1MB 都没有 moov，读 4MB 才有）。
+        tail = rng(tok, fid, max(0, size - 4 * 1024 * 1024), size - 1, timeout=90)
     except Exception as e:                            # noqa: BLE001
         return ("unknown", "尾读超时/失败: %s" % str(e)[:30])
     if b"moov" in tail:
         return None
-    return ("no_moov", "头 64KB 与尾 1MB 都没有 moov")
+    return ("no_moov", "头 2MB 与尾 4MB 都没有 moov")
 
 
 def main():
