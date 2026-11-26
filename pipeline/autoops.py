@@ -1163,6 +1163,34 @@ def _dup_episodes_of(series_id, total_hint=None, paths=None):
     return dup
 
 
+def _scan_counters(r):
+    """只留非零计数，写进 audit/告警，省得下次只能看到「mode=scanpath」。"""
+    return {k: r.get(k) for k in ("Created", "Refreshed", "PathNotFound",
+                                  "ParentNotFound", "Failed", "skipped") if r.get(k)}
+
+
+def _scanpath_verdict(r):
+    """TargetedScan 返回值三分类（E211）。
+
+    2026-11-26 19:21 多喜一家人 S01E18：post_ingest 19:20:01 送扫时文件还没落到
+    挂载视图（PathNotFound），autoops 19:21:51 重试却被 emby_scan 的「同路径 150s
+    去重窗」挡下（返回只有 skipped）—— 旧代码把这种情况也当「ScanPath 未建成」，
+    第一次就升级 P1，文案还写「refresh 2 次无效」（tries=0）。
+
+    判据分开：
+      ok      —— 建了/刷了条目
+      pending —— 只被去重窗挡下：另一条 lane 刚送扫同一路径，异步生效中，不是失败
+      failed  —— 插件真回了 PathNotFound / ParentNotFound / Failed
+    """
+    if (r.get("Created") or 0) + (r.get("Refreshed") or 0) > 0:
+        return "ok"
+    if (r.get("PathNotFound") or 0) + (r.get("ParentNotFound") or 0) + (r.get("Failed") or 0) > 0:
+        return "failed"
+    if r.get("skipped"):
+        return "pending"
+    return "failed"
+
+
 def refresh_mismatched(f, st=None):
     """对 lib_diff 里的库，找出具体哪几部剧集数不符 → 定向 refresh（最多 3 部）
     返回 (fixed, skipped)：同一部剧 REFRESH_TRIES_WINDOW 内已刷 REFRESH_MAX_TRIES 次仍不符，
@@ -1171,7 +1199,9 @@ def refresh_mismatched(f, st=None):
         import lib_reconcile as LR
     except Exception:                                              # noqa: BLE001
         return [], []
-    tries = (st or {}).setdefault("refresh_tries", {})
+    # 2026-11-26（E211）：原来是 `(st or {})` —— 传进来空 state（{}）时 setdefault
+    # 作用在临时 dict 上，refresh_tries 永远写不回，同一部剧会每个周期重刷永不计数。
+    tries = (st if st is not None else {}).setdefault("refresh_tries", {})
     now = time.time()
     fixed = []
     skipped = []
@@ -1243,11 +1273,35 @@ def refresh_mismatched(f, st=None):
                               for p in _miss][:50]
                         _r = _ES.scan_paths(_c)
                         _used_scanpath = True
-                        if not (_r.get("Created") or _r.get("Refreshed")):
-                            skipped.append({"lib": lib, "series": nm, "disk": n,
-                                            "emby": e, "tries": len(hist),
-                                            "why": "ScanPath 未建成 %s" % _r.get("mode")})
+                        _v = _scanpath_verdict(_r)
+                        if _v == "pending":
+                            # E211：另一条 lane 刚送扫过同一路径（150s 去重窗），
+                            # 异步建条目中 —— 不是失败，不计次、不告警。
+                            audit("skip", code="index_diff", series=nm,
+                                  why="ScanPath 去重窗内（另一 lane 刚送扫，异步生效中）")
+                            continue
+                        if _v == "failed":
+                            # E178/E211：刚上传的文件在插件侧会短暂不可见（PathNotFound）；
+                            # 插件对失败路径已不占用去重窗，这里清一次父目录缓存并重试一次。
+                            # PathNotFound 表示没建成任何条目，重试不会造成重复建条。
+                            try:
+                                import reconcile as _RC
+                                _vis, _healed = _RC.heal_mount_cache(_c)
+                                if _healed:
+                                    audit("heal", code="index_diff", series=nm, healed=_healed)
+                                _retry = _vis or _c
+                                if _retry:
+                                    _r = _ES.scan_paths(_retry)
+                                    _v = _scanpath_verdict(_r)
+                            except Exception:              # noqa: BLE001
+                                pass
+                        if _v != "ok":
                             tries[nm] = hist + [now]
+                            if len(tries[nm]) >= REFRESH_MAX_TRIES:
+                                skipped.append({"lib": lib, "series": nm, "disk": n,
+                                                "emby": e, "tries": len(tries[nm]),
+                                                "why": "ScanPath 未建成 %s %s"
+                                                       % (_r.get("mode"), _scan_counters(_r))})
                             continue
                 except Exception:                          # noqa: BLE001
                     _used_scanpath = False

@@ -11,7 +11,42 @@ import re
 
 STORE_CH = -1004413117262
 MNT = '/opt/embytg/mnt/embytg'
-GENRE_DIR = [('动画', 'Movies/动画片'), ('喜剧', 'Movies/喜剧片'), ('爱情', 'Movies/剧情片'), ('动作', 'Movies/动作片'), ('惊悚', 'Movies/惊悚片'), ('恐怖', 'Movies/惊悚片'), ('犯罪', 'Movies/犯罪片'), ('科幻', 'Movies/科幻片'), ('战争', 'Movies/战争片'), ('纪录', 'Movies/纪录片'), ('剧情', 'Movies/剧情片')]
+GENRE_DIR = [('动画', 'Movies/动画片'), ('纪录', 'Movies/纪录片'),
+             ('科幻', 'Movies/科幻片'), ('恐怖', 'Movies/惊悚片'),
+             ('战争', 'Movies/战争片'), ('犯罪', 'Movies/犯罪片'),
+             ('动作', 'Movies/动作片'), ('惊悚', 'Movies/惊悚片'),
+             ('喜剧', 'Movies/喜剧片'), ('爱情', 'Movies/剧情片'),
+             ('剧情', 'Movies/剧情片')]
+
+# 2026-11-26（E215）：TMDB 类型 id → 中文库，**全项目唯一真源**。
+# 以前 tgpipe.py 与 tools/fix_libs.py 各抄了一份，顺序还不一样（动作在恐怖前面），
+# 于是「釜山行2：半岛」TMDB 首位类型是「恐怖」，却因为动作排在表里更靠前被归进动作片。
+# 现在只在这里定义，其他脚本 import；顺序原则 = 具体类型优先、泛类型兜底，
+# 同档内部按「更贴近内容」排序（恐怖在动作前，战争/犯罪也在动作前）。
+GENRE_LIB_PRIO = [
+    (16, '动画片'), (99, '纪录片'), (10402, '纪录片'),
+    (878, '科幻片'), (14, '科幻片'),
+    (27, '惊悚片'),            # 恐怖（无独立恐怖库，并入惊悚）
+    (10752, '战争片'),
+    (80, '犯罪片'),
+    (28, '动作片'), (12, '动作片'), (37, '动作片'),
+    (53, '惊悚片'), (9648, '惊悚片'),
+    (35, '喜剧片'),
+    (18, '剧情片'), (10751, '剧情片'), (10749, '剧情片'),
+    (36, '剧情片'), (10770, '剧情片'),
+]
+GENRE_LIB = dict(GENRE_LIB_PRIO)
+
+
+def genre_dir(gids, default='其他片'):
+    """按 GENRE_LIB_PRIO 取第一个命中的库名（gids 是 TMDB genre id 列表）。"""
+    s = set(gids or [])
+    for gid, lib in GENRE_LIB_PRIO:
+        if gid in s:
+            return lib
+    return default
+
+
 DEFAULT_DIR = 'Movies/其他片'
 CAM_WORDS = ('抢先版', '枪版', '抢鲜版', 'TC版', 'TS版', 'HDTS', 'HDTC', '枪鲜', '预告片', '花絮')
 def load_env():

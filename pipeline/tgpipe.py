@@ -17,6 +17,7 @@ from embytg_conf import store_channel
 import argparse, asyncio, json, os, re, subprocess, sys, time, unicodedata, urllib.request, urllib.error, urllib.parse, uuid
 
 from embytg_conf import cfg  # 统一配置真源: /opt/embytg/config.json
+from tg_common import GENRE_LIB_PRIO  # E215：类型→库 唯一真源
 
 API_ID = cfg("tg_api_id")
 API_HASH = cfg("tg_api_hash")
@@ -119,15 +120,10 @@ UA = cfg("ua")
 MOVIE_LIBS = ['剧情片', '喜剧片', '动作片', '惊悚片', '犯罪片', '科幻片', '动画片', '纪录片', '战争片', '其他片']
 TV_LIBS = ['国产剧', '日韩剧', '欧美剧', '港台剧', '国漫', '日漫', '综艺']
 
-# TMDB 电影 genre id -> 中文库（明确类型优先，泛类型兜底，避免 53/9648 吸走动作片）
-GENRE_PRIO = [
-    (16, '动画片'), (99, '纪录片'), (10402, '纪录片'),
-    (878, '科幻片'), (14, '科幻片'),
-    (28, '动作片'), (12, '动作片'), (37, '动作片'),
-    (27, '惊悚片'), (80, '犯罪片'), (35, '喜剧片'), (10752, '战争片'),
-    (53, '惊悚片'), (9648, '惊悚片'),
-    (18, '剧情片'), (10751, '剧情片'), (10749, '剧情片'), (36, '剧情片'), (10770, '剧情片'),
-]
+# TMDB 类型 id -> 中文库：**单真源在 tg_common**（E215）。
+# 原来这里和 tools/fix_libs.py 各存一份，顺序还不同（动作在恐怖前），
+# 导致「恐怖」为主类型的片子被归成动作片。不要再在本文件里复制这张表。
+GENRE_PRIO = GENRE_LIB_PRIO
 
 # (用户名, 优先级, 解析器)
 CHANNELS = [

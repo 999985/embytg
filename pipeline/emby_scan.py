@@ -161,6 +161,36 @@ def _scan_guard(paths):
     return allowed, skipped
 
 
+def _scan_unmark(paths):
+    """把路径的「去重窗」时间戳清零（这一轮没建成条目时用）。
+
+    2026-11-26（E211）：原实现只要请求发出去就写 ts，哪怕插件回的是 PathNotFound。
+    刚上传的文件，上传 lane 第一次送扫时常常还看不见（E178 类），这次失败却把之后
+    150s 的重试全挡在门外 —— 实测 19:20:01 的 E18 因此被 autoops 19:21:51 的重试
+    跳过，一直拖到 19:29 才由 reconcile 建出来。只有「建成了」才该占用去重窗；
+    没建成要把窗还回去，让下一次调用（含其它 lane）能真正发出去。
+    """
+    for p in paths:
+        key = hashlib.sha1(p.encode("utf-8")).hexdigest()[:16]
+        f = os.path.join(_SCAN_GUARD_DIR, key + ".t")
+        lk = None
+        try:
+            import fcntl
+            lk = open(f + ".lock", "a+")
+            fcntl.flock(lk.fileno(), fcntl.LOCK_EX)
+            open(f, "w").write("0")
+        except Exception:                                   # noqa: BLE001
+            pass
+        finally:
+            if lk is not None:
+                try:
+                    import fcntl
+                    fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
+                    lk.close()
+                except Exception:                           # noqa: BLE001
+                    pass
+
+
 def scan_paths(paths, timeout=180):
     """把路径交给 TargetedScan，返回状态计数。
 
@@ -182,11 +212,16 @@ def scan_paths(paths, timeout=180):
         # 优先批量端点，失败再逐条
         try:
             r = _req("/Library/ScanPaths", "POST", {"Paths": paths}, timeout=timeout)
+            _bad = []
             for it in (r or {}).get("Results") or []:
                 st = it.get("Status") or "Failed"
                 out[st] = out.get(st, 0) + 1
                 if it.get("ItemId"):
                     out["ids"].append(it["ItemId"])
+                if st not in ("Created", "Refreshed") and it.get("Path"):
+                    _bad.append(it["Path"])
+            if _bad:
+                _scan_unmark(_bad)          # 没建成的路径不占用去重窗（E211）
             return out
         except Exception:                                   # noqa: BLE001
             pass
@@ -197,8 +232,11 @@ def scan_paths(paths, timeout=180):
                 out[st] = out.get(st, 0) + 1
                 if r and r.get("ItemId"):
                     out["ids"].append(r["ItemId"])
+                if st not in ("Created", "Refreshed"):
+                    _scan_unmark([p])
             except Exception:                               # noqa: BLE001
                 out["Failed"] += 1
+                _scan_unmark([p])
         return out
 
     # 插件不在：退回 Media/Updated（只刷新，不建新）
@@ -210,6 +248,7 @@ def scan_paths(paths, timeout=180):
         out["Refreshed"] = len(paths)
     except Exception:                                       # noqa: BLE001
         out["Failed"] += len(paths)
+        _scan_unmark(paths)
     return out
 
 
