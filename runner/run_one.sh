@@ -710,7 +710,7 @@ if [ "$UPLOAD_OK" = "1" ]; then
 fi
 if [ "$UPLOAD_OK" != "1" ]; then
   log "UPLOAD failed after retry; see $WORK/upload.log"
-  UP_ERR=$(grep -a -E "ZERO_PROGRESS|ETA_TOO_SLOW|worker 超时|FloodWait|RPC 超时|QuotaRest|no manifest" "$WORK/upload.log" \
+  UP_ERR=$(grep -a -E "ZERO_PROGRESS|ETA_TOO_SLOW|STALL_NO_PART|worker 超时|FloodWait|RPC 超时|QuotaRest|no manifest" "$WORK/upload.log" \
             | tail -1 | tr -d '\r' | cut -c1-180)
   "$SYSPY" "$PIPELINE_DIR/upload_health.py" --record fail --rc "$UPLOAD_RC" --bytes "$UP_BYTES" \
     --claim "$RUN_KEY" --lane "${ACTIVE_LANE:-$MODE}" --slot "$SLOT" --err="$UP_ERR" \

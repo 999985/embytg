@@ -13,7 +13,8 @@
 产物: F:\\emby_pc\\_manifests\\<源basename>.json  (服务器登记用)
 """
 import argparse, hashlib, json, os, re, signal, subprocess, sys, time, traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (ThreadPoolExecutor, as_completed, wait,
+                                FIRST_COMPLETED)
 
 # 2026-11-14（E095）：账号池模块。之前用 s.replace("import hashlib", ...)
 # 插入，但这行是**合并导入**（import argparse, hashlib, ...），
@@ -89,8 +90,66 @@ def auto_worker_timeout(chunk_bytes, mbps, floor=1800, cap=2700,
     return int(min(cap, max(floor, est * safety + overhead)))
 
 
+def _iter_completed(futs, stall_sec=0, poll=5.0):
+    """按完成顺序产出 future；连续 stall_sec 秒没有新完成 → 抛 UploadStalled。
+
+    **不能用 `as_completed(timeout=)`**：它的 timeout 是「总时长」而不是「每次等待
+    的窗口」（3.13 实测：三个 future 分别在 0.5/1.2/1.9s 完成，timeout=1 在 1.0s
+    就抛 TimeoutError）。用它当僵死判据，会把所有耗时超过窗口的正常上传整单掐死。
+
+    这里用 wait(FIRST_COMPLETED) 自己滚窗口：每拿到一个完成就重置计时，
+    只有「真的 N 秒一个新完成的都没有」才判僵死。
+    """
+    pending = set(futs)
+    last = time.time()
+    while pending:
+        done, pending = wait(pending, timeout=poll,
+                             return_when=FIRST_COMPLETED)
+        if done:
+            last = time.time()
+            for f in done:
+                yield f
+            continue
+        if stall_sec and stall_sec > 0 and (time.time() - last) >= float(stall_sec):
+            raise UploadStalled(
+                "连续 %.0fs 没有任何区段落地（%d 个仍挂着）"
+                % (time.time() - last, len(pending)))
+
+
 class JobTooSlow(RuntimeError):
     """E216：整单 ETA 超过墙钟预算 —— 不是「文件坏了」，是「这个号现在跑不完」。"""
+
+
+class UploadStalled(RuntimeError):
+    """E221：本轮**一个区段都没落地**且已经过了「一段的物理下限时间」——僵死，不是慢。"""
+
+
+def stall_window(chunk_bytes, ceiling, min_rate=0.05, floor=600):
+    """E221：零进展僵死判据的墙钟窗 —— 「一个区段在最慢可活速率上传完要多久」。
+
+    事故（2026-11-27 全天）：`as_completed(futs)` 只在**有区段落地**时才评估
+    E216 的整单 ETA 闸门；一旦一个区段都没落地，那段判据（done<=0 / parts<2
+    直接 return False）永远不触发，只能等每个 worker 撞满 1800s 墙钟超时 ——
+    实测 12 次 `ZERO_PROGRESS 0 个分片落地`，每次白占一条 lane 30 分钟、
+    连池子都学不到「这个号已经死了」（零进展不给吞吐样本）。
+
+    判据换成「零落地」这件**可观测的硬事实**：32MiB 区段在 0.05MB/s 下也只需
+    671s，超过这个时间还一段没落地，就不是「慢」而是「连接已经僵了」。
+    上限取 worker 墙钟预算，下限 600s（别让起步抖动判死）。
+    """
+    try:
+        cb = float(chunk_bytes or 0)
+        cap = float(ceiling or 0)
+        mr = max(0.01, float(min_rate or 0.05))
+    except (TypeError, ValueError):
+        return 600
+    if cb <= 0:
+        return max(600, int(cap or 600))
+    w = (cb / 1e6) / mr
+    w = max(float(floor), w)
+    if cap > 0:
+        w = min(cap, w)
+    return int(w)
 
 
 def _kill_workers():
@@ -777,8 +836,23 @@ def main():
         _eta_min_parts = int(os.getenv("EMBYTG_UPLOAD_ETA_MIN_PARTS", "2"))
     except ValueError:
         _eta_min_el, _eta_min_parts = 300.0, 2
+    # E221：零进展僵死窗。_stall<=0 表示关闭；未设 = 自动按「一段在最慢可活速率
+    # 上传完的时间」推算（见 stall_window）。
+    _stall_env = os.getenv("EMBYTG_UPLOAD_STALL_SEC")
+    if _stall_env is None:
+        _wt_ceil = a.worker_timeout if (a.worker_timeout and a.worker_timeout > 0) \
+            else (max(_wt_seen.values()) if _wt_seen else 1800)
+        _stall = stall_window(chunk, _wt_ceil)
+    else:
+        try:
+            _stall = int(_stall_env or 0)
+        except ValueError:
+            _stall = 0
+    if _stall > 0:
+        print("  僵死闸门=%ds（这么久还没有任何区段落地 → 判僵死，交回 claim）"
+              % _stall, flush=True)
     try:
-        for fu in as_completed(futs):
+        for fu in _iter_completed(futs, _stall):
             idx, length, session_no = futs[fu]
             # run_region 现在返回 (msg, 耗时)；兼容旧签名
             _res = fu.result()
@@ -854,6 +928,49 @@ def main():
         for ex in executors:
             ex.shutdown(wait=False, cancel_futures=True)
         os._exit(7)
+    except UploadStalled as _st:
+        # E221：整整 _stall 秒没有任何区段落地 —— 判「僵死」，不判「慢」。
+        # 慢由 E216 的整单 ETA 闸门兜；而零落地时那段判据根本不触发
+        # （job_eta_exceeded 的 done<=0 / parts<min 直接 return False），
+        # 于是只能等每个 worker 撞满 1800s 墙钟，一条 lane 白占 30 分钟、产出 0。
+        # 实测 2026-11-27 全天 12 次 ZERO_PROGRESS，单次实测 1803s，全部是这条路径。
+        _el3 = time.time() - t0
+        _pend = sum(1 for _f in futs if not _f.done())
+        try:
+            save()
+        except Exception:                                  # noqa: BLE001
+            pass
+        # 池子必须学到「这个号刚才一段都没传上去」：零进展不产生吞吐样本，
+        # 不显式记失败，它的旧 mbps 会一直把它排在最前面（本次事故的成因）。
+        _reported = set()
+        try:
+            for _fu3, (_i3, _l3, _s3) in futs.items():
+                if _fu3.done():
+                    continue
+                _n3 = int(_s3 or 1)
+                _sl3 = (_slot_of_idx[_n3 - 1]
+                        if 1 <= _n3 <= len(_slot_of_idx) else _n3)
+                if _sl3 in _reported:
+                    continue
+                _reported.add(_sl3)
+                TP.report(_sl3, False, None, "stall_no_part")
+        except Exception:                                  # noqa: BLE001
+            pass
+        if _eta_parts <= 0:
+            print("ZERO_PROGRESS 本轮 %.0fs 内 0 个区段落地（%d 个 worker 在传）"
+                  " —— 判僵死，交回 claim 换号复领" % (_el3, _pend), flush=True)
+            _rc = 6
+        else:
+            print("STALL_NO_PART 本轮 %.0fs 无新区段落地（已落地 %d 段，"
+                  "%d 个 worker 仍挂着）—— 尾巴僵死，manifest 保留交回 claim 续传"
+                  % (_el3, _eta_parts, _pend), flush=True)
+            _rc = 7
+        _kill_workers()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        for ex in executors:
+            ex.shutdown(wait=False, cancel_futures=True)
+        os._exit(_rc)
     except BaseException:
         # Do not wait for the other 7 workers after one part fails.  They may
         # be stuck in long Telegram retries; waiting here hides the traceback
