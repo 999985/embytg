@@ -16,6 +16,7 @@ import tgpipe as TP                                       # noqa: E402
 from embytg_conf import cfg                               # noqa: E402
 
 NAMES = [
+    # ① 容器坏：本地 ffprobe 报 moov atom not found
     "当星光坠入花海 S01E02 - 2160p.mp4",
     "当星光坠入花海 S01E04 - 2160p.mp4",
     "当星光坠入花海 S01E07 - 2160p.mp4",
@@ -23,6 +24,15 @@ NAMES = [
     "当星光坠入花海 S01E10 - 2160p.mp4",
     "当星光坠入花海 S01E14 - 2160p.mp4",
     "当星光坠入花海 S01E16 - 2160p.mp4",
+    # ② TG 层就读不出来：连自己的 session 下载都报
+    #    "Request was unsuccessful 6 time(s)"，teldrive 重启也不恢复
+    "黑吃黑 S03E05 - 部落 - 2160p.mp4",
+    "权欲 S05E01 - 每个人都涉嫌 - 1080p.mp4",
+    "权欲 S05E04 - 第二次机会 - 1080p.mp4",
+    "欢乐家长群 S01E39 - 果宝找到小树许下生日愿望 - 2160p.mp4",
+    "钢铁森林 S01E22 - 蒋诚锁定七叔据点 - 2160p.mp4",
+    "紧急呼救 S01E03 - 近亲 - 2160p.mp4",
+    "隐锋 S01E08 - 野火燎原险中生 - 2160p.mp4",
 ]
 PSQL = ["docker", "exec", "teldrive-postgres", "psql", "-U", "teldrive", "-d", "teldrive", "-t", "-A", "-F", "|", "-c"]
 
