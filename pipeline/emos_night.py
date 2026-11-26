@@ -32,10 +32,20 @@ TARGETS = [
 
 
 def local_4k(tmdb):
-    """已有 2160p 的 (season, ep) 集合。"""
+    """已有 2160p 的 (season, ep) 集合（resource_state ∪ state_key）。
+
+    2026-11-26（E213）：resource_state 由 rsscan 每 30 分钟从挂载重建，刚落库的集
+    在下次扫描前「看不见」；本窗口刚补完的集若马上再跑一轮就会被重复选、重复下载。
+    state_key 是 pc_register 在上传完成当刻同步写入的去重台账（key 形如
+    tv|id:37854|(1, 54)|2160p），两处取并集才是真实的「本地已有」。
+    """
     con = sqlite3.connect("file:/opt/embytg/pipeline/tg.db?mode=ro", uri=True, timeout=15)
     rows = con.execute("select rel from resource_state where kind='episode' and tmdb=?",
                        (tmdb,)).fetchall()
+    prefix = "tv|id:%d|" % int(tmdb)
+    upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)     # 前缀范围查询，不用 LIKE（20 万集）
+    keys = con.execute(
+        "select k, val from state_key where k >= ? and k < ?", (prefix, upper)).fetchall()
     con.close()
     import re
     have = set()
@@ -45,6 +55,18 @@ def local_4k(tmdb):
         m = re.search(r"S(\d{2})E(\d{2,4})", rel)
         if m:
             have.add((int(m.group(1)), int(m.group(2))))
+    for k, val in keys:
+        # skip 条目是「源禁止转发」的占位，字节不在我们手里，不能算已有。
+        if '"skip"' in (val or ""):
+            continue
+        parts = (k or "").split("|")
+        if len(parts) != 4 or parts[3] != "2160p":
+            continue
+        try:
+            se, ep = [int(x) for x in parts[2].strip("()").split(",")]
+        except ValueError:
+            continue
+        have.add((se, ep))
     return have
 
 
@@ -83,14 +105,14 @@ def main():
             q, w, h = EI.quality_of(ms)
             if q != "2160p":
                 continue
-            miss.append((se[1], w, h, (ms.get("Size") or 0) / 1e9))
+            miss.append((se[0], se[1], w, h, (ms.get("Size") or 0) / 1e9))
         miss.sort()
         print("  %s：源站 4K 共 %d 集，本地缺 %d 集" % (name, sum(
             1 for it in eps if EI.quality_of((it.get("MediaSources") or [{}])[0])[0] == "2160p"),
             len(miss)))
         for x in miss[: a.limit - len(picked)]:
             picked.append({"name": name, "year": year, "tmdb": tmdb, "dir": tdir,
-                           "ep": x[0], "w": x[1], "h": x[2], "gb": x[3]})
+                           "season": x[0], "ep": x[1], "w": x[2], "h": x[3], "gb": x[4]})
 
     picked = picked[: a.limit]
     if not picked:
@@ -141,8 +163,11 @@ def main():
         # 两集失败只说明「此刻」，不说明「今晚」。改成：同一集冷却后重试，
         # 单集最多 2 次、整轮最多 3 轮冷却；真僵死时成本只有一次下载 + 一段探针。
         for attempt in range(2):
-            if time.time() > deadline - 300:
-                print("  窗口到点（--minutes %d），提前收工" % a.minutes, flush=True)
+            # 2026-11-26（E213）：子进程的「未起跑」分支（窗口<10min / 选号闸门放弃）
+            # 按设计 return 0（不能靠退出码表达「今天不跑」，否则 systemd 记单元失败）。
+            # 于是这里 600s 内起跑的子进程必定空转，白占一次 attempt。直接按 600s 收口。
+            if time.time() > deadline - 600:
+                print("  窗口剩余不足 10 分钟，本轮收工", flush=True)
                 stop = True
                 break
             cmd = [sys.executable, "/opt/embytg/pipeline/emos_import.py",
@@ -150,11 +175,21 @@ def main():
                    "--eps", str(p["ep"]), "--limit", "1", "--apply",
                    "--target-dir", p["dir"]]
             rc = os.spawnv(os.P_WAIT, sys.executable, cmd)
-            print("  E%s → rc=%s（第 %d 次）" % (p["ep"], rc, attempt + 1), flush=True)
-            if rc == 0:
+            # 2026-11-26（E213）：完成数必须是**台账里的真值**，不是子进程退出码。
+            # 今晨 07:2x 的现场：E61-E65 五集全部「窗口剩余不足 10 分钟，本轮不起跑」
+            # → 子进程 return 0 → 这里 ok+=1，于是只有 6 集真正落库（E55-E60），
+            # 日志却报「完成 11/12 集」。缺口照旧、数字虚高，第二天看日志的人被误导。
+            # 判据改成 local_4k（state_key ∪ resource_state 里该集有没有 2160p）：
+            # pc_register 登记完成才算成，其余一律不计。
+            landed = (p["season"], p["ep"]) in local_4k(p["tmdb"])
+            print("  E%s → rc=%s（第 %d 次）%s" % (
+                p["ep"], rc, attempt + 1, "已落库" if landed else "未落库"), flush=True)
+            if landed:
                 ok += 1
                 streak = 0
                 break
+            if rc == 0:
+                print("  rc=0 但库里仍无该集 2160p（未起跑或未入库）→ 不计完成", flush=True)
             streak += 1
             pause = min(1800, max(300, int(max(60, deadline - time.time()) / 8)))
             if rounds >= 3 or time.time() + pause > deadline - 300:
