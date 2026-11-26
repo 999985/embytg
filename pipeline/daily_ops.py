@@ -1214,6 +1214,30 @@ select count(*) from tree
     except Exception as _e:
         line(False, "API 应答", "不通：%s（docker restart teldrive 可恢复）" % str(_e)[:50])
 
+    # 6.57) 分片完整性（2026-11-27 E217）
+    # 用户口径：频道转发进来的片子本身是好的，只有「转发坏了」和「有广告」两种风险。
+    # 「转发坏了」在数据层就一个形状：files 行在、file_parts 为空或分片之和 != size。
+    # 这条只看库，零 IO、零误判，比拿远端字节做容器指纹可靠得多（后者三次假阳性）。
+    sec("6.57) 分片完整性")
+    try:
+        _r = subprocess.run(["docker", "exec", "teldrive-postgres", "psql", "-U", "teldrive", "-d", "teldrive",
+                             "-t", "-A", "-F", "|", "-c",
+                             "with t as (select f.id, f.size, count(p.part_no) n, coalesce(sum(p.plain_size),0) s "
+                             "from files f left join file_parts p on p.file_id=f.id "
+                             "where f.kind='file' and f.mime_type like 'video/%' and f.name not like '%.bad' "
+                             "group by f.id, f.size) "
+                             "select count(*) filter (where n=0), count(*) filter (where n>0 and s<>size), count(*) from t;"],
+                            capture_output=True, text=True, timeout=60)
+        _parts = (_r.stdout or "").strip().split("|")
+        if len(_parts) == 3:
+            _np, _mm, _tot = int(_parts[0]), int(_parts[1]), int(_parts[2])
+            line(_np == 0 and _mm == 0, "分片完整性",
+                 "视频 %d 条：无分片 %d，分片和≠声明大小 %d" % (_tot, _np, _mm))
+        else:
+            line(None, "分片完整性", "psql 无输出")
+    except Exception as _e:
+        line(None, "分片完整性", str(_e)[:60])
+
     # 6.6) 文件名画质一致性（2026-11-26 E214）
     # 事故形状：手工换片时按「高度 804」把 1920x804 写成 720p，而项目判据是
     # **宽度优先**（宽 ≥1700 即 1080p）。于是 teldrive 那行按规则归 1080p、
