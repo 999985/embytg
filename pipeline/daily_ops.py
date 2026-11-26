@@ -488,6 +488,30 @@ def main():
         line(not _bad, "落地画质与实测一致",
              "%d 条不符：%s｜%s" % (len(_bad), "; ".join(_bad[:3]), _info) if _bad
              else "近24h %d 条已探测全部一致｜%s" % (len(_rows), _info))
+        # 全库标签体检（2026-11-26 E214）：上面只拦「近 24h 新落地」，存量错标签
+        # （早期无画质闸门时落的假 4K / 宽银幕被标 720p）永远不在窗口里 → 这里给
+        # 总数作为 Q2 批量改名的进度指标，只报数不判 FAIL（改名要动 Emby，不能每
+        # 6 小时自动干）。
+        try:
+            _ca = sqlite3.connect("file:%s?mode=ro" % os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "tg.db"), uri=True, timeout=10)
+            _all_bad = {"movie": 0, "episode": 0}
+            for _r2, _w2, _h2 in _ca.execute(
+                    "select rel,width,height from resource_state "
+                    "where width is not null and width>0"):
+                _nm2 = _r2.split("/")[-1]
+                _t2 = ("2160p" if "2160p" in _nm2 else "1080p" if "1080p" in _nm2
+                       else "720p" if "720p" in _nm2 else None)
+                if not _t2 or _t2 == _real(_w2, _h2):
+                    continue
+                _k2 = "movie" if _r2.startswith("Movies/") else "episode"
+                _all_bad[_k2] += 1
+            _ca.close()
+            if sum(_all_bad.values()):
+                line(None, "存量画质标签不符", "电影 %d / 剧集 %d（Q2 批量改名，见 SELF_IMPROVE §4）"
+                     % (_all_bad["movie"], _all_bad["episode"]))
+        except Exception:                                        # noqa: BLE001
+            pass
     except Exception as e:                                          # noqa: BLE001
         line(False, "转存画质虚标", str(e)[:50])
 

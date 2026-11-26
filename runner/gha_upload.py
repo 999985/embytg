@@ -10,6 +10,26 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def quality_from_dims(width, height):
+    """宽高 → 画质档；与 gha_download.quality_from_dims 同一口径（宽度优先）。
+
+    2026-11-26（E214）：手写 movie job.json 曾把 1920x804 标成 720p（只按高度），
+    上传器只看 actual_quality==quality 就放行，错标签一路带到落地文件名。
+    这里再按宽高独立推一次 —— 两个字段自洽但都与尺寸不符时，只有重算能发现。
+    """
+    width, height = int(width or 0), int(height or 0)
+    if height >= 1800 or width >= 3000:
+        return "2160p"
+    if height >= 1400 or width >= 2400:
+        return "1440p"
+    if height >= 1000 or width >= 1800:
+        return "1080p"
+    if height >= 700 or width >= 1200:
+        return "720p"
+    return "sd"
+
+
+
 def _mani_dir():
     return os.getenv("TG_MANIFEST_DIR", os.path.join(HERE, "_manifests"))
 
@@ -84,6 +104,12 @@ def main():
     if str(job["actual_quality"]).lower() != str(job["quality"]).lower():
         raise SystemExit("job 实测画质与目标画质不一致: %s != %s" % (
             job["actual_quality"], job["quality"]))
+    # E214：两字段自洽不等于正确 —— 按宽高独立复算一次，堵死手写 job.json 的错标签。
+    _derived = quality_from_dims(job["actual_width"], job["actual_height"])
+    if str(job["actual_quality"]).lower() != _derived:
+        raise SystemExit("job 实测画质与宽高不符: %s != %s (%sx%s)" % (
+            job["actual_quality"], _derived,
+            job["actual_width"], job["actual_height"]))
     if mani.get("name") != job["name"]:
         raise SystemExit("manifest.name 与修正后的 job.name 不一致")
     mani.update({

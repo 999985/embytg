@@ -898,6 +898,29 @@ def eligible_sources(labels, leased=None, load=None):
             if _explicit_cap is not None and int(_explicit_cap) > 0:
                 if int(rec.get("day") or 0) >= int(_explicit_cap):
                     continue
+            # 2026-11-26（自省）：**有失败证据的源，必须真的被自己的有效额度卡住。**
+            #
+            # 上面那段只卡「显式 daily_cap > 0」，而本项目所有源都声明
+            # `daily_cap: 0`（= 不限量，2026-11-21 用户口径）。于是
+            # `_eff_cap_of()` 按 download_fails 算出的惩罚额度**从来没被执行过**：
+            # 它只在下面节流器里参与 `_head += max(0, cap - day)`，
+            # 超额源贡献 0 余量之后**照样被返回、照样继续烧请求**。
+            #
+            # 实测 2026-11-26 09:00（`.gha_src_budget.json` + 15 天 quota_history）：
+            #   ibukifuko day=245 ok=0 df=23 → pen=0.35 → cap=105（超了 140 次）
+            #   ct.cdn    day=211 ok=0 df=54 → cap=105（超了 106 次）
+            #   goemby    day=160 ok=0 df=26 → cap=105（超了  55 次）
+            #   三家 + xqd/lite/yuntv 在 15 天台账里入库合计 **0 集**
+            # 当天 2496 次请求里 ~1080 次落在「当天 0 产出」的源上 = 次/集 8.96 的主因。
+            #
+            # 语义边界（两条都不能破）：
+            #   ① pen == 1.0（近期零下载失败）的源仍然是 10**9 —— 不限量，
+            #      不违反「源站不设量子上限」；
+            #   ② 惩罚下限 0.35 → 最低仍有 ~105 次/天探针额度，
+            #      坏了能靠自己成功走出来（E104 自封死锁的教训）；
+            #      次日 download_fails 归零，额度自动恢复。
+            if int(rec.get("day") or 0) >= _eff_cap_of(rec, limits, now):
+                continue
             _burst = int(limits.get("burst_20m") or 0)
             if _burst and _burst < 100000 and len(rec["events"]) >= _burst:
                 continue
