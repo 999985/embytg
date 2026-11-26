@@ -28,7 +28,9 @@ except Exception:
     pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WORKER = os.path.join(HERE, "pc_worker.py")
+# E216：worker 路径可注入（默认就是同目录的 pc_worker.py）。
+# 早停闸门要在「慢号」现场验证，真跑一次 TG 上传代价太大，测试用假 worker 注入。
+WORKER = os.getenv("TG_PC_WORKER") or os.path.join(HERE, "pc_worker.py")
 MANI_DIR = os.getenv("TG_MANIFEST_DIR", os.path.join(HERE, "_manifests"))
 _store_ch = (os.getenv("TG_STORE_CH", "").split(",")[0] or "").strip()
 STORE_CH = int(_store_ch) if _store_ch.isdigit() else 0
@@ -625,6 +627,8 @@ def main():
     # 把"最快的那个号"的成绩记在 slot1 名下，权重完全失真。
     # 这里建一张 下标 → 真实 slot 的映射表，回填时用它。
     _slot_of_idx = []
+    _pool_w = {}          # 必须先初始化：多会话模式（--session-slot 0）走 `elif _pool_w:`
+                          # 时原代码会 UnboundLocalError（E216 顺带修掉）
     _disc = []
     try:
         _disc = TP.discover_sessions()
@@ -645,7 +649,6 @@ def main():
 
     weights = []
     _slot_ids = []            # E173：weights 每一项对应的真实账号槽位（下标≠槽位）
-    _pool_w = {}
     if active_sessions:
         try:
             _pool_w = TP.weights()
@@ -768,6 +771,12 @@ def main():
     except ValueError:
         _eta_budget = 6000
     _eta_parts = 0            # 本轮（不含历史 manifest）落地的区段数
+    # 样本门槛：默认「至少 300s 且至少 2 段」才判；测试/调试可用环境变量收紧。
+    try:
+        _eta_min_el = float(os.getenv("EMBYTG_UPLOAD_ETA_MIN_ELAPSED", "300"))
+        _eta_min_parts = int(os.getenv("EMBYTG_UPLOAD_ETA_MIN_PARTS", "2"))
+    except ValueError:
+        _eta_min_el, _eta_min_parts = 300.0, 2
     try:
         for fu in as_completed(futs):
             idx, length, session_no = futs[fu]
@@ -812,6 +821,8 @@ def main():
                 _el2 = time.time() - t0
                 _rem = total - sum(p["plain_size"] for p in parts.values())
                 if job_eta_exceeded(_rem, done_bytes[0], _el2, _eta_budget,
+                                    min_elapsed=_eta_min_el,
+                                    min_parts=_eta_min_parts,
                                     parts_done=_eta_parts):
                     _rate2 = done_bytes[0] / max(1.0, _el2)      # B/s
                     raise JobTooSlow(
