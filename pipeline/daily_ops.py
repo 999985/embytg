@@ -1197,6 +1197,58 @@ select count(*) from tree
     except Exception as e:                                          # noqa: BLE001
         line(False, "源服", str(e)[:60])
 
+    # 6.6) 文件名画质一致性（2026-11-26 E214）
+    # 事故形状：手工换片时按「高度 804」把 1920x804 写成 720p，而项目判据是
+    # **宽度优先**（宽 ≥1700 即 1080p）。于是 teldrive 那行按规则归 1080p、
+    # Emby 条目却指向 720p 路径，客户端点开就是空的（用户侧表现「看不了」）。
+    # 这条检查只守一个不变式：**文件名里的画质必须等于按实际分辨率算出的画质**。
+    # 只看近 7 天，避免历史存量把这条检查变成天天红（存量清洗是另一条链）。
+    sec("6.6) 文件名画质一致性")
+    try:
+        import urllib.parse as _up2
+        import urllib.request as _ur2
+        from embytg_conf import cfg as _cfg2
+        _b2 = _cfg2("emby_url").rstrip("/")
+        _tk2 = _cfg2("emby_token")
+        _since2 = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 7 * 86400))
+        _bad2, _tot2, _st2 = [], 0, 0
+        while True:
+            _q2 = _up2.urlencode({"Recursive": "true", "IncludeItemTypes": "Movie,Episode",
+                                  "MinDateCreated": _since2,
+                                  "Fields": "Path,MediaSources,MediaStreams",
+                                  "StartIndex": _st2, "Limit": 300, "api_key": _tk2})
+            _d2 = json.loads(_ur2.urlopen("%s/Items?%s" % (_b2, _q2), timeout=90).read())
+            _its2 = _d2.get("Items") or []
+            if not _its2:
+                break
+            for _it2 in _its2:
+                _tot2 += 1
+                _ms2 = (_it2.get("MediaSources") or [{}])[0]
+                _v2 = [x for x in (_ms2.get("MediaStreams") or []) if x.get("Type") == "Video"]
+                _w2 = (_v2[0].get("Width") if _v2 else 0) or 0
+                _h2 = (_v2[0].get("Height") if _v2 else 0) or 0
+                if not _w2 and not _h2:
+                    continue
+                _act2 = ("2160p" if (_w2 >= 3000 or _h2 >= 1800)
+                         else ("1080p" if (_w2 >= 1700 or _h2 >= 1000) else "720p"))
+                _m2 = re.search(r"- ?(2160p|1080p|720p|480p)\b", _it2.get("Path") or "", re.I)
+                if not _m2:
+                    continue
+                _nm2 = _m2.group(1).lower()
+                if _nm2 == "480p":
+                    _nm2 = "720p"
+                if _nm2 != _act2:
+                    _bad2.append("%s 名=%s 实=%sx%s" % ((_it2.get("Name") or "")[:22],
+                                                        _m2.group(1), _w2, _h2))
+            _st2 += len(_its2)
+            if _st2 >= _d2.get("TotalRecordCount", 0):
+                break
+        line(not _bad2, "近 7 天画质命名",
+             ("%d 条不一致：%s" % (len(_bad2), "；".join(_bad2[:4]))) if _bad2
+             else "%d 条全部一致（宽度优先口径）" % _tot2)
+    except Exception as _e2:                                         # noqa: BLE001
+        line(None, "近 7 天画质命名", str(_e2)[:60])
+
     # 7) 建议
     sec("7) 今日建议")
     fails = [r for r in rows if r[0] is False]
