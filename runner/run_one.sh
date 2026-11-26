@@ -686,9 +686,11 @@ for attempt in 1 2; do
   # E164：两种情况重试第二次没有意义，直接走失败收尾（claim 释放、文件留 _keep）：
   #   rc=6 零进展：一个分片都没落地（实测两次 attempt 结果完全相同，白占 30 分钟）
   #   rc=3 QuotaRest：TG 要求按秒休息，立刻重试只会再撞一次额度
+  # E216：rc=7 = 整单 ETA 超预算（这个号当前速率跑不完这个文件）。
+  #   同号重试只会再烧一个完整预算周期；已完成区段在 manifest 里，换个号复领续传。
   # 关掉本策略：TG_UPLOAD_SKIP_RETRY_ZERO_PARTS=0
-  if [ "${TG_UPLOAD_SKIP_RETRY_ZERO_PARTS:-1}" = "1" ] && { [ "$UPLOAD_RC" -eq 6 ] || [ "$UPLOAD_RC" -eq 3 ]; }; then
-    log "UPLOAD_SKIP_RETRY rc=$UPLOAD_RC（零进展/额度休息）；不再重试，文件留给下一次 claim 复用"
+  if [ "${TG_UPLOAD_SKIP_RETRY_ZERO_PARTS:-1}" = "1" ] && { [ "$UPLOAD_RC" -eq 6 ] || [ "$UPLOAD_RC" -eq 3 ] || [ "$UPLOAD_RC" -eq 7 ]; }; then
+    log "UPLOAD_SKIP_RETRY rc=$UPLOAD_RC（零进展/额度休息/ETA超预算）；不再重试，文件留给下一次 claim 复用"
     break
   fi
   [ "$attempt" -eq 1 ] && sleep 15
@@ -698,7 +700,7 @@ done
 if [ "$UPLOAD_OK" != "1" ]; then
   # 2026-11-23：失败必须留一条**带原因**的日志行。原来只有 "attempt N failed rc=X"，
   # 事后查日志得翻 upload.log 才知道是超时、额度还是分片全丢。日检只看这一行。
-  _last_err="$(grep -iE "error|failed|timeout|FloodWait|limit" "$WORK/upload.log" 2>/dev/null | tail -1 | cut -c1-140)"
+  _last_err="$(grep -iE "error|failed|timeout|FloodWait|limit|ETA_TOO_SLOW" "$WORK/upload.log" 2>/dev/null | tail -1 | cut -c1-140)"
   log "UPLOAD_FAILED run=$RUN_KEY rc=${UPLOAD_RC:-?} reason=${_last_err:-unknown}"
 fi
 if [ "$UPLOAD_OK" = "1" ]; then
@@ -708,7 +710,7 @@ if [ "$UPLOAD_OK" = "1" ]; then
 fi
 if [ "$UPLOAD_OK" != "1" ]; then
   log "UPLOAD failed after retry; see $WORK/upload.log"
-  UP_ERR=$(grep -a -E "ZERO_PROGRESS|worker 超时|FloodWait|RPC 超时|QuotaRest|no manifest" "$WORK/upload.log" \
+  UP_ERR=$(grep -a -E "ZERO_PROGRESS|ETA_TOO_SLOW|worker 超时|FloodWait|RPC 超时|QuotaRest|no manifest" "$WORK/upload.log" \
             | tail -1 | tr -d '\r' | cut -c1-180)
   "$SYSPY" "$PIPELINE_DIR/upload_health.py" --record fail --rc "$UPLOAD_RC" --bytes "$UP_BYTES" \
     --claim "$RUN_KEY" --lane "${ACTIVE_LANE:-$MODE}" --slot "$SLOT" --err="$UP_ERR" \

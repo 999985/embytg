@@ -12,7 +12,7 @@
 
 产物: F:\\emby_pc\\_manifests\\<源basename>.json  (服务器登记用)
 """
-import argparse, hashlib, json, os, re, subprocess, sys, time, traceback
+import argparse, hashlib, json, os, re, signal, subprocess, sys, time, traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 2026-11-14（E095）：账号池模块。之前用 s.replace("import hashlib", ...)
@@ -85,6 +85,72 @@ def auto_worker_timeout(chunk_bytes, mbps, floor=1800, cap=2700,
         return int(floor)
     est = (float(chunk_bytes) / 1e6) / max(float(min_rate), r)
     return int(min(cap, max(floor, est * safety + overhead)))
+
+
+class JobTooSlow(RuntimeError):
+    """E216：整单 ETA 超过墙钟预算 —— 不是「文件坏了」，是「这个号现在跑不完」。"""
+
+
+def _kill_workers():
+    """杀掉本进程派生、还在跑的 pc_worker（E216）。
+
+    父进程早停/失败退出后，worker 变成孤儿进程继续往存储频道灌
+    **没人登记**的区段：烧 TG 配额、污染频道、下次复领还得重新扫。
+    只杀 ppid==本进程 且 cmdline 含 pc_worker.py 的，不碰别人。
+    """
+    me = os.getpid()
+    killed = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return []
+    for pid in pids:
+        try:
+            with open("/proc/%s/stat" % pid, encoding="utf-8",
+                      errors="replace") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+            if ppid != me:
+                continue
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                if b"pc_worker.py" not in f.read():
+                    continue
+            os.kill(int(pid), signal.SIGKILL)
+            killed.append(int(pid))
+        except (OSError, ValueError, IndexError):
+            continue
+    if killed:
+        print("  已掐掉 %d 个仍在传的 worker（不留孤儿继续烧配额）" % len(killed),
+              flush=True)
+    return killed
+
+
+def job_eta_exceeded(remaining_bytes, done_bytes, elapsed, budget,
+                     min_elapsed=300, parts_done=0, min_parts=2):
+    """E216：按本轮**实测已落地字节**推整单 ETA，超预算就早停。
+
+    事故（2026-11-26 08:08，slot4）：池内 EWMA 还留着几小时前的 1.11MB/s，
+    TG 实际已把这个号压到 ~0.2MB/s 聚合。1.5GB 的文件按 1800s/区段的预算跑，
+    22 个区段落地后 part19/part25 各撞一次 1800s，attempt1+attempt2 共 5609s
+    才收尾，产出 0 —— 一条 lane 白占 1.5 小时，而那段时间 slot2 实测 1.7MB/s。
+
+    判据用「已落地字节」而不是池表的 mbps：池表是上一轮的样本，TG 限速是
+    分钟级的，只有本轮实测说了算。manifest 本来就能续传，所以早停不丢任何
+    已完成区段 —— 交回 claim，下一轮换个号复领续传即可。
+
+    返回 True 表示「剩下的活按当前速率跑不完预算」，调用方应早停。
+    """
+    try:
+        rem = float(remaining_bytes)
+        done = float(done_bytes)
+        el = float(elapsed)
+        bud = float(budget)
+    except (TypeError, ValueError):
+        return False
+    if bud <= 0 or rem <= 0 or done <= 0 or el <= 0:
+        return False
+    if el < float(min_elapsed) or int(parts_done) < int(min_parts):
+        return False                      # 样本太少，别拿起步抖动判死
+    return (rem / (done / el)) > bud
 
 
 def feasible_weights(slots, weights, chunk_bytes, mbps_by_slot,
@@ -693,6 +759,15 @@ def main():
     elif a.worker_timeout and a.worker_timeout > 0:
         print("  区段超时=固定 %ds（TG_WORKER_TIMEOUT 显式覆盖）"
               % a.worker_timeout, flush=True)
+    # E216：整单墙钟预算，与 gha_next3.rate_limited_max_gb 同一口径（默认 6000s）。
+    # 0 = 关闭早停（只跑不判）。
+    try:
+        _eta_budget = int(os.getenv("EMBYTG_UPLOAD_ETA_BUDGET_SEC",
+                                    os.getenv("EMBYTG_LANE_UPLOAD_BUDGET_SEC",
+                                              "6000")) or 0)
+    except ValueError:
+        _eta_budget = 6000
+    _eta_parts = 0            # 本轮（不含历史 manifest）落地的区段数
     try:
         for fu in as_completed(futs):
             idx, length, session_no = futs[fu]
@@ -729,6 +804,45 @@ def main():
                 # 别静默：池子回填失败等于池化失效，必须看得见
                 print("  ! 池回填失败 slot=%r: %s: %s"
                       % (session_no, type(_pe).__name__, str(_pe)[:80]), flush=True)
+            # E216：整单 ETA 闸门。判的是「剩下的活按**本轮实测**速率跑不完预算」，
+            # 不是「这一片慢」：慢号不该占着 lane 磨完整个文件。manifest 里已完成
+            # 的区段全部保留，交回 claim 让更快的号复领续传，一个字节都不白传。
+            _eta_parts += 1
+            if _eta_budget > 0:
+                _el2 = time.time() - t0
+                _rem = total - sum(p["plain_size"] for p in parts.values())
+                if job_eta_exceeded(_rem, done_bytes[0], _el2, _eta_budget,
+                                    parts_done=_eta_parts):
+                    _rate2 = done_bytes[0] / max(1.0, _el2)      # B/s
+                    raise JobTooSlow(
+                        "剩余 %.0fMB ÷ 实测 %.2fMB/s = ETA %ds > 预算 %ds"
+                        "（本轮已落地 %d/%d 段）"
+                        % (_rem / 1e6, _rate2 / 1e6, _rem / max(1.0, _rate2),
+                           _eta_budget, len(parts), nreg))
+    except JobTooSlow as _js:
+        # E216：早停不是「文件坏了」，是「这个号现在跑不完」，所以：
+        #   ① manifest 落盘（已完成区段全保留，下轮续传）
+        #   ② 记一次池失败（连败两次 → 该号 30 分钟冷却，别再派大文件）
+        #   ③ 掐掉还在跑的 worker（不留孤儿继续烧 TG 配额）
+        #   ④ 以 rc=7 退出 → run_one.sh 跳过第二次 attempt，claim 立刻释放
+        try:
+            save()
+        except Exception:                                  # noqa: BLE001
+            pass
+        print("ETA_TOO_SLOW %s" % _js, flush=True)
+        try:
+            _i3 = int(session_no or 1)
+            _sn3 = (_slot_of_idx[_i3 - 1]
+                    if 1 <= _i3 <= len(_slot_of_idx) else _i3)
+            TP.report(_sn3, False, None, "eta_too_slow")
+        except Exception:                                  # noqa: BLE001
+            pass
+        _kill_workers()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        for ex in executors:
+            ex.shutdown(wait=False, cancel_futures=True)
+        os._exit(7)
     except BaseException:
         # Do not wait for the other 7 workers after one part fails.  They may
         # be stuck in long Telegram retries; waiting here hides the traceback
