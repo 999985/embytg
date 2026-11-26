@@ -1197,6 +1197,23 @@ select count(*) from tree
     except Exception as e:                                          # noqa: BLE001
         line(False, "源服", str(e)[:60])
 
+    # 6.55) teldrive API 健康（2026-11-26 E216）
+    # 事故：config.toml 作为单文件 bind mount，被改写后容器内句柄指向旧 inode
+    # → "permission denied" 崩循环 1-2 分钟，期间所有读取/探针全失败，
+    # 而体检完全没报（那一轮容器外的东西都正常）。这条只测 API 能不能应答。
+    sec("6.55) teldrive API")
+    try:
+        _tok = subprocess.run(["bash", "/opt/embytg/api.sh"], capture_output=True, text=True, timeout=30).stdout.strip().splitlines()
+        _tok = _tok[-1].strip() if _tok else ""
+        _req = urllib.request.Request("http://127.0.0.1:8080/api/v1/files?limit=1",
+                                      headers={"Authorization": "Bearer " + _tok})
+        _t0 = time.time()
+        with urllib.request.urlopen(_req, timeout=15) as _r:
+            _code = _r.status
+        line(_code == 200, "API 应答", "HTTP %s %.2fs" % (_code, time.time() - _t0))
+    except Exception as _e:
+        line(False, "API 应答", "不通：%s（docker restart teldrive 可恢复）" % str(_e)[:50])
+
     # 6.6) 文件名画质一致性（2026-11-26 E214）
     # 事故形状：手工换片时按「高度 804」把 1920x804 写成 720p，而项目判据是
     # **宽度优先**（宽 ≥1700 即 1080p）。于是 teldrive 那行按规则归 1080p、
