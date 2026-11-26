@@ -164,7 +164,7 @@ def _scan_guard(paths):
 def _scan_unmark(paths):
     """把路径的「去重窗」时间戳清零（这一轮没建成条目时用）。
 
-    2026-11-26（E211）：原实现只要请求发出去就写 ts，哪怕插件回的是 PathNotFound。
+    2026-11-26（E217）：原实现只要请求发出去就写 ts，哪怕插件回的是 PathNotFound。
     刚上传的文件，上传 lane 第一次送扫时常常还看不见（E178 类），这次失败却把之后
     150s 的重试全挡在门外 —— 实测 19:20:01 的 E18 因此被 autoops 19:21:51 的重试
     跳过，一直拖到 19:29 才由 reconcile 建出来。只有「建成了」才该占用去重窗；
@@ -221,7 +221,7 @@ def scan_paths(paths, timeout=180):
                 if st not in ("Created", "Refreshed") and it.get("Path"):
                     _bad.append(it["Path"])
             if _bad:
-                _scan_unmark(_bad)          # 没建成的路径不占用去重窗（E211）
+                _scan_unmark(_bad)          # 没建成的路径不占用去重窗（E217）
             return out
         except Exception:                                   # noqa: BLE001
             pass

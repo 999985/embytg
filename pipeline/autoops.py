@@ -1170,7 +1170,7 @@ def _scan_counters(r):
 
 
 def _scanpath_verdict(r):
-    """TargetedScan 返回值三分类（E211）。
+    """TargetedScan 返回值三分类（E217）。
 
     2026-11-26 19:21 多喜一家人 S01E18：post_ingest 19:20:01 送扫时文件还没落到
     挂载视图（PathNotFound），autoops 19:21:51 重试却被 emby_scan 的「同路径 150s
@@ -1199,7 +1199,7 @@ def refresh_mismatched(f, st=None):
         import lib_reconcile as LR
     except Exception:                                              # noqa: BLE001
         return [], []
-    # 2026-11-26（E211）：原来是 `(st or {})` —— 传进来空 state（{}）时 setdefault
+    # 2026-11-26（E217）：原来是 `(st or {})` —— 传进来空 state（{}）时 setdefault
     # 作用在临时 dict 上，refresh_tries 永远写不回，同一部剧会每个周期重刷永不计数。
     tries = (st if st is not None else {}).setdefault("refresh_tries", {})
     now = time.time()
@@ -1275,13 +1275,13 @@ def refresh_mismatched(f, st=None):
                         _used_scanpath = True
                         _v = _scanpath_verdict(_r)
                         if _v == "pending":
-                            # E211：另一条 lane 刚送扫过同一路径（150s 去重窗），
+                            # E217：另一条 lane 刚送扫过同一路径（150s 去重窗），
                             # 异步建条目中 —— 不是失败，不计次、不告警。
                             audit("skip", code="index_diff", series=nm,
                                   why="ScanPath 去重窗内（另一 lane 刚送扫，异步生效中）")
                             continue
                         if _v == "failed":
-                            # E178/E211：刚上传的文件在插件侧会短暂不可见（PathNotFound）；
+                            # E178/E217：刚上传的文件在插件侧会短暂不可见（PathNotFound）；
                             # 插件对失败路径已不占用去重窗，这里清一次父目录缓存并重试一次。
                             # PathNotFound 表示没建成任何条目，重试不会造成重复建条。
                             try:
