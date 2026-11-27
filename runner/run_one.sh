@@ -700,7 +700,10 @@ done
 if [ "$UPLOAD_OK" != "1" ]; then
   # 2026-11-23：失败必须留一条**带原因**的日志行。原来只有 "attempt N failed rc=X"，
   # 事后查日志得翻 upload.log 才知道是超时、额度还是分片全丢。日检只看这一行。
-  _last_err="$(grep -iE "error|failed|timeout|FloodWait|limit|ETA_TOO_SLOW" "$WORK/upload.log" 2>/dev/null | tail -1 | cut -c1-140)"
+  # 2026-11-27（E224）：ZERO_PROGRESS / STALL_NO_PART 是 E221 僵死闸门的**结论行**，
+  # 原正则只认 error/failed/timeout… → 零进展的整单在 loop.log 里永远记
+  # `reason=unknown`，08:05 那 39 条失败事后根本分不清是僵死还是别的原因。
+  _last_err="$(grep -iE "ZERO_PROGRESS|STALL_NO_PART|error|failed|timeout|FloodWait|limit|ETA_TOO_SLOW" "$WORK/upload.log" 2>/dev/null | tail -1 | cut -c1-140)"
   log "UPLOAD_FAILED run=$RUN_KEY rc=${UPLOAD_RC:-?} reason=${_last_err:-unknown}"
 fi
 if [ "$UPLOAD_OK" = "1" ]; then

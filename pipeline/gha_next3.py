@@ -457,6 +457,52 @@ def _demote_throttled(order, speeds, ratio=0.5):
     return good + bad if good else list(order)
 
 
+def pool_cooling(path=None, now=None):
+    """正在冷却中的账号槽 → 剩余秒数（读 /opt/embytg-runner/config/tg_pool.json）。
+
+    2026-11-27（E224）：**冷却记录必须真的影响派活，否则等于没有。**
+
+    事故形状（08:05 的「整单失败×39」主因）：slot2 的号上传时「675s 零区段落地」，
+    pc_upload 按 E221 正确记了 stall_no_part，连败两次 → tg_pool 给它 30 分钟
+    cooldown。**但冷却只作用在 pc_upload 的多会话权重上**，而四条 lane 各自
+    `--session-slot` 单会话，权重恒为 1.0 —— 冷却对派活毫无作用。于是冷却一到点
+    又被派 1.4–3.1GB 的集，再空转 11 分钟、再烧一次源站下载（实测 slot2 占了
+    历史失败的最大头）。判据错在「选槽只看谁最闲 + 最近速率样本」，
+    「刚才一段都没传上去」这个**已记录的失败**根本没进候选排序。
+    """
+    p = path or os.getenv("EMBYTG_TG_POOL", "/opt/embytg-runner/config/tg_pool.json")
+    t = time.time() if now is None else float(now)
+    out = {}
+    try:
+        with open(p, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except Exception:                                       # noqa: BLE001
+        return out
+    for k, e in (d.get("nodes") or {}).items():
+        if not isinstance(e, dict):
+            continue
+        try:
+            left = float(e.get("cooldown_until") or 0) - t
+            slot = int(k)
+        except (TypeError, ValueError):
+            continue
+        if left > 0 and slot > 0:
+            out[slot] = left
+    return out
+
+
+def filter_cooling(order, cooling):
+    """去掉冷却中的槽；全在冷却 → 按剩余冷却从短到长（不停摆）。返回 (order, dropped)。"""
+    if not cooling:
+        return list(order), []
+    warm = [s for s in order if s not in cooling]
+    cool = [s for s in order if s in cooling]
+    if not warm:
+        cool.sort(key=lambda s: (cooling[s], s))
+        return cool, []
+    return warm, cool
+
+
 def session_slot(active, run_id=None):
     """挑一个**真正空闲**的 TG session 并独占它，返回 slot 号（1 起）。
 
@@ -511,6 +557,20 @@ def session_slot(active, run_id=None):
             print("session_slot: 限速降级 %s → %s" % (_before, order), file=sys.stderr)
     except Exception:                                      # noqa: BLE001
         pass                                               # 量速失败不影响领活
+
+    # 2026-11-27（E224）：被池子冷却的号**真的一单都别派**（见 pool_cooling）。
+    try:
+        _cool = pool_cooling()
+        if _cool:
+            _b2 = list(order)
+            order, _dropped = filter_cooling(order, _cool)
+            if _dropped:
+                print("session_slot: 池冷却跳过 %s（剩 %s）候选 %s → %s" % (
+                    ["slot%d" % s for s in _dropped],
+                    ["%d分" % round(_cool[s] / 60.0) for s in _dropped],
+                    _b2, order), file=sys.stderr)
+    except Exception:                                      # noqa: BLE001
+        pass
 
     for slot in order:
         if GS.slot_lease(slot, run_id or ("next3-%d" % os.getpid())):

@@ -20,6 +20,7 @@
 """
 import json
 import os
+import re
 import threading
 import time
 
@@ -37,6 +38,14 @@ MIN_WEIGHT = 0.05
 MAX_WEIGHT = 4.0
 # EWMA 平滑系数：新样本占 30%
 ALPHA = 0.3
+# 失败时速度估计的衰减下限（MB/s）：0.05 ≈ 一个 32MiB 区段要 11 分钟，
+# 与「物理上传不完」同义；不再往下降是因为再低就没有区分度了。
+MIN_MBPS = 0.05
+# 只有**传输层**失败才衰减速度估计：它们说明「这个号现在传不动」。
+# 源站错、找不到剧、配额闸门这类跟 TG 速度无关的失败不能连坐。
+RATE_ERR_RE = re.compile(
+    r"stall_no_part|stall_no|eta_too_slow|worker 超时|flood|FloodWait|"
+    r"timeout|超时|ZERO_PROGRESS|zero_part", re.I)
 
 
 def _load():
@@ -173,7 +182,20 @@ def _report_locked(slot, ok, mbps=None, err=None):
     else:
         e["fails"] = int(e.get("fails") or 0) + 1
         e["last_err"] = (err or "")[:120]
-        if e["fails"] >= FAIL_TRIP:
+        # 2026-11-27（E224）：**失败也必须让「这个号有多快」的估计往下走。**
+        # 零进展/超时/超额度的失败不产生吞吐样本，旧版 mbps 就永远停在乐观值：
+        # 实测 slot2 真实 0.02MB/s，池里记着 2.232 → gha_next3.rate_limited_max_gb
+        # 按 2.232 放行 1.4–3.1GB 的集，每一轮都物理上传不完，再空转 11 分钟。
+        # 半衰而不是清零：健康号偶发一次抖动，一个任务内十几片 ok 样本就能把
+        # EWMA（ALPHA=0.3）拉回真值，不会被一次误判长期压低。
+        if RATE_ERR_RE.search(str(err or "")):
+            _old = float(e.get("mbps") or 0)
+            if _old > 0:
+                e["mbps"] = round(max(MIN_MBPS, _old * 0.5), 3)
+        # 「675s 零区段落地」是硬事实（E221），一次就该下课：
+        # 等连败两次再冷却，等于再白送 675s + 一次源站下载。
+        _trip = 1 if str(err or "").startswith("stall_no_part") else FAIL_TRIP
+        if e["fails"] >= _trip:
             e["cooldown_until"] = now + COOLDOWN_SEC
             e["fails"] = 0                             # 进冷却后计数归零，留回血机会
     e["updated"] = int(now)
@@ -186,7 +208,18 @@ def snapshot():
     d = _load()
     now = _now()
     rows = []
-    for s in discover_sessions():
+    nodes = d.get("nodes") or {}
+    # 2026-11-27（E224）：环境里没有 TG_SESSION_STRING（比如直接 `python3 tg_pool.py`
+    # 排查时没 source runner.env）也要能看到池文件里记着的号 —— 否则这张表是空的，
+    # 「池表会过期」这类问题只能靠猜。
+    slots = {s["slot"] for s in discover_sessions()}
+    for k in nodes:
+        try:
+            slots.add(int(k))
+        except (TypeError, ValueError):
+            continue
+    for _slot in sorted(slots):
+        s = {"slot": _slot}
         e = _entry(d, s["slot"])
         cd = float(e.get("cooldown_until") or 0)
         rows.append({
