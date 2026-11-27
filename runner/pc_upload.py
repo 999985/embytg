@@ -594,6 +594,27 @@ def main():
     total = os.path.getsize(src)
     display = a.name or os.path.basename(src)
     base = os.path.splitext(os.path.basename(src))[0]
+    # 2026-11-27（E219）：分片按「该号实测吞吐」自动选，不再全局 32MiB。
+    # 32MiB 是为慢号（0.2MB/s × 32MB ≈ 160s < RPC 240s）设的下限，
+    # 但快号（5MB/s）拿 32MiB 会把 1.4GB 拆成 43 条消息 —— 消息越多越容易撞
+    # FloodWait/part 失败，近 48h 88 次 UPLOAD_FAILED 里大部分是这个形状。
+    # 目标：每片约 180 秒传完，夹在 [32, 512] MiB。
+    if os.environ.get("TG_CHUNK_AUTO", "0") == "1":
+        try:
+            _slot_no = (SESSIONS.index(active_sessions[0]) + 1) if active_sessions else 0
+            _mbps = 0.0
+            for _r in TP.snapshot():
+                if int(_r.get("slot") or 0) == _slot_no:
+                    _mbps = float(_r.get("mbps") or 0)
+                    break
+            if _mbps > 0:
+                _want = max(32, min(512, int(_mbps * 180)))
+                if _want != a.chunk_mib:
+                    print("  分片自适应：slot%d %.2fMB/s → %dMiB（原 %dMiB）"
+                          % (_slot_no, _mbps, _want, a.chunk_mib), flush=True)
+                a.chunk_mib = _want
+        except Exception:                                    # noqa: BLE001
+            pass
     chunk = a.chunk_mib * 1024 * 1024
     nreg = (total + chunk - 1) // chunk
 

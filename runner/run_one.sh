@@ -31,7 +31,10 @@ MODE="${SYSTEM_LANE:-${LANE:-auto}}"
 MAX_ACTIVE="${TG_MAX_ACTIVE:-99}"
 SOURCE_ALLOW="${GHA_SOURCE_ALLOW:-}"
 export PYTHONUNBUFFERED=1
-export TG_CHUNK_MIB="${TG_CHUNK_MIB:-32}"   # 2026-11-24 E205：128MiB 在 0.4MB/s 慢号上要 320s，必超时
+export TG_CHUNK_MIB="${TG_CHUNK_MIB:-32}"
+# E219：分片大小按实测吞吐自动选（pc_upload 里算），32MiB 只当下限。
+# 快号 5MB/s 时 1.4GB 从 43 条消息降到 4 条，明显减少 part 失败面。
+export TG_CHUNK_AUTO="${TG_CHUNK_AUTO:-1}"   # 2026-11-24 E205：128MiB 在 0.4MB/s 慢号上要 320s，必超时
 if [ "$SLOT" = "3" ]; then
   export TG_UPLOAD_JOBS="${TG_UPLOAD_JOBS_SLOT3:-1}"
 else
