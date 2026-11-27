@@ -25,6 +25,8 @@ BUDGET = "/opt/embytg/pipeline/.gha_src_budget.json"
 DEAD_SCORE = 5
 VERIFIED_TOP = 110
 TOP_BASE = 100
+# 2026-11-27（E225）：手工置顶必须有时限，否则它自己就变成下一个会腐烂的静态值。
+VERIFIED_TTL_DAYS = int(os.environ.get("SRC_VERIFIED_TTL_DAYS") or 7)
 
 
 def load(path, default):
@@ -41,6 +43,55 @@ def speed_of(measured, key):
         return float(str(v).split()[0])
     except Exception:                                          # noqa: BLE001
         return 0.0
+
+
+def _as_date(v, fallback=None):
+    """把 'YYYY-MM-DD' / datetime / None 解析成 date。解析不了就用 fallback。"""
+    import datetime as _dt
+    if isinstance(v, _dt.datetime):
+        return v.date()
+    if isinstance(v, _dt.date):
+        return v
+    try:
+        return _dt.date.fromisoformat(str(v)[:10])
+    except Exception:                                          # noqa: BLE001
+        return fallback
+
+
+def verified_live(prio, today=None):
+    """允许「置顶」的源集合 —— 只手核验后 VERIFIED_TTL_DAYS 天内有效。
+
+    2026-11-27（E225）：`_verified_top` 原来是裸列表，置顶永久生效 →
+    等于把「优先级靠人手写会腐烂」这个问题原样引回来：lite.cn2gias.uk
+    2026-11-27 置顶 110 后一次都没被试过（ok=0），却压在 5 个真有产出的源
+    前面，回归用例 test_producing_source_outranks_dead 直接 FAIL。
+
+    现在每项带核验日期，到期自动沉底 —— 不需要任何人记得回来改。
+    生产代码（rank）与回归用例都调这一个函数，两边不可能再各说各话。
+    兼容旧格式：裸列表按优先级文件 mtime 当核验日（同样会到期）。
+    """
+    import datetime as _dt
+    raw = (prio or {}).get("_verified_top")
+    ttl = VERIFIED_TTL_DAYS
+    today = today or _dt.date.today()
+    out = set()
+    if not raw:
+        return out
+    if isinstance(raw, dict):
+        items = [(k, v) for k, v in raw.items() if not str(k).startswith("_")]
+    else:
+        try:
+            mt = _dt.date.fromtimestamp(os.path.getmtime(PRIO))
+        except Exception:                                      # noqa: BLE001
+            mt = today
+        items = [(str(k), mt) for k in raw]
+    for k, v in items:
+        d = _as_date(v, None)
+        if d is None:
+            continue                       # 没有核验日期 = 不认，宁可沉底
+        if (today - d).days <= ttl:
+            out.add(str(k))
+    return out
 
 
 def rank(prio, budget_sources):
@@ -62,7 +113,7 @@ def rank(prio, budget_sources):
     prio = prio or {}
     budget_sources = budget_sources or {}
     measured = prio.get("_measured") or {}
-    verified = set(prio.get("_verified_top") or [])
+    verified = verified_live(prio)          # 带时限的置顶（E225）
     labels = {k for k in prio if not str(k).startswith("_")}
     labels |= {k for k in budget_sources if not str(k).startswith("_")}
     labels = sorted(labels)

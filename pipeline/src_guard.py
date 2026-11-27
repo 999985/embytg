@@ -764,6 +764,25 @@ class Guard:
         """
         usable = [s for s in self.states.values() if s.usable]
         usable.sort(key=lambda s: (s.fails, -s.score, s.avg_ms, s.count))
+        # 2026-11-27（E221）：**探索配额，否则新源永远无法自证。**
+        # 排序主键是历史成功率，一个没被试过的源 score 低 → 永远排后面 →
+        # 永远没记录 → 永远低。实测 lite.cn2gias.uk（用户确认的两大库之一）
+        # 今天就只被查了 36 次、命中 0，而它明明能搜到 黑吃黑/武动乾坤/斗罗大陆。
+        # 规则：本会话请求数 < EXPLORE_MIN 的源提到最前（少的优先），
+        # 让每个可用源每天都有机会跑出第一批成功记录，之后自然按 score 归位。
+        # 注意：不能用 score 给探索段排序 —— 没被试过的源 score 反而可能很高
+        # （xqd 就是 1.0 却 0 命中），lite 只有 0.75 就永远轮不到。
+        # 所以探索段内部按 (本会话请求数, 今日用量) 轮转，不看历史成功率。
+        EXPLORE_MIN = 20
+        fresh = [s for s in usable if s.count < EXPLORE_MIN and s.score >= DEAD_SCORE]
+        if fresh:
+            fresh.sort(key=lambda s: s.count)
+            if len(fresh) > 1:
+                k = self._rr % len(fresh)
+                fresh = fresh[k:] + fresh[:k]
+                self._rr += 1
+            rest = [s for s in usable if s not in fresh]
+            usable = fresh + rest
         alive = [s for s in usable if s.score >= DEAD_SCORE]
         dead = [s for s in usable if s.score < DEAD_SCORE]
         if alive:

@@ -315,8 +315,18 @@ def build(limit=2000, apply=False):
                        x.get("series") or ""),
     )
     deduped = {}
+    _prio = load_source_priority()          # E222：去重阶段就要用优先级，提前取出
     for row in rows:
-        key = (norm_title(row.get("series")), int(row.get("year") or 0))
+        # 2026-11-27（E222）：**主力源不该在去重里被吞掉。**
+        # 去重按「集数多者胜」，而 lite.cn2gias.uk 不填 RecursiveItemCount
+        # （episodes 一律走 UNKNOWN_EPISODES），于是它 28740 部的目录
+        # 在同名剧上全输给 emos/aaa 的真实集数 —— 队列里 lite 条目 0 条，
+        # 一个 2.8 万部的大库整天只被查 36 次。
+        # 规则：优先级 >= 100 的源（人工实测确认的主力）单独占一组键，
+        # 同名剧允许它在队列里另有一条，主源下不动时还有备份。
+        _lab = row.get("source_label") or "?"
+        _key0 = (norm_title(row.get("series")), int(row.get("year") or 0))
+        key = ("src", _lab, _key0) if _prio.get(_lab, 0) >= 100 else _key0
         old = deduped.get(key)
         if not old:
             deduped[key] = row
