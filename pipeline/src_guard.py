@@ -72,6 +72,16 @@ MAX_PER_HOST = int(os.environ.get("EMBYTG_SRC_MAX_PER_HOST") or 400)
 COOLDOWN_FAIL = 600         # 熔断 10 分钟
 COOLDOWN_RATE = 1800        # 429（限流/封禁前兆）熔断 30 分钟
 MAX_CONSEC_FAIL = 2
+# 2026-11-27（自省，E223）：**429 必须单次即熔断。**
+# 事故实测（logs/source_requests.log 8 天）：yuntv 1007 次请求只有 34 次 200，
+# 其余 407×429 + 566×无应答；今天 44 次请求 0 次成功，全在 10-15 分钟一个探针。
+# 根因就一行：429 也走 `fails >= MAX_CONSEC_FAIL`（10 分钟内连续 2 次）才冷却，
+# 而探针间隔 12 分钟 > FAIL_WINDOW(600s) → 计数每次被重置成 1，**永远到不了 2**，
+# 冷却从未发生；`_health_ok` 也不该在 3 天前的一次 200 之后继续给它 ok_streak=27。
+# 429 是服务端明确要求退避（Retry-After 的语义），一次就够了；连续 429 逐次翻倍
+# （30m→1h→2h→4h→6h 封顶），任何一次成功立刻归零 —— 源站恢复后一次探针就能回到轮转。
+RATE_COOL_MAX = int(os.getenv("EMBYTG_SRC_RATE_COOL_MAX", str(6 * 3600)))
+RATE_STRIKE_TTL = int(os.getenv("EMBYTG_SRC_RATE_STRIKE_TTL", str(6 * 3600)))
 # 2026-11-23（自省）：源排序必须基于**可观测的历史**，不是每个进程从零开始的内存。
 # 事故：yuntv 自 11-17 起 742 次请求只有 10 次成功（1.3%，其余是连接失败/429），
 # 但每个 runner 都是新建 Guard，`score` 的 ok/fails 从 0/0 起算 0.5 —— 死源和
@@ -332,6 +342,18 @@ def _health_fail(label, status):
             rec["fails"] = 0          # 隔了 10min 以上不算「连续」
         rec["fails"] = int(rec.get("fails") or 0) + 1
         rec["last_status"] = int(status or 0)
+        if int(status or 0) == 429:
+            # 2026-11-27（E223）：429 单次即熔断，且连续 429 逐次翻倍。
+            # 旧逻辑要求「10 分钟内连续 2 次」才冷却，而实测探针间隔 10-15 分钟，
+            # 计数永远被重置成 1 → 冷却从未发生（yuntv 8 天 407 次 429 全白撞）。
+            if now - float(rec.get("rate_strike_ts") or 0) > RATE_STRIKE_TTL:
+                rec["rate_strikes"] = 0
+            rec["rate_strikes"] = int(rec.get("rate_strikes") or 0) + 1
+            rec["rate_strike_ts"] = now
+            cool = min(COOLDOWN_RATE * (2 ** (rec["rate_strikes"] - 1)), RATE_COOL_MAX)
+            rec["cool_until"] = max(float(rec.get("cool_until") or 0), now + cool)
+            rec["fails"] = max(int(rec.get("fails") or 0), MAX_CONSEC_FAIL)
+            return rec
         if int(status or 0) == 401:
             # 2026-11-22：401 = 本地 token 被源站拒绝。换进程、等 10 分钟、
             # 换镜像都不会让它变好 —— 只有人能重新登录换 token。
@@ -354,6 +376,7 @@ def _health_ok(label, status=200):
         rec["fails"] = 0
         rec["cool_until"] = 0
         rec["token_stale_until"] = 0
+        rec["rate_strikes"] = 0        # E223：一次成功即清空 429 连击，恢复后在轮转里
         rec["last_status"] = int(status)
         rec["ok_streak"] = int(rec.get("ok_streak") or 0) + 1
         return rec

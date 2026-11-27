@@ -80,9 +80,12 @@ def parse_tgdb_fields(manifest, folders, a):
         raise ValueError("--folders 里没有 {tmdb=N}，请显式给 --tmdb")
     sm = re.search(r"Season\s*(\d+)", folders, re.I)
     em = re.search(r"S(\d{1,2})E(\d{1,4})", name, re.I)
-    season = int(sm.group(1)) if sm else (int(em.group(1)) if em else 0)
-    episode = int(em.group(2)) if em else 0
-    if not season or not episode:
+    # 2026-11-27：Season 00（番外/特辑）是合法季号，旧写法 `if not season` 把它
+    # 当成「没解析到」→ 整条登记失败，文件留在 teldrive 但台账空 → claim 卡死。
+    # 判「缺失」只认 None，不认 0。
+    season = int(sm.group(1)) if sm else (int(em.group(1)) if em else None)
+    episode = int(em.group(2)) if em else None
+    if season is None or episode is None:
         raise ValueError("无法解析季/集（--folders 需含 Season XX，name 需含 SxxExx）")
     qm = re.search(r"(2160p|1080p|720p|4K)", name, re.I)
     qual = qm.group(1).lower().replace("4k", "2160p") if qm else "sd"

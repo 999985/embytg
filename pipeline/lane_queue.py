@@ -81,9 +81,13 @@ def prune_job(job):
     if not path or not os.path.exists(path):
         return None
     tmdb = str(job.get("tmdb") or "")
+    # 2026-11-27：Season 00（番外/特辑）合法，不能因 season==0 就跳过清理，
+    # 否则这类条目收尾后仍留在队列里被反复领取、反复上传。
+    if not tmdb or job.get("season") is None or job.get("ep") is None:
+        return None
     season = int(job.get("season") or 0)
     ep = int(job.get("ep") or 0)
-    if not tmdb or not season or not ep:
+    if not ep:
         return None
 
     with _lock():
