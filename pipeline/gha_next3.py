@@ -2687,6 +2687,32 @@ def main():
         _rate = GS.source_success_rate()
     except Exception:                                      # noqa: BLE001
         _rate = {}
+    # 2026-11-28（E226）：**人工核验过的主力源必须有产出下限。**
+    # lite.cn2gias.uk 是用户确认的两大库之一、优先级 110、队列里 1400 条，
+    # 但 source_success_rate() 按当日 ok 算，它 ok=0 → rate=0 → 条目永远排在
+    # 4000 条的最后，实际一次都轮不到（日切后 day 仍然是 0，日志可证）。
+    # 给 config/source_priority.json 的 _verified_top 一个 rate 下限，
+    # 让它排在 bangumi 之后、emos 之前，真正被试出来。
+    _vp = {}
+    try:
+        _vp = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "config", "source_priority.json"), encoding="utf-8"))
+        _vtop = [str(x) for x in (_vp.get("_verified_top") or [])]
+    except Exception:                                       # noqa: BLE001
+        _vp, _vtop = {}, []
+    if _vtop and items:
+        # 注意：_verified_top 里如果放了两个源，给同一个固定 floor 等于没分先后
+        # （实测 emos 和 lite 同时 0.65，稳定排序把 emos 的 1400 条全排在前面，
+        # lite 照样一次轮不到）。floor 必须按优先级拉开档次：
+        # 优先级 110 → 0.92、100 → 0.83、95 → 0.79，主力之间也有明确先后。
+        _rate = dict(_rate)
+        for _l in _vtop:
+            try:
+                _pr = float(_vp.get(_l) or 0)
+            except (TypeError, ValueError):
+                _pr = 0.0
+            _fl = float(os.environ.get("VERIFIED_RATE_FLOOR") or min(0.95, _pr / 120.0))
+            _rate[_l] = max(float(_rate.get(_l) or 0.0), _fl)
     if _rate and items:
         items = sorted(items, key=lambda x: -_rate.get(str(x.get("source_label")), 0.5))
 
