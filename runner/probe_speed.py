@@ -5,7 +5,35 @@ import re
 import sys
 
 HERE = "/opt/embytg-runner"
-SRC = os.path.join(HERE, "media.busan/釜山行2：半岛 (2020) {tmdb=581392} - 720p.mp4")
+
+# E224（2026-11-27）：源文件写死成 media.busan/釜山行2 → 被清理后探针直接
+# FileNotFoundError，四个会话全 FAIL，等于「测速工具自己先死了」。
+# 改成自动挑一个够大的现存文件：优先 _keep（失败留存，稳定不参与新任务），
+# 其次 media.slot*。不写死任何一部片名。
+PROBE = 3 * 1024 * 1024
+
+
+def _pick_src(need):
+    cands = []
+    for d in ["_keep", "media.slot1", "media.slot2", "media.slot3",
+              "media.slot4", "media.slot5", "media.busan"]:
+        p = os.path.join(HERE, d)
+        if not os.path.isdir(p):
+            continue
+        for f in os.listdir(p):
+            q = os.path.join(p, f)
+            if not os.path.isfile(q) or f.endswith((".json", ".path")):
+                continue
+            try:
+                sz = os.path.getsize(q)
+            except OSError:
+                continue
+            if sz >= need:
+                cands.append((0 if d == "_keep" else 1, sz, q))
+    if not cands:
+        return None
+    cands.sort()
+    return cands[0][2]
 
 env = {}
 for line in open(os.path.join(HERE, "runner.env"), encoding="utf-8"):
@@ -16,7 +44,12 @@ for line in open(os.path.join(HERE, "runner.env"), encoding="utf-8"):
 S = [env.get("TG_SESSION_STRING"), env.get("TG_SESSION_STRING_2"),
      env.get("TG_SESSION_STRING_3"), env.get("TG_SESSION_STRING_4")]
 S = [s for s in S if s]
-PROBE = 3 * 1024 * 1024
+SRC = _pick_src(PROBE * (len(S) or 1))
+if not SRC:
+    print("没有可用于测速的源文件（需要 >= %d MB）：先跑一轮上传或清理 _keep。"
+          % (PROBE * (len(S) or 1) // 1024 // 1024), flush=True)
+    sys.exit(2)
+print("  源=%s 会话数=%d" % (os.path.basename(SRC), len(S)), flush=True)
 
 
 async def one(i, sess):
