@@ -164,8 +164,9 @@ def main():
         return 0
     prio.update(new)
     prio["_note"] = ("按真实产出自动重排（reprioritize_sources.py）。"
-                     "有产出的按 ok 降序，无产出一律 5 分，"
-                     "_verified_top 里的新源置顶 110。")
+                     "有产出的按 ok 降序，无产出一律 5 分；"
+                     "_verified_top 是手核验置顶，每项带核验日期，"
+                     "%d 天到期自动沉底（E225）。" % VERIFIED_TTL_DAYS)
     with open(PRIO, "w", encoding="utf-8") as f:
         json.dump(prio, f, ensure_ascii=False, indent=1)
     print("  已写入 %s" % PRIO)

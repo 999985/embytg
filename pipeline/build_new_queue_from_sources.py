@@ -166,7 +166,52 @@ def list_source(guard, label):
             if "400" in msg or "504" in msg or "timed out" in msg.lower() or "timeout" in msg.lower():
                 continue
             raise
-        return data.get("Items") or [], int(data.get("TotalRecordCount") or 0)
+        # 2026-11-27（E223）：**必须翻页。** lite.cn2gias.uk 的 Limit 上限是
+        # 500（更大直接 400），而它有 28740 部 —— 单次请求只拿到 500，
+        # 等于 98% 的目录永远进不了候选池。报表上 listed=500 / total=28740
+        # 看着「正常列完了」，实际只列了 1.7%，又一个整源静默缺席。
+        # 用 StartIndex 续翻，每源上限 QUEUE_PAGE_MAX 条、QUEUE_PAGE_BUDGET_S 秒，
+        # 慢源（39.96 一次 500 要 250s）不会把整次重建拖死。
+        items = list(data.get("Items") or [])
+        total = int(data.get("TotalRecordCount") or 0)
+        try:
+            page_lim = int(lim)
+        except (TypeError, ValueError):
+            page_lim = 500
+        page_max = int(os.environ.get("QUEUE_PAGE_MAX", "3000"))
+        deadline = time.time() + float(os.environ.get("QUEUE_PAGE_BUDGET_S", "240"))
+        seen = {str(x.get("Id")) for x in items}
+        start = len(items)
+        while total and start < total and len(items) < page_max and time.time() < deadline:
+            q2 = urllib.parse.urlencode({
+                "Recursive": "true",
+                "IncludeItemTypes": "Series",
+                "StartIndex": str(start),
+                "Limit": str(page_lim),
+                "Fields": (
+                    "ProviderIds,ProductionYear,Path,OriginalLanguage,"
+                    "ProductionLocations,Genres,ChildCount,RecursiveItemCount"
+                ),
+            })
+            try:
+                d2 = guard.get(st, base + "/Items?" + q2, search=False, timeout=60)
+            except Exception:                          # noqa: BLE001
+                break
+            batch = d2.get("Items") or []
+            if not batch:
+                break
+            added = 0
+            for it in batch:
+                k = str(it.get("Id"))
+                if k in seen:
+                    continue
+                seen.add(k)
+                items.append(it)
+                added += 1
+            if not added:
+                break
+            start += len(batch)
+        return items, total
     raise last if last else RuntimeError("list_source failed: " + label)
 
 
