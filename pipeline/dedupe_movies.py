@@ -7,7 +7,7 @@
 三种写法同一部片互相认不出，于是一部片进三条。
 
 本脚本按 **tmdb id 优先**（三种写法都能抽出来）+ 片名年份兜底分组，
-每组保留 best_pick 排名最高的一份，其余走 drop_old 五处清理。
+每组保留**分辨率档最高、同档体积最大**的一份（`_better_key`），其余走 drop_old 五处清理。
 
 用法：
     python3 dedupe_movies.py --dry-run
@@ -23,8 +23,6 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-import best_pick as BP                                        # noqa: E402
 
 DB = os.path.join(HERE, "tg.db")
 
@@ -46,6 +44,19 @@ def label_of(name):
     if "720" in n:
         return "720p"
     return "sd"
+
+
+_TIER = {"2160p": 3, "1080p": 2, "720p": 1, "sd": 0}
+
+
+def _better_key(i):
+    """保留谁：先分辨率档，再体积（同档体积≈码率），最后时长。
+
+    2026-11-28 日终实测：原来直接用 `best_pick.rank_candidates`，它按体积打分，
+    于是《门徒 (2007)》留了 2185MB 的 720p —— **把 1080p 删掉留 720p**，与用户
+    「能上最高画质就上最高画质、低画质不删」的红线正好相反。体积只能同档内比。
+    """
+    return (_TIER.get(i["label"], 0), i["size"] or 0, i["duration"] or 0)
 
 
 def main():
@@ -79,13 +90,11 @@ def main():
         if a.limit and done >= a.limit:
             break
         items = dups[key]
-        ranked = BP.rank_candidates([{"label": i["label"], "size": i["size"],
-                                      "duration": i["duration"], "vcodec": i["vcodec"]}
-                                     for i in items])
+        ranked = sorted(items, key=_better_key, reverse=True)
         if not ranked:
             continue
         win = ranked[0]
-        keep = next(i["rel"] for i in items if i["size"] == win["size"] and i["label"] == win["label"])
+        keep = win["rel"]
         kill = [i for i in items if i["rel"] != keep]
         print("  留 %-34s %5dMB，删 %d 个" % (os.path.basename(keep)[:34],
               next(i["size"] for i in items if i["rel"] == keep) / 1e6, len(kill)))

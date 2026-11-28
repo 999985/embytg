@@ -110,6 +110,82 @@ def _req(path, method="GET", body=None, timeout=60):
     return json.loads(raw) if raw.strip() else None
 
 
+RC_URL = (C.cfg("rclone_rc", "http://127.0.0.1:5572") or "http://127.0.0.1:5572").rstrip("/")
+_RC_PROBE = {}
+_DIR_REFRESHED = set()          # 本进程已刷过的目录，避免重复打 rc
+
+
+def _rc(path, body):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(RC_URL + path, method="POST",
+                               headers={"Content-Type": "application/json"}, data=data)
+    with urllib.request.urlopen(r, timeout=20) as f:
+        raw = f.read()
+    return json.loads(raw) if raw.strip() else None
+
+
+def _rc_alive():
+    if "ok" in _RC_PROBE:
+        return _RC_PROBE["ok"]
+    try:
+        _rc("/rc/noop", {})
+        _RC_PROBE["ok"] = True
+    except Exception:                                       # noqa: BLE001
+        _RC_PROBE["ok"] = False
+    return _RC_PROBE["ok"]
+
+
+def ensure_visible(paths, waits=(0, 1.5, 4.0)):
+    """把「刚登记但挂载还看不见」的文件刷出来，返回仍然不可见的容器路径。
+
+    2026-11-28 日终的机制性坑（E230 第二段）：teldrive 行已在（`landed_at` 有值）、
+    但 rclone `--dir-cache-time 10m` 的目录列表还是旧的 → `os.path.exists` 为假。
+    下游据此判定「磁盘已无文件」：notify_replay 直接把队列条目**永久出队**
+    （19:30 一次出队 4 条，正是 19:29 落地的《追逐繁星的孩子》《天才谋杀法》《人吓鬼》），
+    于是文件在、Emby 永远没有它，且没人报错。
+
+    这里主动调 `rclone rc vfs/refresh dir=<父目录>` 后重试 stat，最多等 `waits` 秒。
+    rc 不可用就直接返回原始结果（不额外报错，保持原有降级路径）。
+    """
+    miss = []
+    for p in paths:
+        host = HOST_MNT + p[len(PREFIX):] if p.startswith(PREFIX + "/") else p
+        if os.path.exists(host):
+            continue
+        miss.append(p)
+    if not miss:
+        return []
+
+    if _rc_alive():
+        todo = []
+        for p in miss:
+            if not p.startswith(PREFIX + "/"):
+                continue
+            d = os.path.dirname(p[len(PREFIX) + 1:])
+            if not d or d in _DIR_REFRESHED:
+                continue
+            _DIR_REFRESHED.add(d)
+            todo.append(d)
+        for d in todo:
+            try:
+                # rclone rc 的 recursive 必须传字符串 "true"/"false"；
+                # 传 bool 会 500 `value must be string "recursive"=true`（2026-11-28 实测）
+                _rc("/vfs/refresh", {"dir": d, "recursive": "false"})
+            except Exception:                               # noqa: BLE001
+                pass
+
+    still = list(miss)
+    for w in waits:
+        if w:
+            time.sleep(w)
+        still = [p for p in still
+                 if not os.path.exists(HOST_MNT + p[len(PREFIX):]
+                                       if p.startswith(PREFIX + "/") else p)]
+        if not still:
+            break
+    return still
+
+
 def have_scanpath():
     """探测 /Library/ScanPath 是否存在（插件装没装）。
 
@@ -241,6 +317,12 @@ def scan_paths(paths, timeout=180):
     paths = _norm
     if not paths:
         return out
+    # 刚落地/刚改名的文件常被 rclone 目录缓存挡住（dir-cache-time 10m）：
+    # 不先刷出来就会一路被判 PathNotFound，调用方再按「磁盘已无文件」丢掉（E230）
+    try:
+        ensure_visible(paths)
+    except Exception:                                       # noqa: BLE001
+        pass
     paths, _skipped = _scan_guard(paths)
     if _skipped:
         out["skipped"] = len(_skipped)

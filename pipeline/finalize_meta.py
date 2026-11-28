@@ -99,6 +99,10 @@ def db_dup_check():
     sql = ("select name from teldrive.files where kind='file' and status='active' "
            "and lower(name) not like '%.nfo' "
            "and lower(name) not like '%.jpg' "
+           # 隔离/去重标记不是媒体：`.bad`（坏件隔离，E-bad）与 `.dup`（E015 同集多画质
+           # 留高删低时给低画质文件的后缀）都不进 Emby，算进「同画质双份」= 永久假 FAIL。
+           "and lower(name) not like '%.bad' "
+           "and lower(name) not like '%.dup' "
            "and lower(name) not like '%.jpeg' "
            "and lower(name) not like '%.png' "
            "and lower(name) not like '%.webp'")

@@ -58,6 +58,25 @@ def host_path(p):
     return p
 
 
+def rel_of(p):
+    return p[len(DISK_PREFIX) + 1:] if p.startswith(DISK_PREFIX + "/") else p
+
+
+def registered(rel):
+    """tg.db 里这条 rel 是否还在（在 = 文件没删，只是挂载还看不见）。"""
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % os.path.join(HERE, "tg.db"),
+                              uri=True, timeout=20)
+        try:
+            return con.execute("select 1 from resource_state where rel=? limit 1",
+                               (rel,)).fetchone() is not None
+        finally:
+            con.close()
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
 def in_emby(path):
     url = ("%s/Items?Recursive=true&IncludeItemTypes=Episode,Movie&Limit=1&Path=%s&api_key=%s"
            % (E, urllib.parse.quote(path), T))
@@ -127,15 +146,26 @@ def main():
             print("  attempts=%d %s" % (r["attempts"], r["path"]))
         return 0
 
-    # 1) 文件还在的才送扫（删掉的直接出队并留痕）
+    # 1) 文件还在的才送扫。看不见时先批量刷挂载目录再判 —— 不能直接当「已删除」出队：
+    #    2026-11-28 19:30 就是这样把 19:29 刚落地的《追逐繁星的孩子》《天才谋杀法》
+    #    《人吓鬼》永久出队的（rclone dir-cache-time 10m，文件其实在），Emby 至今没有它们。
+    _missing = [r for r in todo if not os.path.exists(host_path(r["path"]))]
+    if _missing:
+        try:
+            import emby_scan
+            emby_scan.ensure_visible([r["path"] for r in _missing][:50])
+        except Exception:                                        # noqa: BLE001
+            pass
     gone, alive = [], []
     for r in todo:
         if os.path.exists(host_path(r["path"])):
             alive.append(r)
+        elif registered(rel_of(r["path"])):
+            alive.append(r)          # 台账还在 = 文件没删，继续等可见（复核环节自会记 attempts）
         else:
             gone.append(r)
     if gone:
-        _log("磁盘已无文件，出队 %d 条（不送扫）" % len(gone))
+        _log("台账已无此文件，出队 %d 条（不送扫）" % len(gone))
         for r in gone:
             entries.pop(r["path"], None)
 
