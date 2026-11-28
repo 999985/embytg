@@ -539,6 +539,9 @@ def download_full(job, target, expect):
         print("MEDIA=%s\nSIZE=%d" % (target, have))
         return target
     headers = {"User-Agent": job.get("source_ua") or FIXED_UA, "Accept": "*/*"}
+    # E227（2026-11-28）：lite.cn2gias.uk 的 stream 必须带 Emby 客户端身份头 +
+    # MediaSourceId，否则一律 404。job 里由 gha_next3 填好，这里透传。
+    headers.update(job.get("source_headers") or {})
     if have:
         headers["Range"] = "bytes=%d-" % have
         print("  本地断点续传：已有 %.2f GB" % (have / 1e9), flush=True)

@@ -671,6 +671,8 @@ def probe_source(job):
         'Accept-Encoding': 'identity',
         'Range': 'bytes=0-%d' % (sample - 1),
     }
+    # E227：有的源（lite）要求 Emby 客户端身份头，缺了直接 404
+    headers.update(job.get('source_headers') or {})
     label = job.get('source_label') or '?'
     t0 = time.time()
     got = 0
@@ -1747,12 +1749,118 @@ def _lane_scan_gated(lane):
     return True
 
 
-def _source_url(st, episode_id):
+def _source_url(st, episode_id, media_source_id=""):
+    """拼一个能真正取到字节的直链。
+
+    2026-11-28（E227）：lite.cn2gias.uk 的 stream 端点**强制要求 MediaSourceId**，
+    少了它一律 404（实测 /Videos/2637384/stream?Static=true&api_key=… → 404，
+    带上 MediaSourceId=mediasource_2637384 → 206 + EBML 头）。这就是它
+    「目录能搜、命中永远 0」的最后一环：预检拿到 404 判 source_preflight_not_video。
+    """
     if getattr(st, "label", "") == "emos.enic65.eu.org":
         import emos_direct
         return emos_direct.direct_url(st.host, st.token, episode_id)
-    return "%s/Videos/%s/stream?Static=true&api_key=%s" % (
-        st.host.rstrip("/"), episode_id, st.token)
+    # E228：lite 实测「带 api_key 反而 404、把 token 放 X-Emby-Authorization 里
+    # 才 206」，所以这类源用 auth_via_header 开关，URL 不带 api_key。
+    if _auth_via_header(getattr(st, "label", "")):
+        url = "%s/Videos/%s/stream?Static=true" % (st.host.rstrip("/"), episode_id)
+    else:
+        url = "%s/Videos/%s/stream?Static=true&api_key=%s" % (
+            st.host.rstrip("/"), episode_id, st.token)
+    # **只给需要的源加** MediaSourceId：实测 emby.bangumi.ca 带上它反而 400
+    # （Value ...），所以不能一刀切。开关放 config/sources.json 的 require_msid，
+    # 加新源时改配置就生效，不写死在代码里。
+    if media_source_id and _needs_media_source_id(getattr(st, "label", "")):
+        url += "&MediaSourceId=" + str(media_source_id)
+    return url
+
+
+_MSID_FLAGS = {}
+_PLAYBACK_UID = {}
+_PB_FLAGS = {}
+_AH_FLAGS = {}
+
+
+def _auth_via_header(label):
+    """config/sources.json: {"label": ..., "auth_via_header": true}"""
+    if not _AH_FLAGS:
+        try:
+            import json as _json
+            _cfg = _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                "config", "sources.json"), encoding="utf-8"))
+            for _e in _cfg:
+                if isinstance(_e, dict) and _e.get("label"):
+                    _AH_FLAGS[str(_e["label"])] = bool(_e.get("auth_via_header"))
+        except Exception:                                   # noqa: BLE001
+            _AH_FLAGS["__loaded__"] = False
+    return bool(_AH_FLAGS.get(str(label)))
+
+
+def _needs_playback_prime(label):
+    """config/sources.json: {"label": ..., "require_playbackinfo": true}"""
+    if not _PB_FLAGS:
+        try:
+            import json as _json
+            _cfg = _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                "config", "sources.json"), encoding="utf-8"))
+            for _e in _cfg:
+                if isinstance(_e, dict) and _e.get("label"):
+                    _PB_FLAGS[str(_e["label"])] = bool(_e.get("require_playbackinfo"))
+        except Exception:                                   # noqa: BLE001
+            _PB_FLAGS["__loaded__"] = False
+    return bool(_PB_FLAGS.get(str(label)))
+
+
+def _prime_playback(st, episode_id):
+    """给「必须先建播放会话才肯给字节」的源开一次会话。
+
+    2026-11-28（E228）实测 lite.cn2gias.uk：
+      · 直接 GET /Videos/{id}/stream?Static=true&MediaSourceId=… → 404
+      · 先 POST /Items/{id}/PlaybackInfo?UserId=…，同一个 stream → 206 + EBML
+    也就是说它的 stream 端点绑在播放会话上。这里返回建会话拿到的
+    MediaSourceId / PlaySessionId，拼进直链。
+    """
+    import json as _json
+    import requests
+    label = str(getattr(st, "label", ""))
+    base = str(getattr(st, "host", "") or "").rstrip("/")
+    tok = getattr(st, "token", "") or ""
+    if not (base and tok):
+        return "", ""
+    auth = ('Emby Client="Hills", Device="Windows", DeviceId="hills-embytg", '
+            'Version="1.5.1", Token="%s"' % tok)
+    hdr = {"User-Agent": getattr(st, "ua", "") or "", "X-Emby-Authorization": auth,
+           "Content-Type": "application/json"}
+    uid = _PLAYBACK_UID.get(label)
+    if not uid:
+        r = requests.get(base + "/Users/Me", headers=hdr, timeout=20, verify=False)
+        if r.status_code != 200:
+            return "", ""
+        uid = r.json().get("Id")
+        _PLAYBACK_UID[label] = uid
+    r = requests.post(base + "/Items/%s/PlaybackInfo?UserId=%s" % (episode_id, uid),
+                      headers=hdr, data=_json.dumps({"UserId": uid}),
+                      timeout=25, verify=False)
+    if r.status_code != 200:
+        return "", ""
+    d = r.json()
+    ms = (d.get("MediaSources") or [{}])[0]
+    return str(ms.get("Id") or ""), str(d.get("PlaySessionId") or "")
+
+
+def _needs_media_source_id(label):
+    """config/sources.json: {"label": ..., "require_msid": true}"""
+    if not _MSID_FLAGS:
+        try:
+            import json as _json
+            _cfg = _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                "config", "sources.json"), encoding="utf-8"))
+            for _e in _cfg:
+                if isinstance(_e, dict) and _e.get("label"):
+                    _MSID_FLAGS[str(_e["label"])] = bool(_e.get("require_msid"))
+        except Exception:                                   # noqa: BLE001
+            _MSID_FLAGS["__loaded__"] = False
+    return bool(_MSID_FLAGS.get(str(label)))
 
 
 def make_job(lane, item, season, ep, target, candidate, key, store_ch, store_channels,
@@ -1762,6 +1870,14 @@ def make_job(lane, item, season, ep, target, candidate, key, store_ch, store_cha
     ms = (episode.get("MediaSources") or [{}])[0]
     runtime = int(episode.get("RunTimeTicks") or ms.get("RunTimeTicks") or 0)
     rel = os.path.relpath(target, A.MNT_ROOT).replace("\\", "/")
+    # E228：需要播放会话的源，先建会话再拼直链（lite 的 stream 绑会话）
+    _src_url = _source_url(candidate["st"], episode["Id"], ms.get("Id") or "")
+    if _needs_playback_prime(candidate["st"].label):
+        _pmsid, _psid = _prime_playback(candidate["st"], episode["Id"])
+        if _pmsid:
+            _src_url += "&MediaSourceId=" + _pmsid
+        if _psid:
+            _src_url += "&PlaySessionId=" + _psid
     job = {
         "job_id": "%s-%s" % (time.strftime("%Y%m%d_%H%M%S"), os.urandom(3).hex()),
         "run_id": run_id,
@@ -1786,7 +1902,14 @@ def make_job(lane, item, season, ep, target, candidate, key, store_ch, store_cha
         "tg_session_slot": slot,
         "source_label": candidate["st"].label,
         "source_ua": candidate["st"].ua,
-        "source_url": _source_url(candidate["st"], episode["Id"]),
+        "source_url": _src_url,
+        # lite 这类源要求 Emby 客户端身份头，否则 stream 直接 404（E227）
+        "source_headers": {
+            "X-Emby-Authorization": (
+                'Emby Client="Hills", Device="Windows", DeviceId="hills-embytg", '
+                'Version="1.5.1", Token="%s"' % (candidate["st"].token or "")
+            ),
+        },
         "status": "running",
         "ts": int(time.time()),
     }
@@ -2713,6 +2836,27 @@ def main():
     except Exception:                                      # noqa: BLE001
         _rate = {}
     if _rate and items:
+        # 2026-11-28（E229）：**人工核验过的主力源要有产出下限。**
+        # source_success_rate() 按当日 ok 算，lite 刚修好、ok=0 → rate=0
+        # → 1400 条永远排在 4000 条的最后，一次都轮不到（日切后 day 仍是 0）。
+        # 给 config/source_priority.json 的 _verified_top 一个按优先级缩放的
+        # rate 下限（110 → 0.92、100 → 0.83），主力之间仍有明确先后。
+        _vp, _vtop = {}, []
+        try:
+            _vp = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "config", "source_priority.json"), encoding="utf-8"))
+            _vtop = [str(x) for x in (_vp.get("_verified_top") or [])]
+        except Exception:                                   # noqa: BLE001
+            _vp, _vtop = {}, []
+        if _vtop:
+            _rate = dict(_rate)
+            for _l in _vtop:
+                try:
+                    _pr = float(_vp.get(_l) or 0)
+                except (TypeError, ValueError):
+                    _pr = 0.0
+                _fl = float(os.environ.get("VERIFIED_RATE_FLOOR") or min(0.95, _pr / 120.0))
+                _rate[_l] = max(float(_rate.get(_l) or 0.0), _fl)
         items = sorted(items, key=lambda x: -_rate.get(str(x.get("source_label")), 0.5))
 
     if _hot:

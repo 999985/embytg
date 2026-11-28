@@ -152,6 +152,42 @@ def stall_window(chunk_bytes, ceiling, min_rate=0.05, floor=600):
     return int(w)
 
 
+def stall_window_measured(chunk_bytes, mbps, ceiling, safety=1.5, floor=600,
+                          min_rate=0.05):
+    """E229：有实测吞吐时，僵死窗按「这个号一段的真实耗时 × 安全系数」。
+
+    事故（2026-11-28 08:05 告警「整单失败×61」，24h 内 58 次 ZERO_PROGRESS）：
+    `stall_window` 的 0.05MB/s 是**硬地板**，而池里慢号的实测吞吐恰好就压在
+    0.04–0.05（slot1 last 0.04 / slot4 0.05）。32MiB ÷ 0.05 = 671s，闸门 = 675s
+    —— 一点余量都没有。RPC 建连、源文件 MD5、8 个 worker 争抢任何一项抖一下，
+    第一段就落在 675s 之后 → 判僵死 → 失败 → 池冷却 30min → 复领同一集再撞一次。
+    实测每次白烧 11 分钟（675s + 收尾）+ 一次源站下载，一天 58 次。
+
+    判据还是「能不能落地」，但阈值必须用**刚刚实测到的这个号的速率**来算，并留
+    1.5 倍余量：0.05MB/s → 1006s（< worker 墙钟 1800，来得及落地）；0.02MB/s →
+    2516s 被墙钟截到 1800（真慢就按墙钟死，而不是按错的地板值死）。快号
+    （≥0.1MB/s）仍被 600s 下限兜住 → 真僵死照样 10 分钟发现，不会变迟钝。
+    """
+    try:
+        cb = float(chunk_bytes or 0)
+        cap = float(ceiling or 0)
+        mb = float(mbps or 0)
+        sf = max(1.0, float(safety or 1.0))
+        fl = float(floor or 600)
+    except (TypeError, ValueError):
+        return 600
+    if cb <= 0:
+        return max(600, int(cap or 600))
+    if mb <= 0:
+        # 没有实测：退回硬地板口径，保持 E221 的行为
+        return stall_window(cb, cap)
+    w = ((cb / 1e6) / max(0.01, mb)) * sf
+    w = max(fl, w)
+    if cap > 0:
+        w = min(cap, w)
+    return int(w)
+
+
 def _kill_workers():
     """杀掉本进程派生、还在跑的 pc_worker（E216）。
 
@@ -863,7 +899,23 @@ def main():
     if _stall_env is None:
         _wt_ceil = a.worker_timeout if (a.worker_timeout and a.worker_timeout > 0) \
             else (max(_wt_seen.values()) if _wt_seen else 1800)
-        _stall = stall_window(chunk, _wt_ceil)
+        # E229：优先用**这个号刚实测到的吞吐**算闸门。E221 的 0.05MB/s 只是硬地板，
+        # 而慢号的实测值本来就贴着 0.04–0.05 —— 拿地板值当阈值等于「按体检报告
+        # 判死刑」：671s 的理论值与 675s 的闸门只差 4 秒，任何抖动都必然被误杀。
+        _stall_rate = 0.0
+        try:
+            if a.session_slot:
+                _stall_rate = float(_mbps_by_slot.get(int(a.session_slot), 0.0) or 0.0)
+            elif _mbps_by_slot:
+                _stall_rate = max(float(v or 0.0) for v in _mbps_by_slot.values())
+        except (TypeError, ValueError):
+            _stall_rate = 0.0
+        if _stall_rate > 0:
+            _stall = stall_window_measured(chunk, _stall_rate, _wt_ceil)
+            print("  僵死闸门口径：实测 slot%s %.2fMB/s × 1.5 → %ds"
+                  % (a.session_slot or "-", _stall_rate, _stall), flush=True)
+        else:
+            _stall = stall_window(chunk, _wt_ceil)
     else:
         try:
             _stall = int(_stall_env or 0)
