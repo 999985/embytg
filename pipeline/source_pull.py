@@ -282,24 +282,31 @@ def _cap_get(label, now):
         c.execute("CREATE TABLE IF NOT EXISTS src_caps("
                   "label TEXT PRIMARY KEY, ts REAL, shows_bad INT, limit_ok INT, "
                   "series_ok INT DEFAULT -1)")
-        row = c.execute("SELECT ts, shows_bad, limit_ok, series_ok FROM src_caps WHERE label=?",
-                        (label,)).fetchone()
+        # 2026-11-28（E228）：新增 parent_ok（ParentId 两级列集可用）。老库没有这一列，
+        # 不 ALTER 就会 SELECT 失败 → 整份能力记忆退化成「无记忆」，14 个源每轮重新试错。
+        try:
+            c.execute("ALTER TABLE src_caps ADD COLUMN parent_ok INT DEFAULT 0")
+        except Exception:                                        # noqa: BLE001
+            pass
+        row = c.execute("SELECT ts, shows_bad, limit_ok, series_ok, parent_ok "
+                        "FROM src_caps WHERE label=?", (label,)).fetchone()
         c.close()
         if not row:
             _CAP_MEM[label] = (now, None)
             return None
-        ts, shows_bad, limit_ok, series_ok = row
+        ts, shows_bad, limit_ok, series_ok, parent_ok = row
         if now - float(ts or 0) >= _CAP_TTL:
             return None
         out = {"shows_bad": bool(shows_bad), "limit_ok": int(limit_ok or 0),
-               "series_ok": -1 if series_ok is None else int(series_ok)}
+               "series_ok": -1 if series_ok is None else int(series_ok),
+               "parent_ok": int(parent_ok or 0)}
         _CAP_MEM[label] = (now, out)
         return out
     except Exception:                                            # noqa: BLE001
         return None
 
 
-def _cap_put(label, shows_bad=None, limit_ok=None, series_ok=None):
+def _cap_put(label, shows_bad=None, limit_ok=None, series_ok=None, parent_ok=None):
     """只更新传入的字段，其余保留（读-改-写，一行，O(1)）。"""
     _CAP_MEM.pop(label, None)          # 刚学到的事实必须立刻可见
     try:
@@ -307,13 +314,18 @@ def _cap_put(label, shows_bad=None, limit_ok=None, series_ok=None):
         c.execute("CREATE TABLE IF NOT EXISTS src_caps("
                   "label TEXT PRIMARY KEY, ts REAL, shows_bad INT, limit_ok INT, "
                   "series_ok INT DEFAULT -1)")
-        old = c.execute("SELECT shows_bad, limit_ok, series_ok FROM src_caps WHERE label=?",
-                        (label,)).fetchone() or (0, 0, -1)
+        try:
+            c.execute("ALTER TABLE src_caps ADD COLUMN parent_ok INT DEFAULT 0")
+        except Exception:                                        # noqa: BLE001
+            pass
+        old = c.execute("SELECT shows_bad, limit_ok, series_ok, parent_ok "
+                        "FROM src_caps WHERE label=?", (label,)).fetchone() or (0, 0, -1, 0)
         sb = old[0] if shows_bad is None else shows_bad
         lim = old[1] if limit_ok is None else limit_ok
         sok = old[2] if series_ok is None else series_ok
-        c.execute("INSERT OR REPLACE INTO src_caps VALUES(?,?,?,?,?)",
-                  (label, time.time(), int(bool(sb)), int(lim or 0), int(sok)))
+        pok = old[3] if parent_ok is None else parent_ok
+        c.execute("INSERT OR REPLACE INTO src_caps VALUES(?,?,?,?,?,?)",
+                  (label, time.time(), int(bool(sb)), int(lim or 0), int(sok), int(pok or 0)))
         c.commit()
         c.close()
     except Exception:                                            # noqa: BLE001
@@ -361,6 +373,80 @@ def _is_bad_answer(e):
     return bool(getattr(e, "bad_answer", False)) or "非 JSON" in str(e)
 
 
+_PARENT_SEASON_MAX = int(os.getenv("EMBYTG_PARENT_SEASON_MAX", "80"))
+
+
+def _ep_by_parent(g, st, label, path, cap=None):
+    """③ ParentId 两级列集：季 → 集。
+
+    2026-11-28（E228）实测 lite.cn2gias.uk：
+        /Shows/3086841/Episodes                       -> 400（端点没实现）
+        /Items?SeriesId=3086841&IncludeItemTypes=Episode -> 200 但**忽略过滤**，346375 条
+        /Items?ParentId=3086841&IncludeItemTypes=Season  -> 14 季
+        /Items?ParentId=3087556&IncludeItemTypes=Episode -> 81 集，SeriesId 正确
+    也就是说这个源**能列集**，只是要按 ParentId 两级走。旧代码只认前两种端点，
+    于是把它判成「列集能力不可用」整源摘除 —— 28740 部的大库 0 集产出。
+    返回与 `/Shows/{id}/Episodes` 同构的 dict（Season 号由季的 IndexNumber 补上，
+    因为 ParentId 列的集不一定回填 ParentIndexNumber）。
+    """
+    m = _SHOWS_EP_RE.match(path or "")
+    if not m:
+        m = re.match(r"^/Items\?(?:.*&)?SeriesId=([^&]+)", path or "")
+    if not m:
+        return None
+    sid = m.group(1)
+    q0 = urllib.parse.parse_qs(urllib.parse.urlparse(path or "").query)
+    fields = (q0.get("Fields") or ["MediaSources,RunTimeTicks,ProviderIds"])[0]
+    lim = int((cap or {}).get("limit_ok") or 0) or 500
+    try:
+        seas = g.get(st, "/Items?ParentId=%s&IncludeItemTypes=Season&Recursive=false"
+                         "&Fields=IndexNumber,Name&Limit=%d" % (sid, lim))
+    except Exception:                                            # noqa: BLE001
+        return None
+    sitems = []
+    for s in (seas.get("Items") or []):
+        if not isinstance(s, dict):
+            continue
+        try:
+            if int(s.get("IndexNumber") or 0) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if s.get("Id"):
+            sitems.append(s)
+    if not sitems:
+        return None
+    out = []
+    for s in sitems[:_PARENT_SEASON_MAX]:
+        season_no = int(s.get("IndexNumber") or 0)
+        season_id = str(s.get("Id"))
+        start = 0
+        while True:
+            p = ("/Items?ParentId=%s&IncludeItemTypes=Episode&Recursive=false"
+                 "&Fields=%s&Limit=%d&StartIndex=%d"
+                 % (season_id, urllib.parse.quote(fields), lim, start))
+            try:
+                d = g.get(st, p)
+            except Exception:                                    # noqa: BLE001
+                break
+            batch = [e for e in (d.get("Items") or []) if isinstance(e, dict)]
+            total = int(d.get("TotalRecordCount") or 0)
+            for e in batch:
+                if e.get("IndexNumber") is None:
+                    continue
+                if not e.get("SeriesId"):
+                    e["SeriesId"] = sid
+                if e.get("ParentIndexNumber") is None:
+                    e["ParentIndexNumber"] = season_no
+                out.append(e)
+            start += len(batch)
+            if not batch or len(batch) < lim or (total and start >= total):
+                break
+    if not out:
+        return None
+    return {"Items": out, "TotalRecordCount": len(out)}
+
+
 def _ep_get(g, st, path):
     """带缓存的 Episodes 请求。缓存异常一律退回直接请求（缓存不能成为故障源）。
 
@@ -398,11 +484,18 @@ def _ep_get(g, st, path):
     base = path
     cap = _cap_get(key[0], now)
     if cap:
-        # /Shows 不存在 **且** /Items 忽略 SeriesId 过滤 = 这个源根本没有可用的列集能力。
-        # 再试只是烧配额（lite 7 天 935 次请求、0 集产出）。TTL 到期会重新探测。
+        # 2026-11-28（E228）：ParentId 两级可用就直接走它，别再撞两个已知失败的端点。
+        if cap.get("shows_bad") and cap.get("series_ok") == 0 and cap.get("parent_ok"):
+            d4 = _ep_by_parent(g, st, key[0], path, cap)
+            if d4 is not None:
+                rec = (now, d4)
+                _EP_CACHE[key] = rec
+                _ep_l2_put(k, rec)
+                return d4
         if cap.get("shows_bad") and cap.get("series_ok") == 0:
-            raise RuntimeError("源 %s 列集能力不可用（/Shows 400，/Items 忽略 SeriesId），"
-                               "跳过（能力记忆 %dd）" % (key[0], _CAP_TTL // 86400))
+            raise RuntimeError("源 %s 列集能力不可用（/Shows 400，/Items 忽略 SeriesId，"
+                               "ParentId 也取不到），跳过（能力记忆 %dd）"
+                               % (key[0], _CAP_TTL // 86400))
         if cap.get("shows_bad") and _SHOWS_EP_RE.match(base):
             base = _shows_to_items_path(base) or base
         if cap.get("limit_ok"):
@@ -537,13 +630,19 @@ def _prefer_cached(order, series):
 
 
 def _cap_dead(label, now):
-    """这个源是否已被判定「列集能力不可用」（/Shows 400 且 /Items 忽略 SeriesId）。
+    """这个源是否已被判定「列集能力不可用」。
 
-    被判定后连搜索都不该再派给它：搜到了也列不出集，只是多烧一次配额
-    （lite 7 天 935 次请求、0 集产出）。TTL 到期自动重新探测。
+    2026-11-28（E228）：**判据必须包含 parent_ok。**
+    lite.cn2gias.uk 实测：`/Shows/{id}/Episodes` → 400，`/Items?SeriesId=` 忽略过滤
+    返回全库 346375 条 —— 于是这里判「列集能力不可用」，把整个源从轮转里摘掉。
+    但 ParentId 两级**能拿到集**（实测 14 季 / 每季 81 集，SeriesId 也正确）。
+    旧判据只看了两种端点，把「最大库（28740 部）可用」误判成「不可用」：
+    队列里 1050 条（35%）每 29 分钟空转一轮、0 次源请求、0 集产出。
+    现在只有 ParentId 也失败（parent_ok=0）才算死。
     """
     cap = _cap_get(label, now)
-    return bool(cap and cap.get("shows_bad") and cap.get("series_ok") == 0)
+    return bool(cap and cap.get("shows_bad") and cap.get("series_ok") == 0
+                and not cap.get("parent_ok"))
 
 
 def _ordered_sources(g, exclude=None, max_hosts=0, order_labels=None, host_pref=None,
