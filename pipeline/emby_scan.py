@@ -63,6 +63,37 @@ E = (C.cfg("emby_url", "http://127.0.0.1:8096") or "").rstrip("/")
 T = C.cfg("emby_api_key") or C.cfg("emby_token") or ""
 TGDB = os.path.join(HERE, "tg.db")
 PREFIX = "/mnt/embytg"
+# 宿主机上的同一棵树（容器 /mnt/embytg == 宿主 /opt/embytg/mnt/embytg）
+HOST_MNT = (C.cfg("mount", "/opt/embytg/mnt/embytg") or "/opt/embytg/mnt/embytg").rstrip("/")
+
+
+def to_container_path(p):
+    """把 宿主路径 / 相对路径 统一成容器内路径（唯一入口，E230）。
+
+    2026-11-28 日终实测：TargetedScan 插件只认容器命名空间。传宿主路径
+    `/opt/embytg/mnt/embytg/...` 一律回
+    `{"Status":"PathNotFound","Message":"Path does not exist on filesystem"}` ——
+    连早就入库的《黑色圣诞节》都被判「文件不存在」；换成 `/mnt/embytg/...` 同一秒
+    `{"Status":"Created","ItemId":"176387"}`。调用方一半传宿主、一半传相对，
+    于是传宿主的那几个脚本（reconcile / post_ingest / notify_replay / emos_import）
+    每部片都静默丢进 PathNotFound，五账只数 Episode，**电影漏建完全不可见**。
+    修法：只在这一个入口转换，不再让每个脚本自己记住前缀。
+    """
+    p = (p or "").strip()
+    if not p:
+        return ""
+    if p.startswith("./"):
+        p = p[2:]
+    if p == HOST_MNT:
+        return PREFIX
+    if p.startswith(HOST_MNT + "/"):
+        return PREFIX + p[len(HOST_MNT):]
+    if p == PREFIX or p.startswith(PREFIX + "/"):
+        return p
+    if p.startswith("/"):
+        return p
+    return PREFIX + "/" + p.lstrip("/")
+
 
 # 插件端点可用性缓存（一次运行内只探一次）
 _PROBE = {}
@@ -200,6 +231,14 @@ def scan_paths(paths, timeout=180):
     paths = [p for p in paths if p]
     out = {"Created": 0, "Refreshed": 0, "PathNotFound": 0,
            "ParentNotFound": 0, "Failed": 0, "ids": [], "mode": "scanpath"}
+    # 前缀统一（E230）：插件只认容器路径，宿主/相对路径在这里一次转完
+    _seen, _norm = set(), []
+    for p in paths:
+        q = to_container_path(p)
+        if q and q not in _seen:
+            _seen.add(q)
+            _norm.append(q)
+    paths = _norm
     if not paths:
         return out
     paths, _skipped = _scan_guard(paths)
