@@ -677,7 +677,12 @@ def main():
                     _mbps = float(_r.get("mbps") or 0)
                     break
             if _mbps > 0:
-                _want = max(32, min(512, int(_mbps * 180)))
+                # 2026-11-28（E230）：实测四个号今天只有 0.04-0.7MB/s。
+                # 32MiB 下限在 0.04MB/s 上要 800s，直接撞 600s 僵死闸门 →
+                # ZERO_PROGRESS 0 个分片落地（近 24h 68 次，占失败 85%）。
+                # 改成「按 120 秒目标 + 8MiB 下限」：0.04MB/s → 8MiB(200s)、
+                # 0.7MB/s → 84MiB。慢号也能在闸门内落地第一个分片。
+                _want = max(8, min(512, int(_mbps * 120)))
                 if _want != a.chunk_mib:
                     print("  分片自适应：slot%d %.2fMB/s → %dMiB（原 %dMiB）"
                           % (_slot_no, _mbps, _want, a.chunk_mib), flush=True)
