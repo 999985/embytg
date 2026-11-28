@@ -152,6 +152,39 @@ def stall_window(chunk_bytes, ceiling, min_rate=0.05, floor=600):
     return int(w)
 
 
+def jobs_for_rate(mbps, cap, slow=0.5, mid=1.0):
+    """E229：按实测吞吐收窄并发 —— 限速号上单连接比 8 并发快 3.3 倍。
+
+    2026-11-28 10:30 现场 A/B（slot1、同一文件、3MB × N 并发，pc_worker 直传）：
+
+        concurrency=1  合计 0.663 MB/s
+        concurrency=2  合计 0.202 MB/s
+        concurrency=4  合计 0.194 MB/s
+        concurrency=8  合计 0.197 MB/s
+
+    限速的瓶颈是**按连接分配的上行额度**：多开连接不增加总量，只是把同一份
+    额度切碎。而切碎的代价是致命的 —— 每个 32MiB 区段都要 1000s 以上才落地，
+    僵死闸门（按整轮零落地判）必然先开火，于是「慢」被判成「死」，
+    一天 58 次 ZERO_PROGRESS、每次白烧 11 分钟 + 一次源站下载。
+
+    规则：实测 <0.5MB/s → 1 个 worker；<1.0 → 2 个；更快才用满配置的并发。
+    不做「永远压低」的降档：这两个阈值远低于 E219 的健康区间（2MB/s 以上），
+    快号完全不受影响；而且成功分片会立刻把 mbps 抬回真实值，自动解除收窄。
+    """
+    try:
+        mb = float(mbps or 0)
+        cp = max(1, int(cap or 1))
+    except (TypeError, ValueError):
+        return 1
+    if mb <= 0:
+        return cp
+    if mb < float(slow):
+        return 1
+    if mb < float(mid):
+        return min(cp, 2)
+    return cp
+
+
 def stall_window_measured(chunk_bytes, mbps, ceiling, safety=1.5, floor=600,
                           min_rate=0.05):
     """E229：有实测吞吐时，僵死窗按「这个号一段的真实耗时 × 安全系数」。
@@ -652,6 +685,22 @@ def main():
         except Exception:                                    # noqa: BLE001
             pass
     chunk = a.chunk_mib * 1024 * 1024
+    # E229：并发按该号实测吞吐收窄（见 jobs_for_rate 的现场 A/B）。
+    try:
+        _jr_rate = 0.0
+        if a.session_slot:
+            for _r in TP.snapshot():
+                if int(_r.get("slot") or 0) == int(a.session_slot):
+                    _jr_rate = float(_r.get("mbps") or 0)
+                    break
+        _jr = jobs_for_rate(_jr_rate, a.jobs)
+        if _jr != a.jobs:
+            print("  并发按实测收窄：slot%s %.2fMB/s → jobs %d→%d"
+                  "（限速号单连接最快，见 E229）"
+                  % (a.session_slot or "-", _jr_rate, a.jobs, _jr), flush=True)
+            a.jobs = _jr
+    except Exception:                                        # noqa: BLE001
+        pass
     nreg = (total + chunk - 1) // chunk
 
     os.makedirs(MANI_DIR, exist_ok=True)
