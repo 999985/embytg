@@ -133,7 +133,8 @@ FILL_NO_SOURCE_COOL_HOURS = float(os.environ.get("FILL_NO_SOURCE_COOL_HOURS") or
 # 这些 why 意味着「根本没向源站发请求」，不应占用 --max-attempts 名额。
 CHARGE_FREE_WHY = {
     "cooldown", "series_active", "no_missing",           # 本地判据即可跳
-    "hint_source_busy", "source_budget",                  # 预算/租约
+    "hint_source_busy", "source_budget",                  # 预算/租约/源级熔断
+    "hint_source_dead",                                   # 源已被判定列不出集（E228）
     "hint_fetch_failed",                                  # 点名源当次取不到（30min 后重试）
 }
 NEW_BUILDER = os.path.join(HERE, "build_three_queues.py")
@@ -2111,6 +2112,30 @@ def try_new(item, available_labels, leased, min_bytes, max_bytes, run_id,
         # 现在：有点名 ID 的 → 30 分钟后重试；真的按剧名搜不到 → 才冷藏几天。
         hinted = bool(item.get("source_label") and item.get("source_series_id"))
         if hinted:
+            _lab = str(item.get("source_label"))
+            # 2026-11-28（E228）：**「取不到」有三种，只有一种该 29 分钟后重试。**
+            # ① 这个源已被判定列不出集（cap-dead）→ 29 分钟重试一万次也一样；
+            # ② 源级熔断（429 冷却）→ 不是这条链路的错，别写成失败记忆；
+            # ③ 真正的单次取数失败 → 29 分钟重试。
+            # 事故：lite 被判 cap-dead 后，队列里 1050 条（35%）每 29 分钟空转一轮，
+            # 一上午写了 3196 条 hint_fetch_failed（其中 0 次源请求），
+            # 统计上把「源摘除」伪装成「源取不到」，掩盖了真正的根因。
+            try:
+                _dead = bool(SP._cap_dead(_lab, time.time()))
+            except Exception:                                  # noqa: BLE001
+                _dead = False
+            if _dead:
+                mark_new_done(item["video_id"], days=random.uniform(2.0, 4.0),
+                              reason="hint_source_dead")
+                return None, "hint_source_dead"
+            try:
+                _h = (SG._health_load() or {}).get(_lab) or {}
+                _cooling = float(_h.get("cool_until") or 0) > time.time()
+            except Exception:                                  # noqa: BLE001
+                _cooling = False
+            if _cooling:
+                mark_new_done(item["video_id"], days=0.02, reason="hint_source_busy")
+                return None, "hint_source_busy"
             mark_new_done(item["video_id"], days=0.02, reason="hint_fetch_failed")
             return None, "hint_fetch_failed"
         # 2026-11-14：12 小时 → 3 天。
@@ -2687,32 +2712,6 @@ def main():
         _rate = GS.source_success_rate()
     except Exception:                                      # noqa: BLE001
         _rate = {}
-    # 2026-11-28（E226）：**人工核验过的主力源必须有产出下限。**
-    # lite.cn2gias.uk 是用户确认的两大库之一、优先级 110、队列里 1400 条，
-    # 但 source_success_rate() 按当日 ok 算，它 ok=0 → rate=0 → 条目永远排在
-    # 4000 条的最后，实际一次都轮不到（日切后 day 仍然是 0，日志可证）。
-    # 给 config/source_priority.json 的 _verified_top 一个 rate 下限，
-    # 让它排在 bangumi 之后、emos 之前，真正被试出来。
-    _vp = {}
-    try:
-        _vp = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "config", "source_priority.json"), encoding="utf-8"))
-        _vtop = [str(x) for x in (_vp.get("_verified_top") or [])]
-    except Exception:                                       # noqa: BLE001
-        _vp, _vtop = {}, []
-    if _vtop and items:
-        # 注意：_verified_top 里如果放了两个源，给同一个固定 floor 等于没分先后
-        # （实测 emos 和 lite 同时 0.65，稳定排序把 emos 的 1400 条全排在前面，
-        # lite 照样一次轮不到）。floor 必须按优先级拉开档次：
-        # 优先级 110 → 0.92、100 → 0.83、95 → 0.79，主力之间也有明确先后。
-        _rate = dict(_rate)
-        for _l in _vtop:
-            try:
-                _pr = float(_vp.get(_l) or 0)
-            except (TypeError, ValueError):
-                _pr = 0.0
-            _fl = float(os.environ.get("VERIFIED_RATE_FLOOR") or min(0.95, _pr / 120.0))
-            _rate[_l] = max(float(_rate.get(_l) or 0.0), _fl)
     if _rate and items:
         items = sorted(items, key=lambda x: -_rate.get(str(x.get("source_label")), 0.5))
 

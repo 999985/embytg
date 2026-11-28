@@ -198,6 +198,17 @@ def _ep_l2_put(k, rec):
         if (cur.rowcount or 0) > 50:
             c.execute("INSERT INTO cache_stat(kind,n) VALUES('ep_purge_bulk',1) "
                       "ON CONFLICT(kind) DO UPDATE SET n=n+1")
+        # 2026-11-28（E228）：**库文件大小闸门。** lite 一部 1615 集的剧单条缓存就好几 MB，
+        # ep_cache 已 521MB/4045 条；20 万集时无闸门会把根分区吃掉（本机可用 24G）。
+        # 超限就按 ts 从旧到新删 500 条 —— 只删行不 VACUUM，新数据复用空闲页，文件稳定在闸门附近。
+        try:
+            _cap_mb = float(os.getenv("EMBYTG_EP_CACHE_MAX_MB", "1500") or 0)
+        except (TypeError, ValueError):
+            _cap_mb = 1500.0
+        if _cap_mb > 0 and os.path.getsize(_SEARCH_DB) > _cap_mb * 1024 * 1024:
+            c.execute("DELETE FROM ep_cache WHERE k IN "
+                      "(SELECT k FROM ep_cache ORDER BY ts ASC LIMIT 500)")
+            _stat("ep_purge_size")
         c.commit()
         c.close()
     except Exception as e:                                       # noqa: BLE001
@@ -398,11 +409,22 @@ def _ep_by_parent(g, st, label, path, cap=None):
     q0 = urllib.parse.parse_qs(urllib.parse.urlparse(path or "").query)
     fields = (q0.get("Fields") or ["MediaSources,RunTimeTicks,ProviderIds"])[0]
     lim = int((cap or {}).get("limit_ok") or 0) or 500
+    # 调用方可能点名只要某一季（`/Shows/{id}/Episodes?Season=2`）。两级列集必须
+    # 自己尊重这个过滤 —— 否则会把别的季的集返回给「按季调用」的调用方，
+    # 上游按 IndexNumber 建表就会季错位（E012 那类脏号）。
+    want_season = None
+    if q0.get("Season"):
+        try:
+            want_season = int(q0["Season"][0])
+        except (TypeError, ValueError):
+            want_season = None
     try:
         seas = g.get(st, "/Items?ParentId=%s&IncludeItemTypes=Season&Recursive=false"
                          "&Fields=IndexNumber,Name&Limit=%d" % (sid, lim))
     except Exception:                                            # noqa: BLE001
-        return None
+        # 源级/网络异常必须上抛：调用方据此判「这次没取到」（可重试），
+        # 绝不能记成「ParentId 不可用」—— 一个 429 不该把源判死 7 天。
+        raise
     sitems = []
     for s in (seas.get("Items") or []):
         if not isinstance(s, dict):
@@ -413,7 +435,8 @@ def _ep_by_parent(g, st, label, path, cap=None):
         except (TypeError, ValueError):
             continue
         if s.get("Id"):
-            sitems.append(s)
+            if want_season is None or int(s.get("IndexNumber") or 0) == want_season:
+                sitems.append(s)
     if not sitems:
         return None
     out = []
@@ -485,13 +508,17 @@ def _ep_get(g, st, path):
     cap = _cap_get(key[0], now)
     if cap:
         # 2026-11-28（E228）：ParentId 两级可用就直接走它，别再撞两个已知失败的端点。
-        if cap.get("shows_bad") and cap.get("series_ok") == 0 and cap.get("parent_ok"):
+        if cap.get("shows_bad") and cap.get("series_ok") == 0 \
+                and int(cap.get("parent_ok") or 0) != -1:
             d4 = _ep_by_parent(g, st, key[0], path, cap)
             if d4 is not None:
+                _cap_put(key[0], parent_ok=1)
                 rec = (now, d4)
                 _EP_CACHE[key] = rec
                 _ep_l2_put(k, rec)
                 return d4
+            # 源**答了**但没有季/集：这才是「ParentId 也不可用」的确定结论。
+            _cap_put(key[0], parent_ok=-1)
         if cap.get("shows_bad") and cap.get("series_ok") == 0:
             raise RuntimeError("源 %s 列集能力不可用（/Shows 400，/Items 忽略 SeriesId，"
                                "ParentId 也取不到），跳过（能力记忆 %dd）"
@@ -537,10 +564,9 @@ def _ep_get(g, st, path):
         # ② 端点改写：没实现 /Shows/{id}/Episodes 的源走 /Items?SeriesId=
         if data is None:
             alt = _shows_to_items_path(base)
-            if alt is None:
-                raise
             last = None
-            for lim in (None, "500", "200", "100"):
+            _ignore_sid = False
+            for lim in ((None, "500", "200", "100") if alt is not None else ()):
                 p3 = alt if lim is None else _rewrite_limit(alt, lim)
                 if p3 is None:
                     continue
@@ -563,17 +589,32 @@ def _ep_get(g, st, path):
                 sid = m_sid.group(1) if m_sid else ""
                 if sid and not _items_match_series(d3, sid):
                     _cap_put(key[0], series_ok=0)
-                    raise RuntimeError("源 %s 的 /Items 忽略 SeriesId 过滤（返回他剧），拒收"
-                                       % st.label)
+                    _ignore_sid = True
+                    break
                 data = d3
                 _cap_put(key[0], series_ok=1)
                 _cap_learn(key[0], path, p3)
                 break
             if data is None:
-                if last is not None:
+                # ③ 2026-11-28（E228）：ParentId 两级。前两种端点都失败时，
+                # 这个源仍可能「按季列得出集」（lite 实测 14 季 / 每季 81 集）。
+                d4 = _ep_by_parent(g, st, key[0], path, cap)
+                if d4 is not None:
+                    _cap_put(key[0], parent_ok=1)
+                    data = d4
+                elif _ignore_sid:
+                    # 源明确「忽略 SeriesId」且 ParentId 也取不到集 → 确定的不可用。
+                    # 只在这条确定路径上写 -1；网络异常在 _ep_by_parent 里就上抛了。
+                    _cap_put(key[0], parent_ok=-1)
+                    raise RuntimeError("源 %s 的 /Items 忽略 SeriesId 过滤（返回他剧），"
+                                       "且 ParentId 也取不到集，拒收" % st.label)
+                elif alt is None:
+                    raise
+                elif last is not None:
                     _ep_err_put(k, last)
                     raise last
-                raise RuntimeError("源 %s 改写端点后仍无可用返回" % st.label)
+                else:
+                    raise RuntimeError("源 %s 改写端点后仍无可用返回" % st.label)
     rec = (now, data)
     _EP_CACHE[key] = rec
     _ep_l2_put(k, rec)
@@ -642,7 +683,7 @@ def _cap_dead(label, now):
     """
     cap = _cap_get(label, now)
     return bool(cap and cap.get("shows_bad") and cap.get("series_ok") == 0
-                and not cap.get("parent_ok"))
+                and int(cap.get("parent_ok") or 0) == -1)
 
 
 def _ordered_sources(g, exclude=None, max_hosts=0, order_labels=None, host_pref=None,
